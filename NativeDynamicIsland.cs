@@ -34,8 +34,8 @@ using System.Reflection;
 [assembly: AssemblyProduct("Dynamic Island Studio")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("2.9.0.0")]
-[assembly: AssemblyFileVersion("2.9.0.0")]
+[assembly: AssemblyVersion("3.0.0.0")]
+[assembly: AssemblyFileVersion("3.0.0.0")]
 namespace DynamicIslandWin
 {
     // =========================================================================
@@ -3195,7 +3195,7 @@ namespace DynamicIslandWin
     // =========================================================================
     public sealed class UpdateManager
     {
-        public const string CurrentVersionStr = "2.9.0";
+        public const string CurrentVersionStr = "3.0.0";
         public string LatestVersionStr { get; private set; }
         public string ReleaseNotes { get; private set; }
         public string DownloadUrl { get; private set; }
@@ -3390,86 +3390,124 @@ namespace DynamicIslandWin
         public event Action SettingsSaved;
         public event Action ManualUpdateCheckRequested;
 
-        private int _activeTab = 0;
-        private bool _draggingTitle = false;
-        private Point _dragOffset;
-        private long _appliedFlashTick = 0;
-        private PointF _mousePt = new PointF(-100, -100);
+        // Motion Lab Palette (Strict Black Hierarchy: #000000 ONLY on Stage Island)
+        private static readonly Color ColChassis = Color.FromArgb(11, 11, 13);        // #0B0B0D
+        private static readonly Color ColStageBg = Color.FromArgb(14, 14, 17);        // #0E0E11
+        private static readonly Color ColPureIsland = Color.FromArgb(0, 0, 0);        // #000000 (Exclusive!)
+        private static readonly Color ColDeckCard = Color.FromArgb(18, 18, 21);       // #121215
+        private static readonly Color ColDeckHover = Color.FromArgb(26, 26, 31);      // #1A1A1F
+        private static readonly Color ColDeckInset = Color.FromArgb(13, 13, 16);      // #0D0D10
+        private static readonly Color ColBorder = Color.FromArgb(21, 255, 255, 255);  // rgba(255,255,255,0.08)
+        private static readonly Color ColBorderHi = Color.FromArgb(56, 255, 255, 255);// rgba(255,255,255,0.22)
+        private static readonly Color ColAccent = Color.FromArgb(255, 85, 0);         // #FF5500 Kinetic Orange
+        private static readonly Color ColLime = Color.FromArgb(200, 255, 0);          // #C8FF00 Acid Lime
+        private static readonly Color ColTextMain = Color.FromArgb(242, 243, 247);
+        private static readonly Color ColTextMuted = Color.FromArgb(138, 142, 154);
+        private static readonly Color ColTextDim = Color.FromArgb(92, 96, 108);
 
-        private readonly TextBox _inlineBox;
-        private Action<int> _inlineCommitSetter = null;
-        private int _inlineMin = 0, _inlineMax = 100;
-        private bool _inlineCommitting = false;
+        private enum StagePreviewMode { Idle = 0, Compact = 1, Expanded = 2, Media = 3, Notify = 4 }
 
-        private readonly string[] _tabNames = new string[]
-        {
-            "Экран и Размеры",
-            "Фон и Эстетика",
-            "Физика и Игры",
-            "Виджеты и Таймер"
-        };
+        private int _activeTab = 0;          // 0..3 Mode Rail
+        private int _inspectorSubMode = 0;   // 0 = Timer & Audio, 1 = Player & EQ, 2 = Vault & Watchdog
+        private StagePreviewMode _stageMode = StagePreviewMode.Compact;
+        private string _filterQuery = "";
+        private bool _editingFilter = false;
 
-        private readonly string[] _tabIcons = new string[]
-        {
-            "⬚",
-            "✦",
-            "⚡",
-            "🔔"
-        };
+        // Live 60Hz Stage Physics & Oscilloscope State
+        private readonly System.Windows.Forms.Timer _stageTimer;
+        private readonly Stopwatch _stageAnimWatch = new Stopwatch();
+        private readonly CustomBackgroundEngine _stageBgPreview = new CustomBackgroundEngine();
+        private bool _stageAnimating = false;
+        private bool _stageExpanding = true;
+        private int _stageAnimDurMs = 330;
+        private float _stageStartW = 310f, _stageStartH = 36f, _stageStartExp = 0f;
+        private float _stageCurW = 310f, _stageCurH = 36f, _stageCurExp = 0f;
+        private float _stageTargetW = 310f, _stageTargetH = 36f, _stageTargetExp = 0f;
+        private float _stagePulseScale = 1.0f;
+        private long _stagePulseStartMs = -9999;
+        private float _stageWavePhase = 0f;
+        private long _lastModifiedTick = 0;
 
-        private sealed class HitAction
+        // Input & Hit-Testing State
+        private bool _draggingWindow = false;
+        private Point _windowDragOffset;
+        private PointF _mousePt = new PointF(-999, -999);
+
+        private sealed class HitZone
         {
             public RectangleF Rect;
             public Action OnClick;
         }
 
-        private sealed class SliderTrackHit
+        private sealed class PrecisionSliderHit
         {
             public RectangleF TrackRect;
+            public RectangleF WheelRect;
             public int MinVal;
             public int MaxVal;
+            public Func<int> Getter;
             public Action<int> Setter;
         }
 
-        private readonly List<HitAction> _hits = new List<HitAction>();
-        private readonly List<SliderTrackHit> _sliderHits = new List<SliderTrackHit>();
-        private SliderTrackHit _activeDraggingSlider = null;
+        private readonly List<HitZone> _hits = new List<HitZone>();
+        private readonly List<PrecisionSliderHit> _sliderHits = new List<PrecisionSliderHit>();
+        private PrecisionSliderHit _draggingSlider = null;
+        private bool _draggingSpatialPad = false;
+        private RectangleF _spatialPadRect = RectangleF.Empty;
+        private RectangleF _stageIslandHitRect = RectangleF.Empty;
 
-        private RectangleF _rcCloseTraffic, _rcResetTraffic, _rcSaveTraffic;
-        private readonly List<RectangleF> _tabRects = new List<RectangleF>();
+        // Inline Monospace Numeric & Search Input (Zero system dialogs)
+        private readonly TextBox _inlineBox;
+        private Action<int> _inlineCommitSetter = null;
+        private int _inlineMin = 0, _inlineMax = 100;
+        private bool _inlineCommitting = false;
 
-        private readonly Font _fHeader = new Font("Segoe UI Semibold", 14.2f, FontStyle.Bold);
-        private readonly Font _fSide = new Font("Segoe UI Semibold", 9.6f, FontStyle.Bold);
-        private readonly Font _fRowTitle = new Font("Segoe UI", 9.4f, FontStyle.Regular);
-        private readonly Font _fRowValue = new Font("Segoe UI Semibold", 9.1f, FontStyle.Bold);
-        private readonly Font _fSmall = new Font("Segoe UI Semibold", 8.1f, FontStyle.Regular);
+        private readonly string[] _railCodes = { "01", "02", "03", "04" };
+        private readonly string[] _railTitles =
+        {
+            "ФИЗИКА И ФОРМА",
+            "МОДУЛИ ОСТРОВА",
+            "ЭКРАН И РЕЖИМЫ",
+            "СКИН И СИСТЕМА"
+        };
 
-        private readonly StringFormat _sfLeft = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter };
-        private readonly StringFormat _sfCenter = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter };
-        private readonly StringFormat _sfRight = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
+        private readonly Font _fConsoleBrand = new Font("Consolas", 8.8f, FontStyle.Bold);
+        private readonly Font _fBentoHeader = new Font("Segoe UI Semibold", 8.4f, FontStyle.Bold);
+        private readonly Font _fLabel = new Font("Segoe UI Semibold", 8.8f, FontStyle.Bold);
+        private readonly Font _fSub = new Font("Segoe UI", 7.8f, FontStyle.Regular);
+        private readonly Font _fChip = new Font("Segoe UI Semibold", 8.0f, FontStyle.Bold);
+        private readonly Font _fMonoBig = new Font("Consolas", 11.0f, FontStyle.Bold);
+        private readonly Font _fMonoVal = new Font("Consolas", 9.2f, FontStyle.Bold);
+        private readonly Font _fMonoTiny = new Font("Consolas", 7.6f, FontStyle.Bold);
+
+        private readonly StringFormat _sfLeft = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+        private readonly StringFormat _sfCenter = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+        private readonly StringFormat _sfRight = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
 
         public SettingsForm(IslandConfigData cfg)
         {
             _cfg = cfg;
-            Text = "Dynamic Island Studio";
+            Text = "Dynamic Island — Kinetic Stage & Deck";
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterScreen;
             TopMost = true;
             DoubleBuffered = true;
-            ClientSize = new Size(690, 520);
-            BackColor = Color.FromArgb(14, 16, 22);
-            ForeColor = Color.White;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+            ClientSize = new Size(880, 640);
+            BackColor = ColChassis;
+            ForeColor = ColTextMain;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-            Region = Region.FromHrgn(NativeWin32.CreateRoundRectRgn(0, 0, Width + 1, Height + 1, 26, 26));
+            // Crisp 8px technical chassis corners (no soft rounded macOS sheet)
+            Region = Region.FromHrgn(NativeWin32.CreateRoundRectRgn(0, 0, Width + 1, Height + 1, 10, 10));
 
             _inlineBox = new TextBox
             {
                 Visible = false,
                 BorderStyle = BorderStyle.None,
-                BackColor = Color.FromArgb(24, 28, 42),
-                ForeColor = Color.FromArgb(125, 211, 252),
-                Font = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold),
+                BackColor = ColDeckInset,
+                ForeColor = ColAccent,
+                Font = new Font("Consolas", 9.6f, FontStyle.Bold),
                 TextAlign = HorizontalAlignment.Center
             };
             _inlineBox.KeyDown += (s, e) =>
@@ -3477,29 +3515,218 @@ namespace DynamicIslandWin
                 if (e.KeyCode == Keys.Enter)
                 {
                     e.SuppressKeyPress = true;
-                    CommitInlineEdit(true);
+                    CommitInlineInput(true);
                 }
                 else if (e.KeyCode == Keys.Escape)
                 {
                     e.SuppressKeyPress = true;
-                    CommitInlineEdit(false);
+                    CommitInlineInput(false);
                 }
             };
-            _inlineBox.LostFocus += (s, e) => CommitInlineEdit(true);
+            _inlineBox.TextChanged += (s, e) =>
+            {
+                if (_editingFilter && _inlineBox.Visible)
+                {
+                    _filterQuery = (_inlineBox.Text ?? "").Trim();
+                    RouteFilterQuery(_filterQuery);
+                    Invalidate();
+                }
+            };
+            _inlineBox.LostFocus += (s, e) => CommitInlineInput(true);
             Controls.Add(_inlineBox);
+
+            SyncStageTargetsFromMode(false);
+            _stageCurW = _stageTargetW;
+            _stageCurH = _stageTargetH;
+            _stageCurExp = _stageTargetExp;
+
+            _stageTimer = new System.Windows.Forms.Timer { Interval = 15 };
+            _stageTimer.Tick += OnStageTick;
+            _stageTimer.Start();
         }
 
-        private void BeginInlineEdit(RectangleF pillRc, int curVal, int minVal, int maxVal, Action<int> setter)
+        private void RouteFilterQuery(string q)
         {
-            CommitInlineEdit(true);
+            if (string.IsNullOrEmpty(q)) return;
+            string lq = q.ToLowerInvariant();
+            if (lq.Contains("тайм") || lq.Contains("помод") || lq.Contains("звук") || lq.Contains("мелод"))
+            {
+                _activeTab = 1; _inspectorSubMode = 0;
+            }
+            else if (lq.Contains("плеер") || lq.Contains("муз") || lq.Contains("облож") || lq.Contains("лайк"))
+            {
+                _activeTab = 1; _inspectorSubMode = 1;
+            }
+            else if (lq.Contains("скрин") || lq.Contains("закач") || lq.Contains("сон") || lq.Contains("watch") || lq.Contains("drop") || lq.Contains("батар") || lq.Contains("час"))
+            {
+                _activeTab = 1; _inspectorSubMode = 2;
+            }
+            else if (lq.Contains("монит") || lq.Contains("экран") || lq.Contains("игр") || lq.Contains("призр") || lq.Contains("микр") || lq.Contains("отступ") || lq.Contains("сдвиг"))
+            {
+                _activeTab = 2;
+            }
+            else if (lq.Contains("gif") || lq.Contains("фото") || lq.Contains("цвет") || lq.Contains("тем") || lq.Contains("скин") || lq.Contains("автозап") || lq.Contains("обнов") || lq.Contains("блик"))
+            {
+                _activeTab = 3;
+            }
+            else if (lq.Contains("шир") || lq.Contains("выс") || lq.Contains("пруж") || lq.Contains("скор") || lq.Contains("радиус") || lq.Contains("масштаб"))
+            {
+                _activeTab = 0;
+            }
+        }
+
+        private bool MatchesFilter(string text)
+        {
+            if (string.IsNullOrEmpty(_filterQuery) || string.IsNullOrEmpty(text)) return false;
+            return text.IndexOf(_filterQuery, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private float EvaluateStageSpring(float t, bool expanding)
+        {
+            if (t <= 0f) return 0f;
+            if (t >= 1f) return 1f;
+            float zeta = expanding
+                ? Math.Max(0.45f, Math.Min(0.95f, 1.30f - (_cfg.spring_overshoot_pct / 190f)))
+                : 0.94f;
+            float omega0 = expanding ? 11.4f : 10.4f;
+            float omegaD = omega0 * (float)Math.Sqrt(Math.Max(0.01f, 1.0f - zeta * zeta));
+            float env = (float)Math.Exp(-zeta * omega0 * t);
+            return 1.0f - env * ((float)Math.Cos(omegaD * t) + (zeta * omega0 / omegaD) * (float)Math.Sin(omegaD * t));
+        }
+
+        private void SyncStageTargetsFromMode(bool animate)
+        {
+            float tw = _cfg.idle_width;
+            float th = _cfg.idle_height;
+            float texp = 0f;
+
+            if (_stageMode == StagePreviewMode.Idle)
+            {
+                tw = _cfg.idle_width;
+                th = _cfg.idle_height;
+                texp = 0f;
+            }
+            else if (_stageMode == StagePreviewMode.Compact)
+            {
+                tw = Math.Max(_cfg.idle_width, 310);
+                th = _cfg.idle_height;
+                texp = 0f;
+            }
+            else if (_stageMode == StagePreviewMode.Media)
+            {
+                tw = Math.Max(_cfg.idle_width + 44, 348);
+                th = Math.Max(_cfg.idle_height + 6, 42);
+                texp = 0f;
+            }
+            else if (_stageMode == StagePreviewMode.Notify)
+            {
+                tw = Math.Max(_cfg.idle_width + 96, 396);
+                th = Math.Max(_cfg.idle_height + 10, 46);
+                texp = 0f;
+            }
+            else // Expanded
+            {
+                tw = _cfg.expanded_width;
+                th = _cfg.expanded_height;
+                texp = 1f;
+            }
+
+            if (!animate)
+            {
+                _stageTargetW = tw; _stageTargetH = th; _stageTargetExp = texp;
+                return;
+            }
+
+            _stageStartW = _stageCurW;
+            _stageStartH = _stageCurH;
+            _stageStartExp = _stageCurExp;
+            _stageTargetW = tw;
+            _stageTargetH = th;
+            _stageTargetExp = texp;
+            _stageExpanding = (tw * th >= _stageStartW * _stageStartH);
+            _stageAnimDurMs = Math.Max(110, _cfg.anim_duration_ms);
+            _stageAnimWatch.Restart();
+            _stageAnimating = true;
+        }
+
+        private void TriggerTestPulse()
+        {
+            _stagePulseStartMs = Environment.TickCount;
+            _stageStartW = _stageTargetW * 0.76f;
+            _stageStartH = _stageTargetH * 0.80f;
+            _stageStartExp = _stageCurExp;
+            _stageCurW = _stageStartW;
+            _stageCurH = _stageStartH;
+            _stageExpanding = true;
+            _stageAnimDurMs = Math.Max(120, _cfg.anim_duration_ms);
+            _stageAnimWatch.Restart();
+            _stageAnimating = true;
+            Invalidate();
+        }
+
+        private void OnStageTick(object sender, EventArgs e)
+        {
+            bool dirty = false;
+            _stageWavePhase += 0.16f;
+
+            if (_stageAnimating)
+            {
+                float rawT = Math.Max(0f, Math.Min(1f, _stageAnimWatch.ElapsedMilliseconds / (float)_stageAnimDurMs));
+                float s = EvaluateStageSpring(rawT, _stageExpanding);
+                _stageCurW = _stageStartW + (_stageTargetW - _stageStartW) * s;
+                _stageCurH = _stageStartH + (_stageTargetH - _stageStartH) * s;
+                _stageCurExp = Math.Max(0f, Math.Min(1f, _stageStartExp + (_stageTargetExp - _stageStartExp) * s));
+                if (rawT >= 1.0f)
+                {
+                    _stageCurW = _stageTargetW;
+                    _stageCurH = _stageTargetH;
+                    _stageCurExp = _stageTargetExp;
+                    _stageAnimating = false;
+                }
+                dirty = true;
+            }
+            else
+            {
+                // Smooth immediate tracking when user drags geometry sliders
+                if (Math.Abs(_stageCurW - _stageTargetW) > 0.4f || Math.Abs(_stageCurH - _stageTargetH) > 0.4f)
+                {
+                    _stageCurW += (_stageTargetW - _stageCurW) * 0.38f;
+                    _stageCurH += (_stageTargetH - _stageCurH) * 0.38f;
+                    _stageCurExp += (_stageTargetExp - _stageCurExp) * 0.38f;
+                    dirty = true;
+                }
+                else
+                {
+                    _stageCurW = _stageTargetW;
+                    _stageCurH = _stageTargetH;
+                    _stageCurExp = _stageTargetExp;
+                }
+            }
+
+            if (_stageBgPreview.AdvanceAnimationFrame())
+                dirty = true;
+
+            if (_stageMode != StagePreviewMode.Idle || (Environment.TickCount - _stagePulseStartMs) < 900)
+                dirty = true;
+
+            if (dirty)
+                Invalidate(new Rectangle(0, 32, Width, 290));
+        }
+
+        private void BeginInlineNumericEdit(RectangleF boxRc, int curVal, int minVal, int maxVal, Action<int> setter)
+        {
+            CommitInlineInput(true);
+            _editingFilter = false;
             _inlineMin = minVal;
             _inlineMax = maxVal;
             _inlineCommitSetter = setter;
 
-            int bx = (int)Math.Round(pillRc.X + 2);
-            int by = (int)Math.Round(pillRc.Y + (pillRc.Height - 17) / 2f);
-            int bw = Math.Max(36, (int)Math.Round(pillRc.Width - 4));
-            _inlineBox.SetBounds(bx, by, bw, 18);
+            _inlineBox.TextAlign = HorizontalAlignment.Center;
+            _inlineBox.SetBounds(
+                (int)Math.Round(boxRc.X + 2),
+                (int)Math.Round(boxRc.Y + (boxRc.Height - 16) / 2f),
+                Math.Max(38, (int)Math.Round(boxRc.Width - 4)),
+                16);
             _inlineBox.Text = curVal.ToString();
             _inlineBox.Visible = true;
             _inlineBox.BringToFront();
@@ -3507,15 +3734,45 @@ namespace DynamicIslandWin
             _inlineBox.SelectAll();
         }
 
-        private void CommitInlineEdit(bool applyValue)
+        private void BeginInlineFilterEdit(RectangleF boxRc)
+        {
+            CommitInlineInput(true);
+            _editingFilter = true;
+            _inlineCommitSetter = null;
+
+            _inlineBox.TextAlign = HorizontalAlignment.Left;
+            _inlineBox.SetBounds(
+                (int)Math.Round(boxRc.X + 22),
+                (int)Math.Round(boxRc.Y + (boxRc.Height - 16) / 2f),
+                Math.Max(54, (int)Math.Round(boxRc.Width - 26)),
+                16);
+            _inlineBox.Text = _filterQuery;
+            _inlineBox.Visible = true;
+            _inlineBox.BringToFront();
+            _inlineBox.Focus();
+            _inlineBox.SelectAll();
+        }
+
+        private void CommitInlineInput(bool applyValue)
         {
             if (_inlineCommitting || !_inlineBox.Visible) return;
             _inlineCommitting = true;
             try
             {
+                if (_editingFilter)
+                {
+                    if (!applyValue) _filterQuery = "";
+                    _editingFilter = false;
+                    _inlineBox.Visible = false;
+                    Invalidate();
+                    return;
+                }
+
                 var setter = _inlineCommitSetter;
                 _inlineCommitSetter = null;
-                string raw = (_inlineBox.Text ?? "").Trim().Replace("%", "").Replace("px", "").Replace("мс", "").Replace("мин", "").Trim();
+                string raw = (_inlineBox.Text ?? "").Trim()
+                    .Replace("%", "").Replace("px", "").Replace("мс", "").Replace("ms", "")
+                    .Replace("мин", "").Replace("s", "").Replace("x", "").Replace("+", "").Trim();
                 _inlineBox.Visible = false;
 
                 if (applyValue && setter != null)
@@ -3538,13 +3795,15 @@ namespace DynamicIslandWin
 
         private void ApplyLive()
         {
+            _lastModifiedTick = Environment.TickCount;
+            SyncStageTargetsFromMode(false);
             ConfigManager.SetAutostart(_cfg.autostart);
             ConfigManager.Save(_cfg);
             if (SettingsSaved != null) SettingsSaved();
             Invalidate();
         }
 
-        private static GraphicsPath RoundRect(RectangleF r, float rad)
+        private static GraphicsPath SharpRoundRect(RectangleF r, float rad)
         {
             float d = Math.Min(rad * 2f, Math.Min(r.Width, r.Height));
             var p = new GraphicsPath();
@@ -3557,6 +3816,507 @@ namespace DynamicIslandWin
             return p;
         }
 
+        private void GetPreviewThemeColors(int alpha, out Color c1, out Color c2)
+        {
+            string preset = _cfg.theme_preset ?? "Dinasmic Neon";
+            if (preset == "Kinetic Orange") { c1 = Color.FromArgb(alpha, 255, 85, 0); c2 = Color.FromArgb(alpha, 255, 159, 10); }
+            else if (preset == "Acid Lime") { c1 = Color.FromArgb(alpha, 200, 255, 0); c2 = Color.FromArgb(alpha, 16, 185, 129); }
+            else if (preset == "Dinasmic Neon") { c1 = Color.FromArgb(alpha, 34, 211, 238); c2 = Color.FromArgb(alpha, 236, 72, 153); }
+            else if (preset == "Apple Blue") { c1 = Color.FromArgb(alpha, 10, 132, 255); c2 = Color.FromArgb(alpha, 139, 92, 246); }
+            else if (preset == "Yandex Gold-Yellow") { c1 = Color.FromArgb(alpha, 255, 214, 10); c2 = Color.FromArgb(alpha, 255, 159, 10); }
+            else if (preset == "Spotify Neon Green") { c1 = Color.FromArgb(alpha, 48, 209, 88); c2 = Color.FromArgb(alpha, 34, 211, 238); }
+            else if (preset == "Crimson Sunset") { c1 = Color.FromArgb(alpha, 255, 55, 95); c2 = Color.FromArgb(alpha, 255, 159, 10); }
+            else if (preset == "Minimal White") { c1 = Color.FromArgb(alpha, 245, 245, 247); c2 = Color.FromArgb(alpha, 174, 174, 178); }
+            else { c1 = Color.FromArgb(alpha, 34, 211, 238); c2 = Color.FromArgb(alpha, 192, 132, 252); }
+        }
+        // =====================================================================
+        // REUSABLE CUSTOM CONTROLS (Zero System Widgets, Zero Blur, 1px Borders)
+        // =====================================================================
+        private void DrawBentoCell(Graphics g, RectangleF rc, string code, string title, string rightMeta = "")
+        {
+            bool hovered = rc.Contains(_mousePt) && _draggingSlider == null && !_draggingSpatialPad;
+            bool filterHit = MatchesFilter(title) || MatchesFilter(rightMeta);
+
+            using (GraphicsPath path = SharpRoundRect(rc, 6f))
+            using (var bgBr = new SolidBrush(ColDeckCard))
+            using (var pen = new Pen(filterHit ? ColAccent : (hovered ? Color.FromArgb(36, 255, 255, 255) : ColBorder), 1f))
+            {
+                g.FillPath(bgBr, path);
+                g.DrawPath(pen, path);
+            }
+
+            // Crisp 1px header divider
+            float headH = 24f;
+            using (var divPen = new Pen(ColBorder, 1f))
+                g.DrawLine(divPen, rc.X + 1f, rc.Y + headH, rc.Right - 1f, rc.Y + headH);
+
+            using (var codeBr = new SolidBrush(ColAccent))
+            using (var titleBr = new SolidBrush(ColTextMuted))
+            using (var metaBr = new SolidBrush(ColTextDim))
+            {
+                g.DrawString("[" + code + "]", _fMonoTiny, codeBr, new RectangleF(rc.X + 10f, rc.Y, 48f, headH), _sfLeft);
+                g.DrawString(title, _fBentoHeader, titleBr, new RectangleF(rc.X + 54f, rc.Y, rc.Width - 130f, headH), _sfLeft);
+                if (!string.IsNullOrEmpty(rightMeta))
+                    g.DrawString(rightMeta, _fMonoTiny, metaBr, new RectangleF(rc.Right - 130f, rc.Y, 120f, headH), _sfRight);
+            }
+        }
+
+        private void DrawHardwareButton(Graphics g, RectangleF rc, string label, bool primaryAccent, bool danger, Action onClick)
+        {
+            bool hov = rc.Contains(_mousePt);
+            Color bg = primaryAccent
+                ? (hov ? Color.FromArgb(255, 102, 24) : ColAccent)
+                : (danger
+                    ? (hov ? Color.FromArgb(52, 22, 24) : Color.FromArgb(28, 16, 18))
+                    : (hov ? ColDeckHover : ColDeckCard));
+            Color border = primaryAccent
+                ? Color.FromArgb(220, 255, 140, 80)
+                : (danger ? Color.FromArgb(110, 255, 70, 60) : (hov ? ColBorderHi : ColBorder));
+            Color fg = primaryAccent
+                ? Color.FromArgb(12, 12, 14)
+                : (danger ? Color.FromArgb(255, 105, 95) : ColTextMain);
+
+            using (GraphicsPath p = SharpRoundRect(rc, 4f))
+            using (var b = new SolidBrush(bg))
+            using (var pen = new Pen(border, 1f))
+            using (var tb = new SolidBrush(fg))
+            {
+                g.FillPath(b, p);
+                g.DrawPath(pen, p);
+                g.DrawString(label, _fMonoTiny, tb, rc, _sfCenter);
+            }
+            if (onClick != null)
+                _hits.Add(new HitZone { Rect = rc, OnClick = () => { CommitInlineInput(true); onClick(); } });
+        }
+
+        private void DrawPrecisionTickSlider(
+            Graphics g,
+            RectangleF cellRc,
+            string label,
+            int curVal,
+            int minVal,
+            int maxVal,
+            string formattedReadout,
+            int tickCount,
+            Func<int> getter,
+            Action<int> setter)
+        {
+            bool hov = cellRc.Contains(_mousePt);
+            bool filterHit = MatchesFilter(label);
+
+            using (GraphicsPath cp = SharpRoundRect(cellRc, 5f))
+            using (var cb = new SolidBrush(hov ? ColDeckHover : ColDeckInset))
+            using (var cPen = new Pen(filterHit ? ColAccent : (hov ? ColBorderHi : ColBorder), 1f))
+            {
+                g.FillPath(cb, cp);
+                g.DrawPath(cPen, cp);
+            }
+
+            // Top row: Label on left, Clickable Tabular Monospace Readout on right
+            var valBoxRc = new RectangleF(cellRc.Right - 72f, cellRc.Y + 4f, 66f, 19f);
+            bool valHov = valBoxRc.Contains(_mousePt);
+
+            using (var lblBr = new SolidBrush(hov ? ColTextMain : ColTextMuted))
+                g.DrawString(label, _fChip, lblBr, new RectangleF(cellRc.X + 8f, cellRc.Y + 4f, cellRc.Width - 84f, 19f), _sfLeft);
+
+            using (GraphicsPath vp = SharpRoundRect(valBoxRc, 3f))
+            using (var vb = new SolidBrush(Color.FromArgb(10, 10, 12)))
+            using (var vPen = new Pen(valHov ? ColAccent : ColBorder, 1f))
+            using (var vt = new SolidBrush(ColAccent))
+            {
+                g.FillPath(vb, vp);
+                g.DrawPath(vPen, vp);
+                g.DrawString(formattedReadout, _fMonoVal, vt, valBoxRc, _sfCenter);
+            }
+
+            // Bottom row: Precision Graduated Ruler Scale + Active Bar + Hairline Cursor
+            float trackLeft = cellRc.X + 10f;
+            float trackRight = cellRc.Right - 10f;
+            float trackW = Math.Max(24f, trackRight - trackLeft);
+            float rulerBaseY = cellRc.Bottom - 8f;
+            var trackHitRc = new RectangleF(trackLeft, cellRc.Y + 24f, trackW, Math.Max(14f, cellRc.Height - 26f));
+
+            float ratio = (maxVal > minVal)
+                ? Math.Max(0f, Math.Min(1f, (curVal - minVal) / (float)(maxVal - minVal)))
+                : 0f;
+            float activeX = trackLeft + trackW * ratio;
+
+            int ticks = Math.Max(6, tickCount);
+            using (var penDimTick = new Pen(Color.FromArgb(42, 255, 255, 255), 1f))
+            using (var penActTick = new Pen(Color.FromArgb(195, 255, 85, 0), 1f))
+            using (var penRail = new Pen(Color.FromArgb(35, 255, 255, 255), 1.5f))
+            using (var penActiveRail = new Pen(ColAccent, 2.0f))
+            {
+                g.DrawLine(penRail, trackLeft, rulerBaseY, trackRight, rulerBaseY);
+                if (activeX > trackLeft + 1f)
+                    g.DrawLine(penActiveRail, trackLeft, rulerBaseY, activeX, rulerBaseY);
+
+                for (int i = 0; i <= ticks; i++)
+                {
+                    float tx = trackLeft + (trackW * i) / ticks;
+                    bool major = (i == 0 || i == ticks || i == ticks / 2 || i % 4 == 0);
+                    float th = major ? 7.5f : 4.0f;
+                    g.DrawLine(tx <= activeX + 0.5f ? penActTick : penDimTick, tx, rulerBaseY - th, tx, rulerBaseY);
+                }
+            }
+
+            // Precision Hairline Thumb Marker
+            var thumbRc = new RectangleF(activeX - 3.5f, rulerBaseY - 10f, 7f, 12f);
+            using (GraphicsPath tp = SharpRoundRect(thumbRc, 2f))
+            using (var tb = new SolidBrush(ColTextMain))
+            using (var tPen = new Pen(ColAccent, 1.2f))
+            {
+                g.FillPath(tb, tp);
+                g.DrawPath(tPen, tp);
+            }
+
+            _sliderHits.Add(new PrecisionSliderHit
+            {
+                TrackRect = RectangleF.Inflate(trackHitRc, 5f, 3f),
+                WheelRect = cellRc,
+                MinVal = minVal,
+                MaxVal = maxVal,
+                Getter = getter,
+                Setter = setter
+            });
+
+            _hits.Add(new HitZone
+            {
+                Rect = valBoxRc,
+                OnClick = () => BeginInlineNumericEdit(valBoxRc, curVal, minVal, maxVal, setter)
+            });
+        }
+
+        private void DrawSegmentedToggle(Graphics g, RectangleF rowRc, string label, bool value, Action<bool> setter)
+        {
+            bool hov = rowRc.Contains(_mousePt) && _draggingSlider == null;
+            bool filterHit = MatchesFilter(label);
+
+            using (GraphicsPath rp = SharpRoundRect(rowRc, 5f))
+            using (var rb = new SolidBrush(hov ? ColDeckHover : ColDeckInset))
+            using (var rPen = new Pen(filterHit ? ColAccent : (hov ? ColBorderHi : ColBorder), 1f))
+            {
+                g.FillPath(rb, rp);
+                g.DrawPath(rPen, rp);
+            }
+
+            using (var lb = new SolidBrush(value ? ColTextMain : ColTextMuted))
+                g.DrawString(label, _fChip, lb, new RectangleF(rowRc.X + 9f, rowRc.Y, rowRc.Width - 98f, rowRc.Height), _sfLeft);
+
+            // Rigid Segmented Switch: [ OFF | ● ON ]
+            float segW = 78f;
+            float segH = Math.Min(21f, rowRc.Height - 6f);
+            var segRc = new RectangleF(rowRc.Right - segW - 6f, rowRc.Y + (rowRc.Height - segH) / 2f, segW, segH);
+            var offRc = new RectangleF(segRc.X + 1f, segRc.Y + 1f, segW / 2f - 1f, segH - 2f);
+            var onRc = new RectangleF(segRc.X + segW / 2f, segRc.Y + 1f, segW / 2f - 1f, segH - 2f);
+
+            using (GraphicsPath sp = SharpRoundRect(segRc, 3.5f))
+            using (var sb = new SolidBrush(Color.FromArgb(9, 9, 11)))
+            using (var sPen = new Pen(ColBorder, 1f))
+            {
+                g.FillPath(sb, sp);
+                g.DrawPath(sPen, sp);
+            }
+
+            if (!value)
+            {
+                using (GraphicsPath op = SharpRoundRect(offRc, 2.5f))
+                using (var ob = new SolidBrush(Color.FromArgb(38, 40, 48)))
+                    g.FillPath(ob, op);
+            }
+            else
+            {
+                using (GraphicsPath op = SharpRoundRect(onRc, 2.5f))
+                using (var ob = new SolidBrush(Color.FromArgb(48, 255, 85, 0)))
+                using (var oPen = new Pen(ColAccent, 1f))
+                {
+                    g.FillPath(ob, op);
+                    g.DrawPath(oPen, op);
+                }
+                using (var led = new SolidBrush(ColLime))
+                    g.FillEllipse(led, onRc.X + 5f, onRc.Y + (onRc.Height - 5f) / 2f, 5f, 5f);
+            }
+
+            using (var bOff = new SolidBrush(!value ? ColTextMain : ColTextDim))
+            using (var bOn = new SolidBrush(value ? ColTextMain : ColTextDim))
+            {
+                g.DrawString("OFF", _fMonoTiny, bOff, offRc, _sfCenter);
+                g.DrawString(value ? "  ON" : "ON", _fMonoTiny, bOn, onRc, _sfCenter);
+            }
+
+            _hits.Add(new HitZone { Rect = rowRc, OnClick = () => { CommitInlineInput(true); setter(!value); ApplyLive(); } });
+        }
+
+        private void DrawChipSelectorMatrix(
+            Graphics g,
+            RectangleF areaRc,
+            string headerLabel,
+            string[] values,
+            string[] shortLabels,
+            string currentVal,
+            int columns,
+            Action<string> onSelect,
+            Color[] swatchLeds = null)
+        {
+            float curY = areaRc.Y;
+            if (!string.IsNullOrEmpty(headerLabel))
+            {
+                bool fHit = MatchesFilter(headerLabel);
+                using (var hb = new SolidBrush(fHit ? ColAccent : ColTextMuted))
+                    g.DrawString(headerLabel, _fMonoTiny, hb, new RectangleF(areaRc.X + 2f, curY, areaRc.Width, 14f), _sfLeft);
+                curY += 16f;
+            }
+
+            int cols = Math.Max(1, columns);
+            int rows = (values.Length + cols - 1) / cols;
+            float gapX = 5f, gapY = 5f;
+            float availH = Math.Max(22f, areaRc.Bottom - curY);
+            float chipW = (areaRc.Width - gapX * (cols - 1)) / cols;
+            float chipH = Math.Min(26f, (availH - gapY * (rows - 1)) / Math.Max(1, rows));
+
+            for (int i = 0; i < values.Length; i++)
+            {
+                int r = i / cols;
+                int c = i % cols;
+                var cRc = new RectangleF(areaRc.X + c * (chipW + gapX), curY + r * (chipH + gapY), chipW, chipH);
+                string val = values[i];
+                string disp = (shortLabels != null && i < shortLabels.Length) ? shortLabels[i] : val;
+                bool selected = string.Equals(val, currentVal, StringComparison.OrdinalIgnoreCase);
+                bool hov = cRc.Contains(_mousePt);
+
+                using (GraphicsPath cp = SharpRoundRect(cRc, 4f))
+                using (var cb = new SolidBrush(selected ? Color.FromArgb(36, 255, 85, 0) : (hov ? ColDeckHover : ColDeckInset)))
+                using (var cPen = new Pen(selected ? ColAccent : (hov ? ColBorderHi : ColBorder), 1f))
+                {
+                    g.FillPath(cb, cp);
+                    g.DrawPath(cPen, cp);
+                }
+
+                float textLeft = cRc.X + 4f;
+                if (swatchLeds != null && i < swatchLeds.Length)
+                {
+                    var swRc = new RectangleF(cRc.X + 6f, cRc.Y + (cRc.Height - 7f) / 2f, 7f, 7f);
+                    using (var swBr = new SolidBrush(swatchLeds[i]))
+                        g.FillRectangle(swBr, swRc);
+                    textLeft = cRc.X + 16f;
+                }
+                else if (selected)
+                {
+                    using (var ledBr = new SolidBrush(ColAccent))
+                        g.FillEllipse(ledBr, cRc.X + 5f, cRc.Y + (cRc.Height - 5f) / 2f, 5f, 5f);
+                    textLeft = cRc.X + 12f;
+                }
+
+                using (var tb = new SolidBrush(selected ? ColTextMain : (hov ? ColTextMain : ColTextMuted)))
+                {
+                    var txtRc = new RectangleF(textLeft, cRc.Y, cRc.Right - textLeft - 3f, cRc.Height);
+                    g.DrawString(disp, _fChip, tb, txtRc, (swatchLeds != null || selected) ? _sfLeft : _sfCenter);
+                }
+
+                string capturedVal = val;
+                _hits.Add(new HitZone { Rect = cRc, OnClick = () => { CommitInlineInput(true); onSelect(capturedVal); ApplyLive(); } });
+            }
+        }
+
+        private void DrawModuleCartridgeSlot(
+            Graphics g,
+            RectangleF rc,
+            string modCode,
+            string title,
+            string subState,
+            bool enabled,
+            bool hasInspector,
+            bool inspectorActive,
+            Action onToggle,
+            Action onOpenInspector)
+        {
+            bool hov = rc.Contains(_mousePt);
+            bool filterHit = MatchesFilter(title) || MatchesFilter(subState);
+
+            Color bg = enabled
+                ? (hov ? Color.FromArgb(28, 28, 34) : Color.FromArgb(21, 21, 26))
+                : (hov ? Color.FromArgb(20, 20, 24) : ColDeckInset);
+            Color border = filterHit
+                ? ColAccent
+                : (inspectorActive
+                    ? ColBorderHi
+                    : (enabled ? Color.FromArgb(95, 255, 85, 0) : (hov ? ColBorderHi : ColBorder)));
+
+            using (GraphicsPath cp = SharpRoundRect(rc, 5f))
+            using (var cb = new SolidBrush(bg))
+            using (var cPen = new Pen(border, 1f))
+            {
+                g.FillPath(cb, cp);
+                g.DrawPath(cPen, cp);
+            }
+
+            // Left tactile accent notch bar when latched ON
+            if (enabled)
+            {
+                using (var barBr = new SolidBrush(ColAccent))
+                    g.FillRectangle(barBr, rc.X + 1f, rc.Y + 8f, 3f, rc.Height - 16f);
+            }
+
+            // Top-left module code + Top-right LED status lamp
+            using (var codeBr = new SolidBrush(enabled ? ColAccent : ColTextDim))
+                g.DrawString(modCode, _fMonoTiny, codeBr, new RectangleF(rc.X + 10f, rc.Y + 6f, 68f, 13f), _sfLeft);
+
+            Color ledCol = enabled ? ColLime : Color.FromArgb(55, 255, 255, 255);
+            float ledRightOffset = hasInspector ? 34f : 12f;
+            using (var ledBr = new SolidBrush(ledCol))
+                g.FillEllipse(ledBr, rc.Right - ledRightOffset - 6f, rc.Y + 9f, 6f, 6f);
+
+            // Title & live subState
+            using (var tBr = new SolidBrush(enabled ? ColTextMain : ColTextMuted))
+            using (var sBr = new SolidBrush(enabled ? ColTextMuted : ColTextDim))
+            {
+                g.DrawString(title, _fLabel, tBr, new RectangleF(rc.X + 10f, rc.Y + 21f, rc.Width - (hasInspector ? 42f : 16f), 18f), _sfLeft);
+                g.DrawString(subState, _fMonoTiny, sBr, new RectangleF(rc.X + 10f, rc.Y + 41f, rc.Width - (hasInspector ? 42f : 16f), 15f), _sfLeft);
+            }
+
+            if (hasInspector && onOpenInspector != null)
+            {
+                var gearRc = new RectangleF(rc.Right - 28f, rc.Y + 6f, 22f, rc.Height - 12f);
+                bool gHov = gearRc.Contains(_mousePt);
+                using (GraphicsPath gp = SharpRoundRect(gearRc, 3.5f))
+                using (var gb = new SolidBrush(inspectorActive ? ColAccent : (gHov ? ColDeckHover : Color.FromArgb(12, 12, 15))))
+                using (var gPen = new Pen(inspectorActive ? ColAccent : ColBorder, 1f))
+                using (var gt = new SolidBrush(inspectorActive ? Color.FromArgb(12, 12, 14) : ColTextMuted))
+                {
+                    g.FillPath(gb, gp);
+                    g.DrawPath(gPen, gp);
+                    g.DrawString("⚙", _fChip, gt, gearRc, _sfCenter);
+                }
+
+                var mainLatchRc = new RectangleF(rc.X, rc.Y, rc.Width - 30f, rc.Height);
+                _hits.Add(new HitZone { Rect = gearRc, OnClick = () => { CommitInlineInput(true); onOpenInspector(); Invalidate(); } });
+                _hits.Add(new HitZone { Rect = mainLatchRc, OnClick = () => { CommitInlineInput(true); onToggle(); if (onOpenInspector != null) onOpenInspector(); ApplyLive(); } });
+            }
+            else
+            {
+                _hits.Add(new HitZone { Rect = rc, OnClick = () => { CommitInlineInput(true); onToggle(); ApplyLive(); } });
+            }
+        }
+
+        private void DrawLiveSpringOscilloscope(Graphics g, RectangleF scopeRc)
+        {
+            using (GraphicsPath sp = SharpRoundRect(scopeRc, 4f))
+            using (var sb = new SolidBrush(Color.FromArgb(10, 10, 12)))
+            using (var sPen = new Pen(ColBorder, 1f))
+            {
+                g.FillPath(sb, sp);
+                g.DrawPath(sPen, sp);
+            }
+
+            float gx = scopeRc.X + 8f;
+            float gw = scopeRc.Width - 16f;
+            float gyTop = scopeRc.Y + 8f;
+            float gh = scopeRc.Height - 16f;
+            // Map spring output [0.0 .. 1.38] vertically inside scope
+            float yZero = gyTop + gh - 4f;
+            float yOne = gyTop + gh * 0.30f;
+            float scaleY = yZero - yOne;
+
+            using (var gridPen = new Pen(Color.FromArgb(18, 255, 255, 255), 1f))
+            using (var targetPen = new Pen(Color.FromArgb(65, 200, 255, 0), 1f) { DashStyle = DashStyle.Dot })
+            {
+                for (int i = 1; i <= 3; i++)
+                {
+                    float vx = gx + (gw * i) / 4f;
+                    g.DrawLine(gridPen, vx, gyTop, vx, yZero);
+                }
+                g.DrawLine(targetPen, gx, yOne, gx + gw, yOne);
+            }
+
+            int samples = 56;
+            PointF[] pts = new PointF[samples + 1];
+            float peak = 1.0f;
+            for (int i = 0; i <= samples; i++)
+            {
+                float t = i / (float)samples;
+                float val = EvaluateStageSpring(t, true);
+                if (val > peak) peak = val;
+                float px = gx + gw * t;
+                float py = Math.Max(scopeRc.Y + 3f, Math.Min(scopeRc.Bottom - 3f, yZero - val * scaleY));
+                pts[i] = new PointF(px, py);
+            }
+
+            using (var curvePen = new Pen(ColAccent, 1.75f))
+                g.DrawLines(curvePen, pts);
+
+            // Live playhead dot during TEST PULSE
+            long pulseElapsed = Environment.TickCount - _stagePulseStartMs;
+            if (pulseElapsed >= 0 && pulseElapsed <= _cfg.anim_duration_ms + 120)
+            {
+                float pt = Math.Max(0f, Math.Min(1f, pulseElapsed / (float)Math.Max(100, _cfg.anim_duration_ms)));
+                float pv = EvaluateStageSpring(pt, true);
+                float dx = gx + gw * pt;
+                float dy = Math.Max(scopeRc.Y + 3f, Math.Min(scopeRc.Bottom - 3f, yZero - pv * scaleY));
+                using (var dotBr = new SolidBrush(ColLime))
+                    g.FillEllipse(dotBr, dx - 3.5f, dy - 3.5f, 7f, 7f);
+            }
+
+            string tele = string.Format("PEAK {0:0.00}x  •  T={1:0.00}s", peak, _cfg.anim_duration_ms / 1000.0);
+            using (var tb = new SolidBrush(ColTextMuted))
+                g.DrawString(tele, _fMonoTiny, tb, new RectangleF(scopeRc.X + 8f, scopeRc.Bottom - 16f, scopeRc.Width - 14f, 14f), _sfRight);
+        }
+
+        private void DrawSpatialScreenPad(Graphics g, RectangleF padRc)
+        {
+            _spatialPadRect = padRc;
+            bool hov = padRc.Contains(_mousePt) || _draggingSpatialPad;
+
+            using (GraphicsPath pp = SharpRoundRect(padRc, 5f))
+            using (var pb = new SolidBrush(Color.FromArgb(10, 10, 13)))
+            using (var pPen = new Pen(hov ? ColAccent : ColBorderHi, 1f))
+            {
+                g.FillPath(pb, pp);
+                g.DrawPath(pPen, pp);
+            }
+
+            // Engineering grid + Center X=0 & Top Y=0 guides
+            float midX = padRc.X + padRc.Width * 0.5f;
+            using (var axisPen = new Pen(Color.FromArgb(30, 255, 255, 255), 1f) { DashStyle = DashStyle.Dot })
+            using (var bezelPen = new Pen(Color.FromArgb(90, 255, 85, 0), 1.5f))
+            {
+                g.DrawLine(axisPen, midX, padRc.Y + 2f, midX, padRc.Bottom - 2f);
+                g.DrawLine(axisPen, padRc.X + 2f, padRc.Y + padRc.Height * 0.5f, padRc.Right - 2f, padRc.Y + padRc.Height * 0.5f);
+                g.DrawLine(bezelPen, padRc.X + 8f, padRc.Y + 6f, padRc.Right - 8f, padRc.Y + 6f);
+            }
+
+            // Map horizontal_offset (-500..+500) and top_margin (0..120) onto schematic pad
+            float normX = (_cfg.horizontal_offset + 500f) / 1000f; // 0..1
+            float normY = _cfg.top_margin / 120f;                  // 0..1
+            float pillW = Math.Max(44f, Math.Min(110f, _cfg.idle_width * 0.20f));
+            float pillH = Math.Max(10f, Math.Min(22f, _cfg.idle_height * 0.34f));
+
+            float usableW = padRc.Width - pillW - 16f;
+            float usableH = padRc.Height - pillH - 26f;
+            float ix = padRc.X + 8f + normX * usableW;
+            float iy = padRc.Y + 8f + normY * usableH;
+
+            // Coordinate crosshair lines to miniature island
+            using (var guidePen = new Pen(Color.FromArgb(65, 255, 85, 0), 1f))
+            {
+                g.DrawLine(guidePen, ix + pillW / 2f, padRc.Y + 6f, ix + pillW / 2f, iy);
+            }
+
+            var miniPill = new RectangleF(ix, iy, pillW, pillH);
+            using (GraphicsPath mp = SharpRoundRect(miniPill, pillH / 2f))
+            using (var mb = new SolidBrush(ColPureIsland))
+            using (var mPen = new Pen(ColAccent, 1.4f))
+            {
+                g.FillPath(mb, mp);
+                g.DrawPath(mPen, mp);
+            }
+
+            string posTxt = string.Format("X:{0:+#;-#;0}px  Y:+{1}px  •  DRAG TO MOVE", _cfg.horizontal_offset, _cfg.top_margin);
+            using (var tb = new SolidBrush(ColTextMuted))
+                g.DrawString(posTxt, _fMonoTiny, tb, new RectangleF(padRc.X + 8f, padRc.Bottom - 17f, padRc.Width - 16f, 15f), _sfLeft);
+        }
+        // =====================================================================
+        // ZONE 1 (LIVE STAGE) + ZONE 2 (MODE RAIL) + ZONE 3 (INSTRUMENT DECK)
+        // =====================================================================
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
@@ -3566,561 +4326,605 @@ namespace DynamicIslandWin
 
             _hits.Clear();
             _sliderHits.Clear();
-            _tabRects.Clear();
+            _spatialPadRect = RectangleF.Empty;
 
-            // Modern Deep Obsidian Sidebar (#0D0F15 -> #12151F)
-            var sideRc = new RectangleF(0, 0, 206, Height);
-            using (var sb = new LinearGradientBrush(sideRc, Color.FromArgb(12, 14, 20), Color.FromArgb(17, 20, 29), 90f))
-                g.FillRectangle(sb, sideRc);
+            using (var bgBr = new SolidBrush(ColChassis))
+                g.FillRectangle(bgBr, ClientRectangle);
 
-            // Right Studio Canvas (#151822 -> #1A1E2B)
-            var mainRc = new RectangleF(206, 0, Width - 206, Height);
-            using (var mb = new LinearGradientBrush(mainRc, Color.FromArgb(20, 23, 33), Color.FromArgb(25, 29, 41), 115f))
-                g.FillRectangle(mb, mainRc);
-
-            // Subtle ambient top-right glow
-            using (GraphicsPath glowPath = new GraphicsPath())
+            // -----------------------------------------------------------------
+            // TOP CONSOLE HEADER BAR (y = 0..34)
+            // -----------------------------------------------------------------
+            using (var barBr = new SolidBrush(Color.FromArgb(14, 14, 17)))
+            using (var barPen = new Pen(ColBorder, 1f))
             {
-                glowPath.AddEllipse(Width - 240, -90, 300, 200);
-                using (var pgb = new PathGradientBrush(glowPath))
-                {
-                    pgb.CenterColor = Color.FromArgb(28, 99, 102, 241);
-                    pgb.SurroundColors = new Color[] { Color.FromArgb(0, 99, 102, 241) };
-                    g.FillPath(pgb, glowPath);
-                }
+                g.FillRectangle(barBr, 0, 0, Width, 34);
+                g.DrawLine(barPen, 0, 34, Width, 34);
             }
 
-            using (var divPen = new Pen(Color.FromArgb(26, 255, 255, 255), 1f))
-                g.DrawLine(divPen, 206, 0, 206, Height);
-
-            // macOS Traffic Lights
-            _rcCloseTraffic = new RectangleF(22, 20, 13, 13);
-            _rcResetTraffic = new RectangleF(43, 20, 13, 13);
-            _rcSaveTraffic = new RectangleF(64, 20, 13, 13);
-
-            using (var bRed = new SolidBrush(Color.FromArgb(255, 95, 86)))
-            using (var bYel = new SolidBrush(Color.FromArgb(255, 189, 46)))
-            using (var bGrn = new SolidBrush(Color.FromArgb(39, 201, 63)))
+            using (var accBr = new SolidBrush(ColAccent))
+            using (var titleBr = new SolidBrush(ColTextMain))
+            using (var dimBr = new SolidBrush(ColTextDim))
             {
-                g.FillEllipse(bRed, _rcCloseTraffic);
-                g.FillEllipse(bYel, _rcResetTraffic);
-                g.FillEllipse(bGrn, _rcSaveTraffic);
+                g.FillRectangle(accBr, 14, 11, 8, 12);
+                g.DrawString("DYNAMIC ISLAND // KINETIC STAGE & DECK", _fConsoleBrand, titleBr, new RectangleF(28, 0, 330, 34), _sfLeft);
+                g.DrawString("MOTION LAB v3.0  •  CLICK VALUE = KEYBOARD  •  WHEEL = ±1", _fMonoTiny, dimBr, new RectangleF(352, 0, 275, 34), _sfLeft);
             }
 
-            // Brand Header with custom app icon
-            var badgeRc = new RectangleF(22, 48, 34, 34);
-            if (Icon != null)
+            DrawHardwareButton(g, new RectangleF(Width - 252, 6, 76, 22), "ВЫХОД APP", false, true, () => Application.Exit());
+            DrawHardwareButton(g, new RectangleF(Width - 170, 6, 80, 22), "ПРИМЕНИТЬ", false, false, () => ApplyLive());
+            DrawHardwareButton(g, new RectangleF(Width - 84, 6, 70, 22), "ГОТОВО ✕", true, false, () =>
             {
-                using (Bitmap icoBmp = Icon.ToBitmap())
-                {
-                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    g.DrawImage(icoBmp, badgeRc);
-                }
-            }
-            else
-            {
-                using (GraphicsPath bp = RoundRect(badgeRc, 9f))
-                using (var bg = new LinearGradientBrush(badgeRc, Color.FromArgb(99, 102, 241), Color.FromArgb(14, 165, 233), 45f))
-                using (var bt = new SolidBrush(Color.White))
-                {
-                    g.FillPath(bg, bp);
-                    g.DrawString("◈", _fSide, bt, badgeRc, _sfCenter);
-                }
-            }
-
-            using (var brTitle = new SolidBrush(Color.FromArgb(245, 247, 252)))
-            using (var brSub = new SolidBrush(Color.FromArgb(135, 142, 162)))
-            {
-                g.DrawString("Dynamic Island", _fSide, brTitle, new RectangleF(62, 47, 136, 18), _sfLeft);
-                g.DrawString("Studio Pro • v2.9", _fSmall, brSub, new RectangleF(62, 64, 136, 16), _sfLeft);
-            }
-
-            // Sidebar Navigation Pills
-            float navY = 100f;
-            for (int i = 0; i < _tabNames.Length; i++)
-            {
-                var navRc = new RectangleF(14, navY, 178, 38);
-                _tabRects.Add(navRc);
-                bool active = (i == _activeTab);
-                bool hovered = navRc.Contains(_mousePt);
-
-                if (active)
-                {
-                    using (GraphicsPath np = RoundRect(navRc, 10f))
-                    using (var nb = new LinearGradientBrush(navRc, Color.FromArgb(55, 99, 102, 241), Color.FromArgb(28, 14, 165, 233), 0f))
-                    using (var nPen = new Pen(Color.FromArgb(75, 129, 140, 248), 1f))
-                    {
-                        g.FillPath(nb, np);
-                        g.DrawPath(nPen, np);
-                    }
-                    var barRc = new RectangleF(navRc.X + 4, navRc.Y + 9, 3.5f, navRc.Height - 18);
-                    using (GraphicsPath bp = RoundRect(barRc, 2f))
-                    using (var bb = new SolidBrush(Color.FromArgb(129, 140, 248)))
-                        g.FillPath(bb, bp);
-                }
-                else if (hovered)
-                {
-                    using (GraphicsPath np = RoundRect(navRc, 10f))
-                    using (var nb = new SolidBrush(Color.FromArgb(16, 255, 255, 255)))
-                        g.FillPath(nb, np);
-                }
-
-                using (var icBr = new SolidBrush(active ? Color.FromArgb(129, 140, 248) : Color.FromArgb(140, 146, 165)))
-                using (var tb = new SolidBrush(active ? Color.White : Color.FromArgb(195, 200, 214)))
-                {
-                    g.DrawString(_tabIcons[i], _fSide, icBr, new RectangleF(navRc.X + 12, navRc.Y, 22, navRc.Height), _sfCenter);
-                    g.DrawString(_tabNames[i], _fSide, tb, new RectangleF(navRc.X + 36, navRc.Y, navRc.Width - 42, navRc.Height), _sfLeft);
-                }
-
-                navY += 44f;
-            }
-
-            // Sidebar Footer Buttons: SWAPPED "Готово" (Top) and "Применить" (Middle), then "Выйти" (Bottom)
-            var rcDoneBtn = new RectangleF(16, Height - 128, 174, 33);
-            using (GraphicsPath dp = RoundRect(rcDoneBtn, 9f))
-            using (var db = new LinearGradientBrush(rcDoneBtn, Color.FromArgb(10, 132, 255), Color.FromArgb(56, 189, 248), 0f))
-            using (var dt = new SolidBrush(Color.White))
-            {
-                g.FillPath(db, dp);
-                g.DrawString("Готово", _fSide, dt, rcDoneBtn, _sfCenter);
-            }
-            _hits.Add(new HitAction { Rect = rcDoneBtn, OnClick = () => { CommitInlineEdit(true); ApplyLive(); DialogResult = DialogResult.OK; Close(); } });
-
-            bool recentlyApplied = (Environment.TickCount - _appliedFlashTick) < 1600 && _appliedFlashTick != 0;
-            var rcApplyBtn = new RectangleF(16, Height - 88, 174, 33);
-            using (GraphicsPath ap = RoundRect(rcApplyBtn, 9f))
-            using (var ab = new SolidBrush(recentlyApplied ? Color.FromArgb(48, 209, 88) : Color.FromArgb(42, 46, 62)))
-            using (var aPen = new Pen(Color.FromArgb(65, 129, 140, 248), 1f))
-            using (var at = new SolidBrush(Color.White))
-            {
-                g.FillPath(ab, ap);
-                if (!recentlyApplied) g.DrawPath(aPen, ap);
-                g.DrawString(recentlyApplied ? "✓ Сохранено" : "Применить", _fSide, at, rcApplyBtn, _sfCenter);
-            }
-            _hits.Add(new HitAction
-            {
-                Rect = rcApplyBtn,
-                OnClick = () =>
-                {
-                    CommitInlineEdit(true);
-                    _appliedFlashTick = Environment.TickCount;
-                    ApplyLive();
-                }
+                CommitInlineInput(true);
+                ApplyLive();
+                DialogResult = DialogResult.OK;
+                Close();
             });
 
-            var rcQuitBtn = new RectangleF(16, Height - 46, 174, 30);
-            using (GraphicsPath qp = RoundRect(rcQuitBtn, 8f))
-            using (var qb = new SolidBrush(Color.FromArgb(28, 255, 69, 58)))
-            using (var qt = new SolidBrush(Color.FromArgb(255, 95, 86)))
-            {
-                g.FillPath(qb, qp);
-                g.DrawString("Выйти из приложения", _fSmall, qt, rcQuitBtn, _sfCenter);
-            }
-            _hits.Add(new HitAction { Rect = rcQuitBtn, OnClick = () => Application.Exit() });
+            // -----------------------------------------------------------------
+            // ZONE 1: INTERACTIVE STAGE (y = 40..260, ~38% of window height)
+            // -----------------------------------------------------------------
+            var stageRc = new RectangleF(14f, 40f, Width - 28f, 220f);
+            PaintInteractiveStage(g, stageRc);
 
-            // Right Pane Header
-            using (var brHead = new SolidBrush(Color.FromArgb(248, 249, 253)))
-            using (var brHint = new SolidBrush(Color.FromArgb(138, 145, 165)))
-            {
-                g.DrawString(_tabNames[_activeTab], _fHeader, brHead, new RectangleF(230, 18, 250, 30), _sfLeft);
-                g.DrawString("Клик по числу справа от ползунка — ввод с клавиатуры", _fSmall, brHint, new RectangleF(390, 23, 276, 20), _sfRight);
-            }
+            // -----------------------------------------------------------------
+            // ZONE 2: CENTRAL MODE RAIL (y = 266..302)
+            // -----------------------------------------------------------------
+            var railRc = new RectangleF(14f, 266f, Width - 28f, 36f);
+            PaintModeRail(g, railRc);
 
-            float cardX = 230f;
-            float cardW = Width - 254f;
-            float curY = 58f;
+            // -----------------------------------------------------------------
+            // ZONE 3: ASYMMETRIC BENTO INSTRUMENT DECK (y = 308..628)
+            // -----------------------------------------------------------------
+            if (_activeTab == 0) PaintDeck01PhysicsAndShape(g);
+            else if (_activeTab == 1) PaintDeck02ModulesAndAudio(g);
+            else if (_activeTab == 2) PaintDeck03ScreenAndModes(g);
+            else PaintDeck04SkinAndSystem(g);
 
-            if (_activeTab == 0) PaintTabGeometry(g, cardX, cardW, ref curY);
-            else if (_activeTab == 1) PaintTabAppearance(g, cardX, cardW, ref curY);
-            else if (_activeTab == 2) PaintTabPhysics(g, cardX, cardW, ref curY);
-            else PaintTabWidgets(g, cardX, cardW, ref curY);
-
-            // Outer glass specular border
-            using (GraphicsPath wp = RoundRect(new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), 26f))
-            using (var wPen = new Pen(Color.FromArgb(46, 255, 255, 255), 1f))
-                g.DrawPath(wPen, wp);
-        }
-        private void BeginCardGroup(Graphics g, float x, float y, float w, int rowCount, float rowH = 38f)
-        {
-            float h = rowCount * rowH;
-            var rc = new RectangleF(x, y, w, h);
-            using (GraphicsPath cp = RoundRect(rc, 13f))
-            using (var cb = new LinearGradientBrush(rc, Color.FromArgb(32, 36, 49), Color.FromArgb(27, 31, 43), 90f))
-            using (var cPen = new Pen(Color.FromArgb(26, 255, 255, 255), 1f))
-            {
-                g.FillPath(cb, cp);
-                g.DrawPath(cPen, cp);
-            }
-            using (var linePen = new Pen(Color.FromArgb(16, 255, 255, 255), 1f))
-            {
-                for (int i = 1; i < rowCount; i++)
-                {
-                    float ly = y + i * rowH;
-                    g.DrawLine(linePen, x + 16f, ly, x + w - 16f, ly);
-                }
-            }
+            // Crisp 1px Chassis Outer Frame
+            using (GraphicsPath framePath = SharpRoundRect(new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), 9f))
+            using (var framePen = new Pen(ColBorderHi, 1f))
+                g.DrawPath(framePen, framePath);
         }
 
-        private void DrawRowHoverIfInside(Graphics g, RectangleF rowRc)
+        private void PaintInteractiveStage(Graphics g, RectangleF stageRc)
         {
-            if (rowRc.Contains(_mousePt) && _activeDraggingSlider == null)
+            using (GraphicsPath sp = SharpRoundRect(stageRc, 6f))
+            using (var sb = new SolidBrush(ColStageBg))
+            using (var sPen = new Pen(ColBorder, 1f))
             {
-                var hRc = RectangleF.Inflate(rowRc, -3f, -2f);
-                using (GraphicsPath hp = RoundRect(hRc, 9f))
-                using (var hb = new SolidBrush(Color.FromArgb(12, 255, 255, 255)))
-                    g.FillPath(hb, hp);
-            }
-        }
-
-        private void AddToggleRow(Graphics g, float x, ref float y, float w, string label, bool value, Action<bool> setter, float rowH = 38f)
-        {
-            var rowRc = new RectangleF(x, y, w, rowH);
-            DrawRowHoverIfInside(g, rowRc);
-
-            using (var tb = new SolidBrush(Color.FromArgb(238, 240, 248)))
-                g.DrawString(label, _fRowTitle, tb, new RectangleF(x + 15f, y, w - 78f, rowH), _sfLeft);
-
-            var swRc = new RectangleF(x + w - 56f, y + (rowH - 22f) / 2f, 42f, 22f);
-            using (GraphicsPath sp = RoundRect(swRc, 11f))
-            using (var sb = new SolidBrush(value ? Color.FromArgb(52, 211, 153) : Color.FromArgb(54, 59, 76)))
                 g.FillPath(sb, sp);
-
-            float knobX = value ? (swRc.Right - 20f) : (swRc.X + 2f);
-            using (var kb = new SolidBrush(Color.White))
-                g.FillEllipse(kb, knobX, swRc.Y + 2f, 18f, 18f);
-
-            _hits.Add(new HitAction { Rect = rowRc, OnClick = () => { CommitInlineEdit(true); setter(!value); ApplyLive(); } });
-            y += rowH;
-        }
-
-        private void AddSliderRow(Graphics g, float x, ref float y, float w, string label, int curVal, int minVal, int maxVal, string unit, Action<int> setter, float rowH = 38f)
-        {
-            var rowRc = new RectangleF(x, y, w, rowH);
-            DrawRowHoverIfInside(g, rowRc);
-
-            using (var tb = new SolidBrush(Color.FromArgb(238, 240, 248)))
-                g.DrawString(label, _fRowTitle, tb, new RectangleF(x + 15f, y, w - 224f, rowH), _sfLeft);
-
-            float trackW = 138f;
-            float trackH = 7.2f;
-            float trackX = x + w - 210f;
-            float trackY = y + (rowH - trackH) / 2f;
-            var trackRc = new RectangleF(trackX, trackY, trackW, trackH);
-
-            using (GraphicsPath tp = RoundRect(trackRc, trackH / 2f))
-            using (var tBr = new SolidBrush(Color.FromArgb(46, 51, 68)))
-                g.FillPath(tBr, tp);
-
-            float ratio = (maxVal > minVal) ? Math.Max(0f, Math.Min(1f, (curVal - minVal) / (float)(maxVal - minVal))) : 0f;
-            float fillW = Math.Max(trackH, trackW * ratio);
-            var fillRc = new RectangleF(trackX, trackY, fillW, trackH);
-            using (GraphicsPath fp = RoundRect(fillRc, trackH / 2f))
-            using (var fBr = new LinearGradientBrush(new PointF(trackX, trackY), new PointF(trackX + trackW, trackY),
-                Color.FromArgb(99, 102, 241), Color.FromArgb(56, 189, 248)))
-            {
-                g.FillPath(fBr, fp);
+                g.DrawPath(sPen, sp);
             }
 
-            float knobSz = 16.0f;
-            float knobX = trackX + fillW - knobSz / 2f;
-            float knobY = y + (rowH - knobSz) / 2f;
-            using (var haloBr = new SolidBrush(Color.FromArgb(45, 99, 102, 241)))
-            using (var kBr = new SolidBrush(Color.FromArgb(129, 140, 248)))
-            using (var kPen = new Pen(Color.FromArgb(235, 255, 255, 255), 1.4f))
+            Region prevClip = g.Clip;
+            using (GraphicsPath clipPath = SharpRoundRect(stageRc, 6f))
             {
-                g.FillEllipse(haloBr, knobX - 3f, knobY - 3f, knobSz + 6f, knobSz + 6f);
-                g.FillEllipse(kBr, knobX, knobY, knobSz, knobSz);
-                g.DrawEllipse(kPen, knobX, knobY, knobSz, knobSz);
-            }
+                g.SetClip(clipPath);
 
-            var rcVal = new RectangleF(x + w - 62f, y + 6f, 50f, rowH - 12f);
-            bool valHovered = rcVal.Contains(_mousePt);
-            string displayVal = string.IsNullOrEmpty(unit) ? curVal.ToString() : (curVal + (unit == "%" ? "%" : " " + unit));
-            using (GraphicsPath vp = RoundRect(rcVal, 6f))
-            using (var valBg = new SolidBrush(Color.FromArgb(20, 23, 34)))
-            using (var valPen = new Pen(valHovered ? Color.FromArgb(140, 56, 189, 248) : Color.FromArgb(40, 255, 255, 255), 1f))
-            using (var valBr = new SolidBrush(Color.FromArgb(125, 211, 252)))
-            {
-                g.FillPath(valBg, vp);
-                g.DrawPath(valPen, vp);
-                g.DrawString(displayVal, _fRowValue, valBr, rcVal, _sfCenter);
-            }
-
-            _sliderHits.Add(new SliderTrackHit
-            {
-                TrackRect = RectangleF.Inflate(trackRc, 6f, 10f),
-                MinVal = minVal,
-                MaxVal = maxVal,
-                Setter = setter
-            });
-            _hits.Add(new HitAction
-            {
-                Rect = rcVal,
-                OnClick = () => BeginInlineEdit(rcVal, curVal, minVal, maxVal, setter)
-            });
-            y += rowH;
-        }
-
-        private void AddCycleRow(Graphics g, float x, ref float y, float w, string label, string currentVal, Action onCycle, float rowH = 38f)
-        {
-            var rowRc = new RectangleF(x, y, w, rowH);
-            DrawRowHoverIfInside(g, rowRc);
-
-            using (var tb = new SolidBrush(Color.FromArgb(238, 240, 248)))
-                g.DrawString(label, _fRowTitle, tb, new RectangleF(x + 15f, y, w - 195f, rowH), _sfLeft);
-
-            var pillRc = new RectangleF(x + w - 182f, y + (rowH - 25f) / 2f, 168f, 25f);
-            using (GraphicsPath pp = RoundRect(pillRc, 7.5f))
-            using (var pb = new SolidBrush(Color.FromArgb(44, 49, 66)))
-            using (var pPen = new Pen(Color.FromArgb(35, 255, 255, 255), 1f))
-            using (var pt = new SolidBrush(Color.FromArgb(125, 211, 252)))
-            {
-                g.FillPath(pb, pp);
-                g.DrawPath(pPen, pp);
-                g.DrawString(currentVal + "  ▾", _fRowValue, pt, pillRc, _sfCenter);
-            }
-
-            _hits.Add(new HitAction { Rect = rowRc, OnClick = () => { CommitInlineEdit(true); onCycle(); ApplyLive(); } });
-            y += rowH;
-        }
-
-        private void PaintTabGeometry(Graphics g, float x, float w, ref float y)
-        {
-            Screen[] screens = Screen.AllScreens;
-            int monCount = Math.Max(1, screens.Length);
-            string monLabel = string.Format("Монитор {0} из {1}", _cfg.monitor_index + 1, monCount);
-
-            BeginCardGroup(g, x, y, w, 9, 38f);
-            AddCycleRow(g, x, ref y, w, "Активный дисплей", monLabel, () =>
-            {
-                _cfg.monitor_index = (_cfg.monitor_index + 1) % monCount;
-            });
-            AddSliderRow(g, x, ref y, w, "Отступ от верхнего края", _cfg.top_margin, 0, 120, "px", v => _cfg.top_margin = v);
-            AddSliderRow(g, x, ref y, w, "Горизонтальный сдвиг", _cfg.horizontal_offset, -500, 500, "px", v => _cfg.horizontal_offset = v);
-            AddSliderRow(g, x, ref y, w, "Ширина компактной капсулы", _cfg.idle_width, 160, 480, "px", v => _cfg.idle_width = v);
-            AddSliderRow(g, x, ref y, w, "Высота компактной капсулы", _cfg.idle_height, 26, 68, "px", v => _cfg.idle_height = v);
-            AddSliderRow(g, x, ref y, w, "Ширина раскрытой панели", _cfg.expanded_width, 360, 860, "px", v => _cfg.expanded_width = v);
-            AddSliderRow(g, x, ref y, w, "Высота раскрытой панели", _cfg.expanded_height, 165, 430, "px", v => _cfg.expanded_height = v);
-            AddSliderRow(g, x, ref y, w, "Масштаб интерфейса", _cfg.ui_scale_percent, 80, 150, "%", v => _cfg.ui_scale_percent = v);
-            AddSliderRow(g, x, ref y, w, "Радиус скругления углов", _cfg.corner_radius, 12, 48, "px", v => _cfg.corner_radius = v);
-
-            y += 12f;
-            var resetRc = new RectangleF(x, y, w, 34f);
-            using (GraphicsPath rp = RoundRect(resetRc, 10f))
-            using (var rb = new SolidBrush(Color.FromArgb(32, 36, 49)))
-            using (var rPen = new Pen(Color.FromArgb(45, 56, 189, 248), 1f))
-            using (var rt = new SolidBrush(Color.FromArgb(56, 189, 248)))
-            {
-                g.FillPath(rb, rp);
-                g.DrawPath(rPen, rp);
-                g.DrawString("↺  Сбросить размеры к эталону Apple (или LCtrl + СКМ)", _fRowValue, rt, resetRc, _sfCenter);
-            }
-            _hits.Add(new HitAction
-            {
-                Rect = resetRc,
-                OnClick = () =>
+                // 1) Dot-Matrix Engineering Grid (16px pitch)
+                using (var dotBr = new SolidBrush(Color.FromArgb(20, 255, 255, 255)))
                 {
-                    CommitInlineEdit(false);
-                    _cfg.top_margin = 8; _cfg.horizontal_offset = 0;
-                    _cfg.idle_width = 310; _cfg.idle_height = 36;
-                    _cfg.expanded_width = 520; _cfg.expanded_height = 224;
-                    _cfg.ui_scale_percent = 100; _cfg.corner_radius = 30;
-                    ApplyLive();
-                }
-            });
-        }
-
-        private void PaintTabAppearance(Graphics g, float x, float w, ref float y)
-        {
-            BeginCardGroup(g, x, y, w, 4, 38f);
-
-            string bgName = string.IsNullOrEmpty(_cfg.custom_bg_path) ? "Чёрный OLED (По умолчанию)" : Path.GetFileName(_cfg.custom_bg_path);
-            using (var tb = new SolidBrush(Color.FromArgb(238, 240, 248)))
-                g.DrawString("Фон: " + bgName, _fRowTitle, tb, new RectangleF(x + 15f, y, w - 170f, 38f), _sfLeft);
-
-            var btnPick = new RectangleF(x + w - 154f, y + 7f, 88f, 24f);
-            var btnClear = new RectangleF(x + w - 60f, y + 7f, 48f, 24f);
-            using (GraphicsPath p1 = RoundRect(btnPick, 6f))
-            using (GraphicsPath p2 = RoundRect(btnClear, 6f))
-            using (var bBlue = new LinearGradientBrush(btnPick, Color.FromArgb(99, 102, 241), Color.FromArgb(14, 165, 233), 0f))
-            using (var bGray = new SolidBrush(Color.FromArgb(54, 59, 76)))
-            using (var bWhite = new SolidBrush(Color.White))
-            {
-                g.FillPath(bBlue, p1);
-                g.FillPath(bGray, p2);
-                g.DrawString("GIF / Фото", _fSmall, bWhite, btnPick, _sfCenter);
-                g.DrawString("Сброс", _fSmall, bWhite, btnClear, _sfCenter);
-            }
-            _hits.Add(new HitAction
-            {
-                Rect = btnPick,
-                OnClick = () =>
-                {
-                    CommitInlineEdit(true);
-                    using (var ofd = new OpenFileDialog())
+                    for (float gx = stageRc.X + 14f; gx < stageRc.Right - 8f; gx += 16f)
                     {
-                        ofd.Title = "Выберите GIF или Фото для фона Dynamic Island";
-                        ofd.Filter = "GIF и Фото (*.gif;*.png;*.jpg;*.jpeg;*.bmp)|*.gif;*.png;*.jpg;*.jpeg;*.bmp";
-                        if (ofd.ShowDialog(this) == DialogResult.OK)
+                        for (float gy = stageRc.Y + 12f; gy < stageRc.Bottom - 34f; gy += 16f)
                         {
-                            _cfg.custom_bg_path = ofd.FileName;
-                            ApplyLive();
+                            g.FillRectangle(dotBr, gx, gy, 1.3f, 1.3f);
                         }
                     }
                 }
-            });
-            _hits.Add(new HitAction { Rect = btnClear, OnClick = () => { CommitInlineEdit(true); _cfg.custom_bg_path = ""; ApplyLive(); } });
-            y += 38f;
 
-            string[] fits = { "1:1 По размеру островка", "Smart Cover", "Contain" };
-            AddCycleRow(g, x, ref y, w, "Подгонка изображения", _cfg.custom_bg_fit_mode, () =>
-            {
-                int idx = Array.IndexOf(fits, _cfg.custom_bg_fit_mode);
-                _cfg.custom_bg_fit_mode = fits[(idx + 1) % fits.Length];
-            });
+                // 2) Top Screen Bezel Axis & Vertical Center Axis
+                float bezelY = stageRc.Y + 22f;
+                float centerX = stageRc.X + stageRc.Width * 0.5f;
+                using (var axisPen = new Pen(Color.FromArgb(26, 255, 255, 255), 1f) { DashStyle = DashStyle.Dot })
+                using (var bezelPen = new Pen(Color.FromArgb(60, 255, 255, 255), 1f))
+                using (var axisLblBr = new SolidBrush(ColTextDim))
+                {
+                    g.DrawLine(bezelPen, stageRc.X + 12f, bezelY, stageRc.Right - 12f, bezelY);
+                    g.DrawLine(axisPen, centerX, bezelY - 8f, centerX, stageRc.Bottom - 36f);
+                    g.DrawString("SCREEN TOP EDGE [Y=0]", _fMonoTiny, axisLblBr, new RectangleF(stageRc.X + 14f, stageRc.Y + 5f, 160f, 14f), _sfLeft);
+                    g.DrawString(string.Format("LIVE STAGE  •  DX:{0:+#;-#;0}PX  DY:+{1}PX  R:{2}PX", _cfg.horizontal_offset, _cfg.top_margin, _cfg.corner_radius),
+                        _fMonoTiny, axisLblBr, new RectangleF(stageRc.Right - 310f, stageRc.Y + 5f, 296f, 14f), _sfRight);
+                }
 
-            string[] scopes = { "Везде", "Только компактный", "Только раскрытый" };
-            AddCycleRow(g, x, ref y, w, "Где показывать GIF/Фото", _cfg.custom_bg_scope, () =>
-            {
-                int idx = Array.IndexOf(scopes, _cfg.custom_bg_scope);
-                _cfg.custom_bg_scope = scopes[(idx + 1) % scopes.Length];
-            });
+                // 3) Scale & Position the Pure #000000 Dynamic Island Capsule on Stage
+                float maxStagePillW = stageRc.Width - 150f;
+                float maxStagePillH = 142f;
+                float fitScale = Math.Min(1.0f, Math.Min(maxStagePillW / Math.Max(1f, _stageCurW), maxStagePillH / Math.Max(1f, _stageCurH)));
+                float drawW = _stageCurW * fitScale;
+                float drawH = _stageCurH * fitScale;
 
-            AddSliderRow(g, x, ref y, w, "Затемнение фото/GIF", _cfg.custom_bg_dim_percent, 0, 85, "%", v => _cfg.custom_bg_dim_percent = v);
+                float stageOffsetX = Math.Max(-140f, Math.Min(140f, _cfg.horizontal_offset * 0.24f));
+                float stageMarginY = Math.Max(2f, Math.Min(32f, _cfg.top_margin * 0.30f));
+                var pillRc = new RectangleF(centerX - drawW * 0.5f + stageOffsetX, bezelY + stageMarginY, drawW, drawH);
+                _stageIslandHitRect = pillRc;
 
-            y += 14f;
-            BeginCardGroup(g, x, y, w, 5, 38f);
-            string[] themes = { "Dinasmic Neon", "Apple Blue", "iOS Cyan-Purple", "Yandex Gold-Yellow", "Spotify Neon Green", "Crimson Sunset", "Minimal White" };
-            AddCycleRow(g, x, ref y, w, "Цветовой акцент", _cfg.theme_preset, () =>
-            {
-                int idx = Array.IndexOf(themes, _cfg.theme_preset);
-                _cfg.theme_preset = themes[(idx + 1) % themes.Length];
-            });
+                float compactRad = pillRc.Height * 0.5f;
+                float expRad = Math.Max(10f, _cfg.corner_radius * fitScale);
+                float rad = compactRad * (1f - _stageCurExp) + expRad * _stageCurExp;
 
-            string[] eqs = { "5 Полос", "7 Полос", "Выкл" };
-            AddCycleRow(g, x, ref y, w, "Динамический эквалайзер", _cfg.eq_style, () =>
-            {
-                int idx = Array.IndexOf(eqs, _cfg.eq_style);
-                _cfg.eq_style = eqs[(idx + 1) % eqs.Length];
-            });
+                Color tc1, tc2;
+                GetPreviewThemeColors(255, out tc1, out tc2);
 
-            int opacityPct = (int)Math.Round(_cfg.bg_opacity / 2.55f);
-            AddSliderRow(g, x, ref y, w, "Прозрачность / Плотность фона", opacityPct, 25, 100, "%",
-                v => _cfg.bg_opacity = Math.Max(64, Math.Min(255, (int)Math.Round(v * 2.55f))));
+                // Dimension Engineering Callouts around Capsule
+                using (var dimPen = new Pen(Color.FromArgb(55, 255, 85, 0), 1f))
+                using (var dimTxt = new SolidBrush(ColAccent))
+                {
+                    float callY = Math.Min(stageRc.Bottom - 46f, pillRc.Bottom + 7f);
+                    g.DrawLine(dimPen, pillRc.Left, callY, pillRc.Right, callY);
+                    g.DrawLine(dimPen, pillRc.Left, callY - 3f, pillRc.Left, callY + 3f);
+                    g.DrawLine(dimPen, pillRc.Right, callY - 3f, pillRc.Right, callY + 3f);
+                    string dimLabel = string.Format("{0:0} × {1:0} px", _stageCurW, _stageCurH);
+                    g.DrawString(dimLabel, _fMonoTiny, dimTxt, new RectangleF(pillRc.Right + 6f, pillRc.Y + (pillRc.Height - 14f) * 0.5f, 92f, 14f), _sfLeft);
+                }
 
-            AddSliderRow(g, x, ref y, w, "Блик стеклянной грани", _cfg.border_glow, 0, 140, "", v => _cfg.border_glow = v);
+                // Pure #000000 Island Body + Custom GIF/Photo Preview + 1px Specular Highlight
+                _stageBgPreview.EnsureLoaded(_cfg.custom_bg_path);
+                bool showBgOnStage = _stageBgPreview.HasImage &&
+                    !((_cfg.custom_bg_scope ?? "").Contains("компакт") && _stageCurExp > 0.5f) &&
+                    !((_cfg.custom_bg_scope ?? "").Contains("раскрыт") && _stageCurExp < 0.5f);
 
-            AddToggleRow(g, x, ref y, w, "Обложка и название трека в компактном режиме", _cfg.show_compact_cover, v => _cfg.show_compact_cover = v);
-        }
+                using (GraphicsPath capPath = SharpRoundRect(pillRc, rad))
+                {
+                    using (var pureBlk = new SolidBrush(ColPureIsland))
+                        g.FillPath(pureBlk, capPath);
 
-        private void PaintTabPhysics(Graphics g, float x, float w, ref float y)
-        {
-            BeginCardGroup(g, x, y, w, 6, 36f);
-            string[] fsModes = { "Неоновая телеметрия", "Авто-скрытие", "Только по клику" };
-            AddCycleRow(g, x, ref y, w, "Умный игровой режим (D3D Fullscreen)", _cfg.fullscreen_mode ?? "Неоновая телеметрия", () =>
-            {
-                int idx = Array.IndexOf(fsModes, _cfg.fullscreen_mode);
-                _cfg.fullscreen_mode = fsModes[(idx + 1) % fsModes.Length];
-                _cfg.hide_in_fullscreen = (_cfg.fullscreen_mode == "Авто-скрытие");
-            }, 36f);
-            AddToggleRow(g, x, ref y, w, "Режим «Призрака» (20% прозрачность, клик сквозь остров, 0.5с / Alt+Space)", _cfg.enable_ghost_mode, v => _cfg.enable_ghost_mode = v, 36f);
-            AddToggleRow(g, x, ref y, w, "Раскрывать при наведении курсора (Hover)", _cfg.expand_on_hover, v => _cfg.expand_on_hover = v, 36f);
-            AddToggleRow(g, x, ref y, w, "Растягивание островка зажатием LCtrl + Мышь", _cfg.enable_lctrl_resize, v => _cfg.enable_lctrl_resize = v, 36f);
-            AddToggleRow(g, x, ref y, w, "Приоритет Яндекс Музыки / Spotify над браузером", _cfg.prefer_music_players, v => _cfg.prefer_music_players = v, 36f);
-            AddToggleRow(g, x, ref y, w, "Индикатор микрофона и быстрый мьют (CoreAudio)", _cfg.enable_mic_indicator, v => _cfg.enable_mic_indicator = v, 36f);
+                    if (showBgOnStage)
+                    {
+                        _stageBgPreview.DrawBackgroundIntoCapsule(g, capPath, pillRc, _cfg.custom_bg_fit_mode, _cfg.custom_bg_dim_percent, _stageAnimating);
+                    }
 
-            y += 10f;
-            BeginCardGroup(g, x, y, w, 4, 36f);
-            AddSliderRow(g, x, ref y, w, "Длительность анимации", _cfg.anim_duration_ms, 120, 800, "мс", v => _cfg.anim_duration_ms = v, 36f);
-            AddSliderRow(g, x, ref y, w, "Импульс пружины Apple Spring", _cfg.spring_overshoot_pct, 75, 180, "%", v => _cfg.spring_overshoot_pct = v, 36f);
-            AddSliderRow(g, x, ref y, w, "Задержка перед сворачиванием", _cfg.collapse_delay_ms, 100, 3000, "мс", v => _cfg.collapse_delay_ms = v, 36f);
-            string[] wdActions = { "Сон", "Гибернация", "Выключение" };
-            AddCycleRow(g, x, ref y, w, "Действие Стоп-таймера загрузок (Watchdog)", _cfg.watchdog_action ?? "Сон", () =>
-            {
-                int idx = Array.IndexOf(wdActions, _cfg.watchdog_action);
-                _cfg.watchdog_action = wdActions[(idx + 1) % wdActions.Length];
-            }, 36f);
-        }
+                    // Render live simulated modules inside #000000 Stage Capsule
+                    PaintStageIslandContents(g, pillRc, tc1, tc2);
 
-        private void PaintTabWidgets(Graphics g, float x, float w, ref float y)
-        {
-            BeginCardGroup(g, x, y, w, 9, 38f);
-            AddToggleRow(g, x, ref y, w, "Всплывающие уведомления Live Activities", _cfg.enable_live_activities, v => _cfg.enable_live_activities = v);
-            AddToggleRow(g, x, ref y, w, "Показывать часы слева в компактной капсуле", _cfg.show_clock, v => _cfg.show_clock = v);
-            AddToggleRow(g, x, ref y, w, "Показывать заряд аккумулятора", _cfg.show_battery, v => _cfg.show_battery = v);
-            AddToggleRow(g, x, ref y, w, "Файловая полка Dropzone (временный буфер)", _cfg.show_dropzone, v => _cfg.show_dropzone = v);
-            AddToggleRow(g, x, ref y, w, "Монитор ресурсов (CPU • RAM • Сеть)", _cfg.show_telemetry, v => _cfg.show_telemetry = v);
-            AddSliderRow(g, x, ref y, w, "Таймер фокусировки (Помодоро)", _cfg.pomodoro_minutes, 1, 240, "мин", v => _cfg.pomodoro_minutes = v);
+                    int rimAlpha = Math.Max(48, Math.Min(235, 65 + _cfg.border_glow));
+                    using (var rimGrad = new LinearGradientBrush(
+                        new PointF(pillRc.Left, pillRc.Top),
+                        new PointF(pillRc.Right, pillRc.Bottom),
+                        Color.FromArgb(rimAlpha, 255, 255, 255),
+                        Color.FromArgb(Math.Max(35, rimAlpha / 2), tc1.R, tc1.G, tc1.B)))
+                    using (var rimPen = new Pen(rimGrad, 1.1f))
+                    {
+                        g.DrawPath(rimPen, capPath);
+                    }
+                }
 
-            // Row 7: Timer Sound Preset + "▶ Тест" Preview Button
-            var rowPresetRc = new RectangleF(x, y, w, 38f);
-            DrawRowHoverIfInside(g, rowPresetRc);
-            using (var tb = new SolidBrush(Color.FromArgb(238, 240, 248)))
-                g.DrawString("Звук окончания таймера", _fRowTitle, tb, new RectangleF(x + 15f, y, w - 235f, 38f), _sfLeft);
-
-            var pillSoundRc = new RectangleF(x + w - 218f, y + 6.5f, 146f, 25f);
-            var btnTestRc = new RectangleF(x + w - 66f, y + 6.5f, 54f, 25f);
-            using (GraphicsPath sp = RoundRect(pillSoundRc, 7.5f))
-            using (GraphicsPath tp = RoundRect(btnTestRc, 7.5f))
-            using (var pb = new SolidBrush(Color.FromArgb(44, 49, 66)))
-            using (var tb2 = new SolidBrush(Color.FromArgb(38, 160, 110)))
-            using (var pt = new SolidBrush(Color.FromArgb(125, 211, 252)))
-            using (var wt = new SolidBrush(Color.White))
-            {
-                g.FillPath(pb, sp);
-                g.FillPath(tb2, tp);
-                g.DrawString((_cfg.timer_sound_preset ?? "Apple Radar") + " ▾", _fRowValue, pt, pillSoundRc, _sfCenter);
-                g.DrawString("▶ Тест", _fSmall, wt, btnTestRc, _sfCenter);
+                g.Clip = prevClip;
             }
-            _hits.Add(new HitAction
+
+            // Clicking the Stage Island toggles Compact <-> Expanded spring preview
+            _hits.Add(new HitZone
             {
-                Rect = pillSoundRc,
+                Rect = _stageIslandHitRect,
                 OnClick = () =>
                 {
-                    CommitInlineEdit(true);
-                    int idx = Array.IndexOf(TimerSoundEngine.Presets, _cfg.timer_sound_preset);
-                    _cfg.timer_sound_preset = TimerSoundEngine.Presets[(idx + 1) % TimerSoundEngine.Presets.Length];
-                    ApplyLive();
-                    TimerSoundEngine.PlayAlert(_cfg);
+                    _stageMode = (_stageMode == StagePreviewMode.Expanded) ? StagePreviewMode.Compact : StagePreviewMode.Expanded;
+                    SyncStageTargetsFromMode(true);
                 }
             });
-            _hits.Add(new HitAction
+
+            // 4) Stage Bottom Control Bar: [IDLE] [COMPACT] [EXPANDED] [MEDIA] [NOTIFY] ... [⚡ TEST PULSE]
+            float ctrlY = stageRc.Bottom - 30f;
+            using (var stripPen = new Pen(ColBorder, 1f))
+                g.DrawLine(stripPen, stageRc.X + 1f, ctrlY - 4f, stageRc.Right - 1f, ctrlY - 4f);
+
+            string[] modeNames = { "IDLE", "COMPACT", "EXPANDED", "MEDIA", "NOTIFY" };
+            float mx = stageRc.X + 10f;
+            for (int i = 0; i < modeNames.Length; i++)
             {
-                Rect = btnTestRc,
-                OnClick = () =>
+                StagePreviewMode m = (StagePreviewMode)i;
+                bool act = (_stageMode == m);
+                var mRc = new RectangleF(mx, ctrlY, 76f, 22f);
+                bool mHov = mRc.Contains(_mousePt);
+
+                using (GraphicsPath mp = SharpRoundRect(mRc, 3.5f))
+                using (var mb = new SolidBrush(act ? Color.FromArgb(42, 255, 85, 0) : (mHov ? ColDeckHover : ColDeckCard)))
+                using (var mPen = new Pen(act ? ColAccent : ColBorder, 1f))
+                using (var mt = new SolidBrush(act ? ColTextMain : ColTextMuted))
                 {
-                    CommitInlineEdit(true);
-                    TimerSoundEngine.PlayAlert(_cfg);
+                    g.FillPath(mb, mp);
+                    g.DrawPath(mPen, mp);
+                    g.DrawString(modeNames[i], _fMonoTiny, mt, mRc, _sfCenter);
                 }
-            });
-            y += 38f;
 
-            // Row 8: Custom Timer Audio File Picker (just like Custom Background!)
-            string sndName = string.IsNullOrEmpty(_cfg.timer_custom_sound_path)
-                ? "Не выбран (Встроенный звук)"
-                : Path.GetFileName(_cfg.timer_custom_sound_path);
-            using (var tb = new SolidBrush(Color.FromArgb(238, 240, 248)))
-                g.DrawString("Свой звук: " + sndName, _fRowTitle, tb, new RectangleF(x + 15f, y, w - 175f, 38f), _sfLeft);
-
-            var btnPickSnd = new RectangleF(x + w - 154f, y + 7f, 88f, 24f);
-            var btnClearSnd = new RectangleF(x + w - 60f, y + 7f, 48f, 24f);
-            using (GraphicsPath p1 = RoundRect(btnPickSnd, 6f))
-            using (GraphicsPath p2 = RoundRect(btnClearSnd, 6f))
-            using (var bBlue = new LinearGradientBrush(btnPickSnd, Color.FromArgb(99, 102, 241), Color.FromArgb(14, 165, 233), 0f))
-            using (var bGray = new SolidBrush(Color.FromArgb(54, 59, 76)))
-            using (var bWhite = new SolidBrush(Color.White))
-            {
-                g.FillPath(bBlue, p1);
-                g.FillPath(bGray, p2);
-                g.DrawString("Свой файл", _fSmall, bWhite, btnPickSnd, _sfCenter);
-                g.DrawString("Сброс", _fSmall, bWhite, btnClearSnd, _sfCenter);
-            }
-            _hits.Add(new HitAction
-            {
-                Rect = btnPickSnd,
-                OnClick = () =>
+                StagePreviewMode capturedMode = m;
+                _hits.Add(new HitZone
                 {
-                    CommitInlineEdit(true);
+                    Rect = mRc,
+                    OnClick = () =>
+                    {
+                        _stageMode = capturedMode;
+                        SyncStageTargetsFromMode(true);
+                    }
+                });
+                mx += 81f;
+            }
+
+            DrawHardwareButton(g, new RectangleF(stageRc.Right - 128f, ctrlY, 118f, 22f), "⚡ TEST PULSE", true, false, TriggerTestPulse);
+        }
+
+        private void PaintStageIslandContents(Graphics g, RectangleF pillRc, Color tc1, Color tc2)
+        {
+            if (_stageCurExp > 0.55f)
+            {
+                // Expanded Dashboard Mini-Preview inside Stage Capsule
+                float pad = 10f;
+                var mediaBox = new RectangleF(pillRc.X + pad, pillRc.Y + 8f, pillRc.Width - pad * 2f, Math.Min(42f, pillRc.Height * 0.34f));
+                using (GraphicsPath mp = SharpRoundRect(mediaBox, 8f))
+                using (var mb = new SolidBrush(Color.FromArgb(26, 255, 255, 255)))
+                {
+                    g.FillPath(mb, mp);
+                }
+
+                var covRc = new RectangleF(mediaBox.X + 6f, mediaBox.Y + 5f, mediaBox.Height - 10f, mediaBox.Height - 10f);
+                using (GraphicsPath cp = SharpRoundRect(covRc, 5f))
+                using (var cg = new LinearGradientBrush(covRc, tc1, tc2, 45f))
+                    g.FillPath(cg, cp);
+
+                using (var wBr = new SolidBrush(ColTextMain))
+                using (var mBr = new SolidBrush(ColTextMuted))
+                {
+                    g.DrawString("DYNAMIC STUDIO • LIVE", _fMonoTiny, wBr, new RectangleF(covRc.Right + 8f, mediaBox.Y + 5f, mediaBox.Width - 95f, 14f), _sfLeft);
+                    g.DrawString(_cfg.theme_preset ?? "Dinasmic Neon", _fSub, mBr, new RectangleF(covRc.Right + 8f, mediaBox.Y + 19f, mediaBox.Width - 95f, 14f), _sfLeft);
+                }
+
+                // Dual Volume + Dock preview row
+                float row2Y = mediaBox.Bottom + 6f;
+                if (row2Y + 18f < pillRc.Bottom - 8f)
+                {
+                    float halfW = (mediaBox.Width - 6f) * 0.5f;
+                    var v1 = new RectangleF(mediaBox.X, row2Y, halfW, 15f);
+                    var v2 = new RectangleF(mediaBox.X + halfW + 6f, row2Y, halfW, 15f);
+                    using (var vb = new SolidBrush(Color.FromArgb(20, 255, 255, 255)))
+                    using (var af = new SolidBrush(tc1))
+                    {
+                        g.FillRectangle(vb, v1);
+                        g.FillRectangle(vb, v2);
+                        g.FillRectangle(af, v1.X + 4f, v1.Y + 6f, v1.Width * 0.68f, 3f);
+                        g.FillRectangle(af, v2.X + 4f, v2.Y + 6f, v2.Width * 0.84f, 3f);
+                    }
+                }
+
+                // Telemetry / Dropzone footer if enabled
+                if ((_cfg.show_dropzone || _cfg.show_telemetry) && pillRc.Height > 92f)
+                {
+                    using (var tBr = new SolidBrush(ColTextMuted))
+                    {
+                        string foot = (_cfg.show_dropzone ? "[DROPZONE]  " : "") + (_cfg.show_telemetry ? "CPU 14% • RAM 42% • ↓12.4 MB/s" : "");
+                        g.DrawString(foot, _fMonoTiny, tBr, new RectangleF(pillRc.X + 10f, pillRc.Bottom - 20f, pillRc.Width - 20f, 14f), _sfCenter);
+                    }
+                }
+                return;
+            }
+
+            if (_stageMode == StagePreviewMode.Notify)
+            {
+                using (var dotBr = new SolidBrush(ColAccent))
+                using (var txtBr = new SolidBrush(ColTextMain))
+                {
+                    g.FillEllipse(dotBr, pillRc.X + 12f, pillRc.Y + (pillRc.Height - 8f) / 2f, 8f, 8f);
+                    g.DrawString("🔔 ТАЙМЕР " + _cfg.pomodoro_minutes + ":00  •  LIVE ACTIVITY", _fMonoTiny, txtBr,
+                        new RectangleF(pillRc.X + 26f, pillRc.Y, pillRc.Width - 34f, pillRc.Height), _sfLeft);
+                }
+                return;
+            }
+
+            // Compact / Idle / Media Stage Preview
+            float leftCur = pillRc.X + 10f;
+            if (_cfg.show_clock)
+            {
+                using (var clkBr = new SolidBrush(ColTextMain))
+                    g.DrawString(DateTime.Now.ToString("HH:mm"), _fMonoTiny, clkBr, new RectangleF(leftCur, pillRc.Y, 38f, pillRc.Height), _sfLeft);
+                leftCur += 40f;
+            }
+
+            if (_cfg.enable_mic_indicator)
+            {
+                using (var micBr = new SolidBrush(Color.FromArgb(48, 209, 88)))
+                    g.FillEllipse(micBr, leftCur, pillRc.Y + (pillRc.Height - 6f) / 2f, 6f, 6f);
+                leftCur += 12f;
+            }
+
+            if ((_stageMode == StagePreviewMode.Compact || _stageMode == StagePreviewMode.Media) && _cfg.show_compact_cover && pillRc.Width > 170f)
+            {
+                float cSz = Math.Min(18f, pillRc.Height - 8f);
+                var cov = new RectangleF(leftCur + 2f, pillRc.Y + (pillRc.Height - cSz) / 2f, cSz, cSz);
+                using (GraphicsPath cp = SharpRoundRect(cov, 4f))
+                using (var cg = new LinearGradientBrush(cov, tc1, tc2, 45f))
+                    g.FillPath(cg, cp);
+
+                using (var tBr = new SolidBrush(ColTextMain))
+                    g.DrawString(_stageMode == StagePreviewMode.Media ? "KINETIC AUDIO • 60HZ" : "YANDEX / SPOTIFY",
+                        _fMonoTiny, tBr, new RectangleF(cov.Right + 6f, pillRc.Y, pillRc.Width - (cov.Right - pillRc.X) - 52f, pillRc.Height), _sfLeft);
+            }
+            else if (_cfg.show_battery && _stageMode == StagePreviewMode.Idle)
+            {
+                using (var batBr = new SolidBrush(ColLime))
+                    g.DrawString("98%", _fMonoTiny, batBr, new RectangleF(leftCur + 2f, pillRc.Y, 34f, pillRc.Height), _sfLeft);
+            }
+
+            // Live Equalizer Bars on right of Compact Stage Capsule
+            if (_cfg.eq_style != "Выкл" && _cfg.eq_style != "Off")
+            {
+                int bars = (_cfg.eq_style != null && _cfg.eq_style.Contains("7")) ? 7 : 5;
+                float bw = 2.4f, gap = 2.2f;
+                float totalW = bars * bw + (bars - 1) * gap;
+                float sx = pillRc.Right - 11f - totalW;
+                float cy = pillRc.Y + pillRc.Height * 0.5f;
+                float maxH = Math.Min(16f, pillRc.Height - 10f);
+
+                using (var b1 = new SolidBrush(tc1))
+                using (var b2 = new SolidBrush(tc2))
+                {
+                    for (int i = 0; i < bars; i++)
+                    {
+                        float amp = (_stageMode == StagePreviewMode.Idle)
+                            ? 0.25f
+                            : (0.35f + 0.62f * Math.Abs((float)Math.Sin(_stageWavePhase + i * 0.85f)));
+                        float bh = Math.Max(3f, maxH * amp);
+                        g.FillRectangle((i % 2 == 0) ? b1 : b2, sx + i * (bw + gap), cy - bh * 0.5f, bw, bh);
+                    }
+                }
+            }
+        }
+
+        private void PaintModeRail(Graphics g, RectangleF railRc)
+        {
+            using (GraphicsPath rp = SharpRoundRect(railRc, 5f))
+            using (var rb = new SolidBrush(ColDeckCard))
+            using (var rPen = new Pen(ColBorder, 1f))
+            {
+                g.FillPath(rb, rp);
+                g.DrawPath(rPen, rp);
+            }
+
+            float bx = railRc.X + 4f;
+            float by = railRc.Y + 4f;
+            float bh = railRc.Height - 8f;
+            float tabW = 148f;
+
+            for (int i = 0; i < _railTitles.Length; i++)
+            {
+                var tRc = new RectangleF(bx, by, tabW, bh);
+                bool active = (_activeTab == i);
+                bool hov = tRc.Contains(_mousePt);
+
+                using (GraphicsPath tp = SharpRoundRect(tRc, 3.5f))
+                using (var tb = new SolidBrush(active ? Color.FromArgb(34, 255, 85, 0) : (hov ? ColDeckHover : Color.Transparent)))
+                {
+                    g.FillPath(tb, tp);
+                    if (active)
+                    {
+                        using (var aPen = new Pen(ColAccent, 1f))
+                            g.DrawPath(aPen, tp);
+                    }
+                }
+
+                using (var cBr = new SolidBrush(active ? ColAccent : ColTextDim))
+                using (var nBr = new SolidBrush(active ? ColTextMain : ColTextMuted))
+                {
+                    g.DrawString(_railCodes[i], _fMonoTiny, cBr, new RectangleF(tRc.X + 7f, tRc.Y, 22f, bh), _sfLeft);
+                    g.DrawString(_railTitles[i], _fChip, nBr, new RectangleF(tRc.X + 27f, tRc.Y, tRc.Width - 30f, bh), _sfLeft);
+                }
+
+                int capturedIdx = i;
+                _hits.Add(new HitZone { Rect = tRc, OnClick = () => { CommitInlineInput(true); _activeTab = capturedIdx; Invalidate(); } });
+                bx += tabW + 4f;
+            }
+
+            // Right Side of Mode Rail: [ ⌕ ФИЛЬТР ] + [ ● SYNCED ] + [ ↺ СБРОС ]
+            var searchRc = new RectangleF(railRc.Right - 242f, by, 98f, bh);
+            bool sHov = searchRc.Contains(_mousePt) || _editingFilter;
+            using (GraphicsPath sp = SharpRoundRect(searchRc, 3.5f))
+            using (var sb = new SolidBrush(ColDeckInset))
+            using (var sPen = new Pen((!string.IsNullOrEmpty(_filterQuery) || sHov) ? ColAccent : ColBorder, 1f))
+            using (var st = new SolidBrush(string.IsNullOrEmpty(_filterQuery) ? ColTextMuted : ColAccent))
+            {
+                g.FillPath(sb, sp);
+                g.DrawPath(sPen, sp);
+                string fTxt = string.IsNullOrEmpty(_filterQuery) ? "⌕ ПОИСК..." : ("⌕ " + _filterQuery);
+                if (!_editingFilter)
+                    g.DrawString(fTxt, _fMonoTiny, st, new RectangleF(searchRc.X + 6f, searchRc.Y, searchRc.Width - 10f, bh), _sfLeft);
+            }
+            _hits.Add(new HitZone { Rect = searchRc, OnClick = () => BeginInlineFilterEdit(searchRc) });
+
+            bool justSaved = (Environment.TickCount - _lastModifiedTick) < 1200 && _lastModifiedTick != 0;
+            var statusRc = new RectangleF(railRc.Right - 138f, by, 72f, bh);
+            using (var ledBr = new SolidBrush(justSaved ? ColAccent : ColLime))
+            using (var stBr = new SolidBrush(justSaved ? ColAccent : ColTextMuted))
+            {
+                g.FillEllipse(ledBr, statusRc.X + 4f, statusRc.Y + (bh - 6f) / 2f, 6f, 6f);
+                g.DrawString(justSaved ? "SAVING" : "SYNCED", _fMonoTiny, stBr, new RectangleF(statusRc.X + 14f, statusRc.Y, 58f, bh), _sfLeft);
+            }
+
+            DrawHardwareButton(g, new RectangleF(railRc.Right - 62f, by, 58f, bh), "↺ СБРОС", false, false, () =>
+            {
+                CommitInlineInput(false);
+                _filterQuery = "";
+                _cfg.top_margin = 8; _cfg.horizontal_offset = 0;
+                _cfg.idle_width = 310; _cfg.idle_height = 36;
+                _cfg.expanded_width = 520; _cfg.expanded_height = 224;
+                _cfg.ui_scale_percent = 100; _cfg.corner_radius = 30;
+                _cfg.anim_duration_ms = 330; _cfg.spring_overshoot_pct = 112;
+                ApplyLive();
+            });
+        }
+        private void PaintDeck01PhysicsAndShape(Graphics g)
+        {
+            var leftCell = new RectangleF(14f, 308f, 488f, 318f);
+            DrawBentoCell(g, leftCell, "01.A", "ГЕОМЕТРИЯ И ПРОПОРЦИИ КАПСУЛЫ", "PRECISION RULERS");
+
+            float gx = leftCell.X + 10f;
+            float gy = leftCell.Y + 32f;
+            float colW = (leftCell.Width - 28f) * 0.5f;
+            float rowH = 84f;
+            float gapY = 8f;
+
+            DrawPrecisionTickSlider(g, new RectangleF(gx, gy, colW, rowH),
+                "ШИРИНА КОМПАКТ", _cfg.idle_width, 160, 480, _cfg.idle_width + "px", 16,
+                () => _cfg.idle_width, v => { _cfg.idle_width = v; _stageMode = StagePreviewMode.Compact; });
+
+            DrawPrecisionTickSlider(g, new RectangleF(gx + colW + 8f, gy, colW, rowH),
+                "ВЫСОТА КОМПАКТ", _cfg.idle_height, 26, 68, _cfg.idle_height + "px", 14,
+                () => _cfg.idle_height, v => { _cfg.idle_height = v; _stageMode = StagePreviewMode.Compact; });
+
+            gy += rowH + gapY;
+            DrawPrecisionTickSlider(g, new RectangleF(gx, gy, colW, rowH),
+                "ШИРИНА РАСКРЫТ.", _cfg.expanded_width, 360, 860, _cfg.expanded_width + "px", 16,
+                () => _cfg.expanded_width, v => { _cfg.expanded_width = v; _stageMode = StagePreviewMode.Expanded; });
+
+            DrawPrecisionTickSlider(g, new RectangleF(gx + colW + 8f, gy, colW, rowH),
+                "ВЫСОТА РАСКРЫТ.", _cfg.expanded_height, 165, 430, _cfg.expanded_height + "px", 14,
+                () => _cfg.expanded_height, v => { _cfg.expanded_height = v; _stageMode = StagePreviewMode.Expanded; });
+
+            gy += rowH + gapY;
+            DrawPrecisionTickSlider(g, new RectangleF(gx, gy, colW, rowH),
+                "РАДИУС СКРУГЛЕНИЯ", _cfg.corner_radius, 12, 48, _cfg.corner_radius + "px", 12,
+                () => _cfg.corner_radius, v => _cfg.corner_radius = v);
+
+            DrawPrecisionTickSlider(g, new RectangleF(gx + colW + 8f, gy, colW, rowH),
+                "МАСШТАБ UI", _cfg.ui_scale_percent, 80, 150, _cfg.ui_scale_percent + "%", 14,
+                () => _cfg.ui_scale_percent, v => _cfg.ui_scale_percent = v);
+
+            var springCell = new RectangleF(510f, 308f, 356f, 214f);
+            DrawBentoCell(g, springCell, "01.B", "ОСЦИЛЛОГРАФ ПРУЖИНЫ", "DAMPED SPRING");
+
+            DrawLiveSpringOscilloscope(g, new RectangleF(springCell.X + 10f, springCell.Y + 30f, springCell.Width - 20f, 56f));
+
+            float sy = springCell.Y + 92f;
+            float sColW = (springCell.Width - 26f) * 0.5f;
+            DrawPrecisionTickSlider(g, new RectangleF(springCell.X + 10f, sy, sColW, 54f),
+                "СКОРОСТЬ", _cfg.anim_duration_ms, 120, 800, string.Format("{0:0.00}s", _cfg.anim_duration_ms / 1000.0), 10,
+                () => _cfg.anim_duration_ms, v => _cfg.anim_duration_ms = v);
+
+            DrawPrecisionTickSlider(g, new RectangleF(springCell.X + 16f + sColW, sy, sColW, 54f),
+                "УПРУГОСТЬ", _cfg.spring_overshoot_pct, 75, 180, string.Format("{0:0.00}x", _cfg.spring_overshoot_pct / 100.0), 10,
+                () => _cfg.spring_overshoot_pct, v => _cfg.spring_overshoot_pct = v);
+
+            DrawPrecisionTickSlider(g, new RectangleF(springCell.X + 10f, sy + 60f, springCell.Width - 20f, 52f),
+                "ЗАДЕРЖКА СВОРАЧИВАНИЯ ПОСЛЕ УХОДА КУРСОРА", _cfg.collapse_delay_ms, 100, 3000, _cfg.collapse_delay_ms + "ms", 16,
+                () => _cfg.collapse_delay_ms, v => _cfg.collapse_delay_ms = v);
+
+            var trigCell = new RectangleF(510f, 530f, 356f, 96f);
+            DrawBentoCell(g, trigCell, "01.C", "ТАКТИЛЬНЫЙ ОТКЛИК", "INPUT TRIGGERS");
+
+            DrawSegmentedToggle(g, new RectangleF(trigCell.X + 10f, trigCell.Y + 30f, trigCell.Width - 20f, 28f),
+                "РАСКРЫВАТЬ ПРИ НАВЕДЕНИИ (HOVER)", _cfg.expand_on_hover, v => _cfg.expand_on_hover = v);
+            DrawSegmentedToggle(g, new RectangleF(trigCell.X + 10f, trigCell.Y + 62f, trigCell.Width - 20f, 28f),
+                "СВОБОДНЫЙ РЕСАЙЗ LCTRL + МЫШЬ", _cfg.enable_lctrl_resize, v => _cfg.enable_lctrl_resize = v);
+        }
+
+        private void PaintDeck02ModulesAndAudio(Graphics g)
+        {
+            var slotBay = new RectangleF(14f, 308f, 514f, 318f);
+            DrawBentoCell(g, slotBay, "02.A", "СЛОТЫ МОДУЛЕЙ И ВИДЖЕТОВ", "CLICK = LATCH  •  ⚙ = TUNE");
+
+            float cx = slotBay.X + 10f;
+            float cy = slotBay.Y + 32f;
+            float cW = (slotBay.Width - 28f) * 0.5f;
+            float cH = 63f;
+            float gapY = 6f;
+
+            DrawModuleCartridgeSlot(g, new RectangleF(cx, cy, cW, cH),
+                "MOD-01", "МЕДИА В КАПСУЛЕ", _cfg.show_compact_cover ? ("АКТИВЕН • EQ " + (_cfg.eq_style ?? "5 Полос")) : "ОТКЛЮЧЕН",
+                _cfg.show_compact_cover, true, _inspectorSubMode == 1,
+                () => _cfg.show_compact_cover = !_cfg.show_compact_cover, () => _inspectorSubMode = 1);
+
+            DrawModuleCartridgeSlot(g, new RectangleF(cx + cW + 8f, cy, cW, cH),
+                "MOD-02", "ТАЙМЕР ПОМОДОРО", _cfg.pomodoro_minutes + " МИН • " + (_cfg.timer_sound_preset ?? "Apple Radar"),
+                _cfg.timer_sound_preset != "Без звука", true, _inspectorSubMode == 0,
+                () => _inspectorSubMode = 0, () => _inspectorSubMode = 0);
+
+            cy += cH + gapY;
+            DrawModuleCartridgeSlot(g, new RectangleF(cx, cy, cW, cH),
+                "MOD-03", "LIVE УВЕДОМЛЕНИЯ", _cfg.enable_live_activities ? "ВСПЛЫВАЮЩИЕ БАННЕРЫ" : "БЕЗ БАННЕРОВ",
+                _cfg.enable_live_activities, false, false,
+                () => _cfg.enable_live_activities = !_cfg.enable_live_activities, null);
+
+            DrawModuleCartridgeSlot(g, new RectangleF(cx + cW + 8f, cy, cW, cH),
+                "MOD-04", "ЧАСЫ КАПСУЛЫ", _cfg.show_clock ? "СЛЕВА • ФОРМАТ 24Ч" : "СКРЫТЫ",
+                _cfg.show_clock, false, false,
+                () => _cfg.show_clock = !_cfg.show_clock, null);
+
+            cy += cH + gapY;
+            DrawModuleCartridgeSlot(g, new RectangleF(cx, cy, cW, cH),
+                "MOD-05", "ЗАРЯД БАТАРЕИ", _cfg.show_battery ? "МОНИТОРИНГ ПИТАНИЯ" : "СКРЫТ",
+                _cfg.show_battery, false, false,
+                () => _cfg.show_battery = !_cfg.show_battery, null);
+
+            DrawModuleCartridgeSlot(g, new RectangleF(cx + cW + 8f, cy, cW, cH),
+                "MOD-06", "МИКРОФОН COREAUDIO", _cfg.enable_mic_indicator ? "LED + БЫСТРЫЙ МЬЮТ" : "ВЫКЛЮЧЕН",
+                _cfg.enable_mic_indicator, false, false,
+                () => _cfg.enable_mic_indicator = !_cfg.enable_mic_indicator, null);
+
+            cy += cH + gapY;
+            DrawModuleCartridgeSlot(g, new RectangleF(cx, cy, cW, cH),
+                "MOD-07", "ПОЛКА DROPZONE", _cfg.show_dropzone ? "БУФЕР ФАЙЛОВ DRAG&DROP" : "ВЫКЛЮЧЕНА",
+                _cfg.show_dropzone, false, false,
+                () => _cfg.show_dropzone = !_cfg.show_dropzone, null);
+
+            DrawModuleCartridgeSlot(g, new RectangleF(cx + cW + 8f, cy, cW, cH),
+                "MOD-08", "ТЕЛЕМЕТРИЯ & VAULT", _cfg.show_telemetry ? ("CPU/RAM + " + (_cfg.watchdog_action ?? "Сон")) : "СКРЫТА",
+                _cfg.show_telemetry, true, _inspectorSubMode == 2,
+                () => _cfg.show_telemetry = !_cfg.show_telemetry, () => _inspectorSubMode = 2);
+
+            var insp = new RectangleF(536f, 308f, 330f, 318f);
+            string[] subTabs = { "ТАЙМЕР/ЗВУК", "ПЛЕЕР/EQ", "СКРИНЫ/СОН" };
+            DrawBentoCell(g, insp, "02.B", "ИНСПЕКТОР МОДУЛЯ", "SLOT TUNER");
+
+            float sx = insp.X + 10f;
+            float sy = insp.Y + 30f;
+            float stW = (insp.Width - 28f) / 3f;
+            for (int i = 0; i < 3; i++)
+            {
+                var stRc = new RectangleF(sx + i * (stW + 4f), sy, stW, 22f);
+                bool act = (_inspectorSubMode == i);
+                using (GraphicsPath sp = SharpRoundRect(stRc, 3.5f))
+                using (var sb = new SolidBrush(act ? Color.FromArgb(38, 255, 85, 0) : ColDeckInset))
+                using (var sPen = new Pen(act ? ColAccent : ColBorder, 1f))
+                using (var st = new SolidBrush(act ? ColTextMain : ColTextMuted))
+                {
+                    g.FillPath(sb, sp);
+                    g.DrawPath(sPen, sp);
+                    g.DrawString(subTabs[i], _fMonoTiny, st, stRc, _sfCenter);
+                }
+                int capI = i;
+                _hits.Add(new HitZone { Rect = stRc, OnClick = () => { CommitInlineInput(true); _inspectorSubMode = capI; Invalidate(); } });
+            }
+
+            float iy = sy + 30f;
+            float iw = insp.Width - 20f;
+
+            if (_inspectorSubMode == 0)
+            {
+                DrawPrecisionTickSlider(g, new RectangleF(sx, iy, iw, 54f),
+                    "ФОКУС-ТАЙМЕР", _cfg.pomodoro_minutes, 1, 240, _cfg.pomodoro_minutes + " мин", 12,
+                    () => _cfg.pomodoro_minutes, v => _cfg.pomodoro_minutes = v);
+                iy += 62f;
+
+                DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 102f),
+                    "МЕЛОДИЯ ОКОНЧАНИЯ ТАЙМЕРА (CHIP MATRIX)",
+                    TimerSoundEngine.Presets,
+                    new[] { "Apple Radar", "Crystal", "Digital", "Zen Bell", "Свой звук", "Без звука" },
+                    _cfg.timer_sound_preset ?? "Apple Radar", 2,
+                    val => { _cfg.timer_sound_preset = val; TimerSoundEngine.PlayAlert(_cfg); });
+                iy += 108f;
+
+                DrawHardwareButton(g, new RectangleF(sx, iy, iw * 0.56f - 3f, 24f), "▶ ТЕСТ МЕЛОДИИ", true, false,
+                    () => TimerSoundEngine.PlayAlert(_cfg));
+                DrawHardwareButton(g, new RectangleF(sx + iw * 0.56f + 3f, iy, iw * 0.44f - 3f, 24f), "■ СТОП ЗВУК", false, false,
+                    () => TimerSoundEngine.StopAlert());
+                iy += 30f;
+
+                string sndFile = string.IsNullOrEmpty(_cfg.timer_custom_sound_path)
+                    ? "СВОЙ MP3/WAV: НЕ ВЫБРАН"
+                    : ("ФАЙЛ: " + Path.GetFileName(_cfg.timer_custom_sound_path));
+                using (var fb = new SolidBrush(ColTextMuted))
+                    g.DrawString(sndFile, _fMonoTiny, fb, new RectangleF(sx, iy, iw, 15f), _sfLeft);
+                iy += 17f;
+
+                DrawHardwareButton(g, new RectangleF(sx, iy, iw * 0.65f - 3f, 24f), "ВЫБРАТЬ АУДИОФАЙЛ...", false, false, () =>
+                {
                     using (var ofd = new OpenFileDialog())
                     {
                         ofd.Title = "Выберите звуковой файл для таймера Dynamic Island";
@@ -4133,57 +4937,313 @@ namespace DynamicIslandWin
                             TimerSoundEngine.PlayAlert(_cfg);
                         }
                     }
-                }
-            });
-            _hits.Add(new HitAction
-            {
-                Rect = btnClearSnd,
-                OnClick = () =>
+                });
+                DrawHardwareButton(g, new RectangleF(sx + iw * 0.65f + 3f, iy, iw * 0.35f - 3f, 24f), "СБРОС", false, true, () =>
                 {
-                    CommitInlineEdit(true);
                     TimerSoundEngine.StopAlert();
                     _cfg.timer_custom_sound_path = "";
-                    if (_cfg.timer_sound_preset == "Свой звук")
-                        _cfg.timer_sound_preset = "Apple Radar";
+                    if (_cfg.timer_sound_preset == "Свой звук") _cfg.timer_sound_preset = "Apple Radar";
                     ApplyLive();
-                }
-            });
-            y += 38f;
-
-            // Row 9: Autostart & Updates
-            AddToggleRow(g, x, ref y, w, "Перехватчик скриншотов + автозапуск с Windows", _cfg.autostart, v => { _cfg.autostart = v; _cfg.enable_screenshot_vault = true; });
-
-            y += 8f;
-            var updRc = new RectangleF(x, y, w, 32f);
-            using (GraphicsPath up = RoundRect(updRc, 9f))
-            using (var ub = new SolidBrush(Color.FromArgb(32, 36, 49)))
-            using (var uPen = new Pen(Color.FromArgb(45, 99, 102, 241), 1f))
-            using (var ut = new SolidBrush(Color.FromArgb(125, 211, 252)))
-            {
-                g.FillPath(ub, up);
-                g.DrawPath(uPen, up);
-                g.DrawString("↻  Проверить обновления GitHub Releases (Текущая: v" + UpdateManager.CurrentVersionStr + ")", _fRowValue, ut, updRc, _sfCenter);
+                });
             }
-            _hits.Add(new HitAction
+            else if (_inspectorSubMode == 1)
             {
-                Rect = updRc,
-                OnClick = () =>
-                {
-                    CommitInlineEdit(true);
-                    if (ManualUpdateCheckRequested != null) ManualUpdateCheckRequested();
-                }
+                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 34f),
+                    "ОБЛОЖКА ТРЕКА В КОМПАКТЕ", _cfg.show_compact_cover, v => _cfg.show_compact_cover = v);
+                iy += 42f;
+                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 34f),
+                    "ПРИОРИТЕТ ЯНДЕКС / SPOTIFY", _cfg.prefer_music_players, v => _cfg.prefer_music_players = v);
+                iy += 42f;
+                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 34f),
+                    "LIVE-БАННЕР СМЕНЫ ТРЕКА", _cfg.enable_live_activities, v => _cfg.enable_live_activities = v);
+                iy += 46f;
+
+                string[] eqVals = { "5 Полос", "7 Полос", "Выкл" };
+                DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 52f),
+                    "РЕЖИМ АУДИО-ЭКВАЛАЙЗЕРА", eqVals, eqVals, _cfg.eq_style ?? "5 Полос", 3,
+                    val => _cfg.eq_style = val);
+            }
+            else
+            {
+                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 32f),
+                    "ПЕРЕХВАТ СКРИНШОТОВ СЕССИИ", _cfg.enable_screenshot_vault, v => _cfg.enable_screenshot_vault = v);
+                iy += 38f;
+                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 32f),
+                    "СТОП-ТАЙМЕР ЗАКАЧЕК (WATCHDOG)", _cfg.enable_download_watchdog, v => _cfg.enable_download_watchdog = v);
+                iy += 40f;
+
+                DrawPrecisionTickSlider(g, new RectangleF(sx, iy, iw, 54f),
+                    "ПОРОГ АКТИВНОЙ ЗАКАЧКИ", _cfg.download_threshold_mbps, 1, 50, _cfg.download_threshold_mbps + " MB/s", 12,
+                    () => _cfg.download_threshold_mbps, v => _cfg.download_threshold_mbps = v);
+                iy += 62f;
+
+                string[] wdVals = { "Сон", "Гибернация", "Выключение" };
+                DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 50f),
+                    "ДЕЙСТВИЕ ПОСЛЕ ОКОНЧАНИЯ ЗАГРУЗКИ", wdVals, wdVals, _cfg.watchdog_action ?? "Сон", 3,
+                    val => _cfg.watchdog_action = val);
+            }
+        }
+        private void PaintDeck03ScreenAndModes(Graphics g)
+        {
+            var padCell = new RectangleF(14f, 308f, 446f, 318f);
+            DrawBentoCell(g, padCell, "03.A", "SPATIAL MONITOR PAD", "2D COORDINATE DECK");
+
+            Screen[] screens = Screen.AllScreens;
+            int monCount = Math.Max(1, screens.Length);
+            string[] monVals = new string[monCount];
+            string[] monLbls = new string[monCount];
+            for (int i = 0; i < monCount; i++)
+            {
+                monVals[i] = i.ToString();
+                monLbls[i] = string.Format("DISPLAY {0:00} ({1}×{2})", i + 1, screens[i].Bounds.Width, screens[i].Bounds.Height);
+            }
+
+            float px = padCell.X + 10f;
+            float pw = padCell.Width - 20f;
+            DrawChipSelectorMatrix(g, new RectangleF(px, padCell.Y + 30f, pw, 26f),
+                "", monVals, monLbls, Math.Max(0, Math.Min(monCount - 1, _cfg.monitor_index)).ToString(),
+                Math.Min(3, monCount),
+                val => { int mi; if (int.TryParse(val, out mi)) _cfg.monitor_index = mi; });
+
+            DrawSpatialScreenPad(g, new RectangleF(px, padCell.Y + 62f, pw, 152f));
+
+            DrawHardwareButton(g, new RectangleF(padCell.Right - 118f, padCell.Y + 190f, 102f, 20f), "ЦЕНТР [0, +8]", false, false, () =>
+            {
+                _cfg.horizontal_offset = 0;
+                _cfg.top_margin = 8;
+                ApplyLive();
             });
+
+            float halfW = (pw - 8f) * 0.5f;
+            DrawPrecisionTickSlider(g, new RectangleF(px, padCell.Y + 222f, halfW, 86f),
+                "СДВИГ ПО X", _cfg.horizontal_offset, -500, 500, string.Format("{0:+#;-#;0}px", _cfg.horizontal_offset), 16,
+                () => _cfg.horizontal_offset, v => _cfg.horizontal_offset = v);
+
+            DrawPrecisionTickSlider(g, new RectangleF(px + halfW + 8f, padCell.Y + 222f, halfW, 86f),
+                "ОТСТУП СВЕРХУ Y", _cfg.top_margin, 0, 120, "+" + _cfg.top_margin + "px", 12,
+                () => _cfg.top_margin, v => _cfg.top_margin = v);
+
+            var modeCell = new RectangleF(468f, 308f, 398f, 318f);
+            DrawBentoCell(g, modeCell, "03.B", "ИГРОВОЙ РЕЖИМ И РЕЖИМ ПРИЗРАКА", "D3D & GHOST");
+
+            float mx = modeCell.X + 10f;
+            float mw = modeCell.Width - 20f;
+            float my = modeCell.Y + 32f;
+
+            string[] fsVals = { "Неоновая телеметрия", "Авто-скрытие", "Только по клику" };
+            string[] fsShort = { "Неон-телеметрия", "Авто-скрытие", "По клику" };
+            DrawChipSelectorMatrix(g, new RectangleF(mx, my, mw, 48f),
+                "ДЕТЕКТОР ПОЛНОЭКРАННЫХ ИГР (D3D FULLSCREEN)", fsVals, fsShort,
+                _cfg.fullscreen_mode ?? "Неоновая телеметрия", 3,
+                val => { _cfg.fullscreen_mode = val; _cfg.hide_in_fullscreen = (val == "Авто-скрытие"); });
+            my += 56f;
+
+            DrawSegmentedToggle(g, new RectangleF(mx, my, mw, 34f),
+                "РЕЖИМ «ПРИЗРАКА» (20% OPACITY • ПРОПУСК КЛИКОВ)", _cfg.enable_ghost_mode, v => _cfg.enable_ghost_mode = v);
+            my += 40f;
+
+            DrawSegmentedToggle(g, new RectangleF(mx, my, mw, 34f),
+                "ИНДИКАТОР И 1-CLICK МЬЮТ МИКРОФОНА", _cfg.enable_mic_indicator, v => _cfg.enable_mic_indicator = v);
+            my += 40f;
+
+            DrawSegmentedToggle(g, new RectangleF(mx, my, mw, 34f),
+                "ПРИОРИТЕТ ЯНДЕКС МУЗЫКИ / SPOTIFY", _cfg.prefer_music_players, v => _cfg.prefer_music_players = v);
+            my += 44f;
+
+            var hkBox = new RectangleF(mx, my, mw, 94f);
+            using (GraphicsPath hp = SharpRoundRect(hkBox, 5f))
+            using (var hb = new SolidBrush(ColDeckInset))
+            using (var hPen = new Pen(ColBorder, 1f))
+            {
+                g.FillPath(hb, hp);
+                g.DrawPath(hPen, hp);
+            }
+
+            string[,] hotkeys =
+            {
+                { "ALT + SPACE", "ВЫХОД ИЗ ПРИЗРАКА / РАСКРЫТЬ" },
+                { "LCTRL + ЛКМ", "РАСТЯГИВАНИЕ ОСТРОВА МЫШЬЮ" },
+                { "LCTRL + КОЛЕСО", "МАСШТАБ ТЕКСТА И ИКОНОК" },
+                { "LCTRL + СКМ", "МГНОВЕННЫЙ СБРОС РАЗМЕРОВ" }
+            };
+            float hkColW = (mw - 18f) * 0.5f;
+            for (int i = 0; i < 4; i++)
+            {
+                int r = i / 2;
+                int c = i % 2;
+                float hx = mx + 8f + c * (hkColW + 4f);
+                float hy = my + 8f + r * 40f;
+                using (var kBr = new SolidBrush(ColAccent))
+                using (var dBr = new SolidBrush(ColTextMuted))
+                {
+                    g.DrawString("[" + hotkeys[i, 0] + "]", _fMonoTiny, kBr, new RectangleF(hx, hy, hkColW, 15f), _sfLeft);
+                    g.DrawString(hotkeys[i, 1], _fSub, dBr, new RectangleF(hx, hy + 15f, hkColW, 15f), _sfLeft);
+                }
+            }
         }
 
-        private void UpdateSliderFromMouse(SliderTrackHit s, float mouseX)
+        private void PaintDeck04SkinAndSystem(Graphics g)
         {
-            CommitInlineEdit(false);
-            float left = s.TrackRect.X + 6f;
-            float width = Math.Max(1f, s.TrackRect.Width - 12f);
+            var palCell = new RectangleF(14f, 308f, 456f, 318f);
+            DrawBentoCell(g, palCell, "04.A", "ПАЛИТРА АКЦЕНТОВ И ОПТИКА КАПСУЛЫ", "COLOR & OPTICS");
+
+            float px = palCell.X + 10f;
+            float pw = palCell.Width - 20f;
+            float py = palCell.Y + 32f;
+
+            string[] themes =
+            {
+                "Kinetic Orange", "Acid Lime", "Dinasmic Neon",
+                "Apple Blue", "iOS Cyan-Purple", "Yandex Gold-Yellow",
+                "Spotify Neon Green", "Crimson Sunset", "Minimal White"
+            };
+            string[] themeShort =
+            {
+                "Kinetic #FF5500", "Acid #C8FF00", "Dinasmic Neon",
+                "Apple Blue", "Cyan-Purple", "Yandex Gold",
+                "Spotify Green", "Crimson", "Minimal White"
+            };
+            Color[] swatches =
+            {
+                Color.FromArgb(255, 85, 0),
+                Color.FromArgb(200, 255, 0),
+                Color.FromArgb(34, 211, 238),
+                Color.FromArgb(10, 132, 255),
+                Color.FromArgb(168, 85, 247),
+                Color.FromArgb(255, 214, 10),
+                Color.FromArgb(48, 209, 88),
+                Color.FromArgb(255, 55, 95),
+                Color.FromArgb(245, 245, 247)
+            };
+
+            DrawChipSelectorMatrix(g, new RectangleF(px, py, pw, 108f),
+                "АКЦЕНТНАЯ ПАЛИТРА ОСТРОВА (9 СТУДИЙНЫХ ПРОФИЛЕЙ)",
+                themes, themeShort, _cfg.theme_preset ?? "Dinasmic Neon", 3,
+                val => _cfg.theme_preset = val, swatches);
+            py += 116f;
+
+            string[] eqVals = { "5 Полос", "7 Полос", "Выкл" };
+            DrawChipSelectorMatrix(g, new RectangleF(px, py, pw, 48f),
+                "ВИЗУАЛИЗАЦИЯ СПЕКТРА (ЭКВАЛАЙЗЕР)", eqVals, eqVals, _cfg.eq_style ?? "5 Полос", 3,
+                val => _cfg.eq_style = val);
+            py += 56f;
+
+            int opPct = (int)Math.Round(_cfg.bg_opacity / 2.55f);
+            float halfW = (pw - 8f) * 0.5f;
+            DrawPrecisionTickSlider(g, new RectangleF(px, py, halfW, 104f),
+                "ПЛОТНОСТЬ ФОНА", opPct, 25, 100, opPct + "%", 14,
+                () => (int)Math.Round(_cfg.bg_opacity / 2.55f),
+                v => _cfg.bg_opacity = Math.Max(64, Math.Min(255, (int)Math.Round(v * 2.55f))));
+
+            DrawPrecisionTickSlider(g, new RectangleF(px + halfW + 8f, py, halfW, 104f),
+                "КОНТУРНЫЙ БЛИК", _cfg.border_glow, 0, 140, _cfg.border_glow.ToString(), 14,
+                () => _cfg.border_glow, v => _cfg.border_glow = v);
+
+            var skinCell = new RectangleF(478f, 308f, 388f, 204f);
+            string bgName = string.IsNullOrEmpty(_cfg.custom_bg_path) ? "PURE #000000" : Path.GetFileName(_cfg.custom_bg_path);
+            DrawBentoCell(g, skinCell, "04.B", "КАСТОМНЫЙ GIF / ФОТО СКИН", bgName);
+
+            float sx = skinCell.X + 10f;
+            float sw = skinCell.Width - 20f;
+            float sy = skinCell.Y + 30f;
+
+            DrawHardwareButton(g, new RectangleF(sx, sy, sw * 0.68f - 3f, 24f), "ЗАГРУЗИТЬ GIF / ФОТО...", true, false, () =>
+            {
+                using (var ofd = new OpenFileDialog())
+                {
+                    ofd.Title = "Выберите GIF или Фото для скина Dynamic Island";
+                    ofd.Filter = "GIF и Фото (*.gif;*.png;*.jpg;*.jpeg;*.bmp)|*.gif;*.png;*.jpg;*.jpeg;*.bmp";
+                    if (ofd.ShowDialog(this) == DialogResult.OK)
+                    {
+                        _cfg.custom_bg_path = ofd.FileName;
+                        ApplyLive();
+                    }
+                }
+            });
+            DrawHardwareButton(g, new RectangleF(sx + sw * 0.68f + 3f, sy, sw * 0.32f - 3f, 24f), "СБРОС СКИНА", false, true, () =>
+            {
+                _cfg.custom_bg_path = "";
+                ApplyLive();
+            });
+            sy += 30f;
+
+            string[] fitVals = { "1:1 По размеру островка", "Smart Cover", "Contain" };
+            string[] fitShort = { "1:1 Остров", "Smart Cover", "Contain" };
+            DrawChipSelectorMatrix(g, new RectangleF(sx, sy, sw, 42f),
+                "КАДРИРОВАНИЕ", fitVals, fitShort, _cfg.custom_bg_fit_mode ?? "1:1 По размеру островка", 3,
+                val => _cfg.custom_bg_fit_mode = val);
+            sy += 46f;
+
+            string[] scopeVals = { "Везде", "Только компактный", "Только раскрытый" };
+            string[] scopeShort = { "Везде", "Только компакт", "Только раскрыт." };
+            DrawChipSelectorMatrix(g, new RectangleF(sx, sy, sw, 42f),
+                "ОБЛАСТЬ ПОКАЗА", scopeVals, scopeShort, _cfg.custom_bg_scope ?? "Везде", 3,
+                val => _cfg.custom_bg_scope = val);
+            sy += 46f;
+
+            DrawPrecisionTickSlider(g, new RectangleF(sx, sy, sw, 36f),
+                "ЗАТЕМНЕНИЕ МЕДИА-СКИНА", _cfg.custom_bg_dim_percent, 0, 85, _cfg.custom_bg_dim_percent + "%", 12,
+                () => _cfg.custom_bg_dim_percent, v => _cfg.custom_bg_dim_percent = v);
+
+            var sysCell = new RectangleF(478f, 520f, 388f, 106f);
+            DrawBentoCell(g, sysCell, "04.C", "СИСТЕМА И ОБНОВЛЕНИЯ", "v" + UpdateManager.CurrentVersionStr);
+
+            float bx = sysCell.X + 10f;
+            float bw = sysCell.Width - 20f;
+            DrawSegmentedToggle(g, new RectangleF(bx, sysCell.Y + 28f, bw, 24f),
+                "АВТОЗАПУСК ПРИ ВХОДЕ В WINDOWS", _cfg.autostart, v => _cfg.autostart = v);
+            DrawSegmentedToggle(g, new RectangleF(bx, sysCell.Y + 55f, bw, 24f),
+                "АВТО-УСТАНОВКА РЕЛИЗОВ GITHUB", _cfg.auto_update_enabled, v => _cfg.auto_update_enabled = v);
+
+            DrawHardwareButton(g, new RectangleF(bx, sysCell.Y + 81f, bw, 20f),
+                "↻ ПРОВЕРИТЬ ОБНОВЛЕНИЯ MILTANCHIK/DYNAMICISLAND", false, false, () =>
+                {
+                    if (ManualUpdateCheckRequested != null) ManualUpdateCheckRequested();
+                });
+        }
+
+        private void UpdateSliderFromMouseX(PrecisionSliderHit s, float mouseX)
+        {
+            CommitInlineInput(false);
+            float left = s.TrackRect.X + 5f;
+            float width = Math.Max(1f, s.TrackRect.Width - 10f);
             float ratio = Math.Max(0f, Math.Min(1f, (mouseX - left) / width));
             int val = s.MinVal + (int)Math.Round(ratio * (s.MaxVal - s.MinVal));
             s.Setter(val);
             ApplyLive();
+        }
+
+        private void UpdateSpatialPadFromPoint(PointF pt)
+        {
+            if (_spatialPadRect.Width < 20f || _spatialPadRect.Height < 20f) return;
+            CommitInlineInput(false);
+            float rx = Math.Max(0f, Math.Min(1f, (pt.X - (_spatialPadRect.X + 24f)) / Math.Max(1f, _spatialPadRect.Width - 48f)));
+            float ry = Math.Max(0f, Math.Min(1f, (pt.Y - (_spatialPadRect.Y + 8f)) / Math.Max(1f, _spatialPadRect.Height - 34f)));
+            _cfg.horizontal_offset = (int)Math.Round(-500f + rx * 1000f);
+            _cfg.top_margin = (int)Math.Round(ry * 120f);
+            ApplyLive();
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            if (e.Delta == 0) return;
+            PointF pt = new PointF(e.X, e.Y);
+            int dir = e.Delta > 0 ? 1 : -1;
+
+            foreach (var s in _sliderHits)
+            {
+                if (s.WheelRect.Contains(pt))
+                {
+                    CommitInlineInput(false);
+                    int span = s.MaxVal - s.MinVal;
+                    int step = span > 400 ? 5 : 1;
+                    int next = Math.Max(s.MinVal, Math.Min(s.MaxVal, s.Getter() + dir * step));
+                    s.Setter(next);
+                    ApplyLive();
+                    return;
+                }
+            }
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -4192,63 +5252,40 @@ namespace DynamicIslandWin
             PointF pt = new PointF(e.X, e.Y);
 
             if (_inlineBox.Visible && !_inlineBox.Bounds.Contains(e.Location))
-                CommitInlineEdit(true);
+                CommitInlineInput(true);
 
-            if (e.Button == MouseButtons.Left)
+            if (e.Button != MouseButtons.Left) return;
+
+            foreach (var h in _hits)
             {
-                if (_rcCloseTraffic.Contains(pt) || _rcSaveTraffic.Contains(pt))
+                if (h.Rect.Contains(pt))
                 {
-                    CommitInlineEdit(true);
-                    ApplyLive();
-                    DialogResult = DialogResult.OK;
-                    Close();
+                    h.OnClick();
                     return;
                 }
-                if (_rcResetTraffic.Contains(pt))
+            }
+
+            foreach (var s in _sliderHits)
+            {
+                if (s.TrackRect.Contains(pt))
                 {
-                    CommitInlineEdit(false);
-                    _cfg.idle_width = 310; _cfg.idle_height = 36;
-                    _cfg.expanded_width = 520; _cfg.expanded_height = 224;
-                    _cfg.ui_scale_percent = 100;
-                    ApplyLive();
+                    _draggingSlider = s;
+                    UpdateSliderFromMouseX(s, pt.X);
                     return;
                 }
+            }
 
-                for (int i = 0; i < _tabRects.Count; i++)
-                {
-                    if (_tabRects[i].Contains(pt))
-                    {
-                        CommitInlineEdit(true);
-                        _activeTab = i;
-                        Invalidate();
-                        return;
-                    }
-                }
+            if (_spatialPadRect.Width > 0 && _spatialPadRect.Contains(pt))
+            {
+                _draggingSpatialPad = true;
+                UpdateSpatialPadFromPoint(pt);
+                return;
+            }
 
-                foreach (var s in _sliderHits)
-                {
-                    if (s.TrackRect.Contains(pt))
-                    {
-                        _activeDraggingSlider = s;
-                        UpdateSliderFromMouse(s, pt.X);
-                        return;
-                    }
-                }
-
-                foreach (var h in _hits)
-                {
-                    if (h.Rect.Contains(pt))
-                    {
-                        h.OnClick();
-                        return;
-                    }
-                }
-
-                if (e.Y < 54)
-                {
-                    _draggingTitle = true;
-                    _dragOffset = e.Location;
-                }
+            if (e.Y <= 36)
+            {
+                _draggingWindow = true;
+                _windowDragOffset = e.Location;
             }
         }
 
@@ -4256,29 +5293,40 @@ namespace DynamicIslandWin
         {
             base.OnMouseMove(e);
             _mousePt = new PointF(e.X, e.Y);
-            if (_activeDraggingSlider != null && (e.Button & MouseButtons.Left) == MouseButtons.Left)
+
+            if (_draggingSlider != null && (e.Button & MouseButtons.Left) == MouseButtons.Left)
             {
-                UpdateSliderFromMouse(_activeDraggingSlider, e.X);
+                UpdateSliderFromMouseX(_draggingSlider, e.X);
                 return;
             }
-            if (_draggingTitle && e.Button == MouseButtons.Left)
+
+            if (_draggingSpatialPad && (e.Button & MouseButtons.Left) == MouseButtons.Left)
+            {
+                UpdateSpatialPadFromPoint(_mousePt);
+                return;
+            }
+
+            if (_draggingWindow && e.Button == MouseButtons.Left)
             {
                 Point screenPt = PointToScreen(e.Location);
-                Location = new Point(screenPt.X - _dragOffset.X, screenPt.Y - _dragOffset.Y);
+                Location = new Point(screenPt.X - _windowDragOffset.X, screenPt.Y - _windowDragOffset.Y);
                 return;
             }
+
             Invalidate();
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
-            _activeDraggingSlider = null;
-            _draggingTitle = false;
+            _draggingSlider = null;
+            _draggingSpatialPad = false;
+            _draggingWindow = false;
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            try { _stageTimer.Stop(); _stageTimer.Dispose(); } catch { }
             TimerSoundEngine.StopAlert();
             base.OnFormClosing(e);
         }
@@ -5849,7 +6897,7 @@ namespace DynamicIslandWin
                 RenderLayeredFrame();
             });
             menu.Items.Add("← Вернуться на страницу плеера (Страница 1)", null, (s, e) => CycleExpandedPage(-1));
-            menu.Items.Add("Открыть настройки Studio Pro...", null, (s, e) => OpenSettingsDialog());
+            menu.Items.Add("Открыть пульт Kinetic Stage & Deck...", null, (s, e) => OpenSettingsDialog());
             menu.Show(screenPt);
         }
 
@@ -6018,7 +7066,7 @@ namespace DynamicIslandWin
             menu.Show(screenPt);
         }
 
-        private void OpenSettingsDialog()
+        public void OpenSettingsDialog()
         {
             using (var dlg = new SettingsForm(_config))
             {
@@ -7518,13 +8566,7 @@ namespace DynamicIslandWin
 
                 var trayMenu = new ContextMenuStrip();
                 trayMenu.Items.Add("Раскрыть островок", null, (s, e) => mainForm.ExpandIsland());
-                trayMenu.Items.Add("Настройки (Apple Studio)...", null, (s, e) =>
-                {
-                    using (var dlg = new SettingsForm(ConfigManager.Load()))
-                    {
-                        dlg.ShowDialog(mainForm);
-                    }
-                });
+                trayMenu.Items.Add("Пульт настроек (Kinetic Stage & Deck)...", null, (s, e) => mainForm.OpenSettingsDialog());
                 trayMenu.Items.Add("Сбросить позицию по центру", null, (s, e) =>
                 {
                     var cfg = ConfigManager.Load();

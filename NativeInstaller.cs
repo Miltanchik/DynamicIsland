@@ -19,8 +19,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("100% Self-Contained Single-File Installer for Dynamic Island Windows 10/11")]
 [assembly: AssemblyProduct("Dynamic Island Studio Setup")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
-[assembly: AssemblyVersion("2.9.0.0")]
-[assembly: AssemblyFileVersion("2.9.0.0")]
+[assembly: AssemblyVersion("3.0.0.0")]
+[assembly: AssemblyFileVersion("3.0.0.0")]
 
 namespace DynamicIslandSetup
 {
@@ -372,11 +372,11 @@ namespace DynamicIslandSetup
                 }
                 catch { }
 
-                if (oldVer != "2.9.0.0")
+                if (oldVer != "3.0.0.0")
                 {
                     var ans = MessageBox.Show(
                         this,
-                        string.Format("На вашем ПК уже установлена версия Dynamic Island v{0}.\n\nОбновить Dynamic Island с v{0} до v2.9.0 Studio Pro (с сохранением всех ваших настроек)?", oldVer),
+                        string.Format("На вашем ПК уже установлена версия Dynamic Island v{0}.\n\nОбновить Dynamic Island с v{0} до v3.0.0 Studio Pro (с сохранением всех ваших настроек)?", oldVer),
                         "Обновление Dynamic Island",
                         MessageBoxButtons.YesNo,
                         MessageBoxIcon.Question);
@@ -462,7 +462,7 @@ namespace DynamicIslandSetup
                         if (k != null)
                         {
                             k.SetValue("DisplayName", "Dynamic Island for Windows 10/11");
-                            k.SetValue("DisplayVersion", "2.9.0");
+                            k.SetValue("DisplayVersion", "3.0.0");
                             k.SetValue("Publisher", "DynamicIslandWin Studio");
                             k.SetValue("DisplayIcon", targetExe);
                             k.SetValue("InstallLocation", _installDir);
