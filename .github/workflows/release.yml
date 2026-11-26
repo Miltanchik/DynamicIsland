@@ -1,0 +1,63 @@
+name: Build & Publish Dynamic Island Windows Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile DynamicIslandWin.exe & DynamicIslandWin_Setup.exe
+        shell: pwsh
+        run: |
+          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          $wpfDir = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF"
+          $relDir = "release"
+          New-Item -ItemType Directory -Path $relDir -Force | Out-Null
+
+          & $csc /nologo /optimize+ /target:winexe /platform:x64 `
+              /win32icon:"DynamicIslandWin.ico" `
+              /out:"$relDir\DynamicIslandWin.exe" `
+              /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:System.Management.dll `
+              /r:"$wpfDir\UIAutomationClient.dll" `
+              /r:"$wpfDir\UIAutomationTypes.dll" `
+              /r:"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Runtime.dll" `
+              /r:"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Runtime.InteropServices.WindowsRuntime.dll" `
+              /r:"C:\Windows\System32\WinMetadata\Windows.Foundation.winmd" `
+              /r:"C:\Windows\System32\WinMetadata\Windows.Media.winmd" `
+              /r:"C:\Windows\System32\WinMetadata\Windows.Storage.winmd" `
+              "NativeDynamicIsland.cs"
+
+          & $csc /nologo /optimize+ /target:winexe /platform:x64 `
+              /win32icon:"DynamicIslandWin.ico" `
+              /out:"$relDir\DynamicIslandWin_Setup.exe" `
+              /resource:"$relDir\DynamicIslandWin.exe,DynamicIslandWin.Payload.exe" `
+              /resource:"DynamicIslandWin.ico,DynamicIslandWin.Payload.ico" `
+              /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
+              "NativeInstaller.cs"
+
+          Copy-Item "$relDir\DynamicIslandWin_Setup.exe" "$relDir\DinamicIsland-Setup.exe" -Force
+
+          $hash1 = (Get-FileHash "$relDir\DynamicIslandWin_Setup.exe" -Algorithm SHA256).Hash.ToLower()
+          $hash2 = (Get-FileHash "$relDir\DynamicIslandWin.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash1  DynamicIslandWin_Setup.exe`n$hash1  DinamicIsland-Setup.exe`n$hash2  DynamicIslandWin.exe" | Out-File "$relDir\SHA256SUMS.txt" -Encoding utf8
+
+      - name: Upload Release Artifacts to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            release/DynamicIslandWin_Setup.exe
+            release/DinamicIsland-Setup.exe
+            release/DynamicIslandWin.exe
+            release/SHA256SUMS.txt
+          generate_release_notes: true

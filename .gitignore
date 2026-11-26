@@ -1,0 +1,27 @@
+# Secrets & Credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*secret*
+*token*
+credentials*.json
+
+# Python / Build / Temp / Watcher State
+node_modules/
+__pycache__/
+*.py[cod]
+.vs/
+.vscode/
+build/
+dist/
+*.old
+*.tmp
+*.log
+.autosync/
+
+# Ignore intermediate binaries in root; keep ready-to-share installer & app in release/
+/*.exe

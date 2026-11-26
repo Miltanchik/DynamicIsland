@@ -18,7 +18,7 @@
 ## 🚀 Быстрая установка и запуск
 
 ### Вариант 1 — Готовый установщик (рекомендуется)
-1. Скачайте **`DynamicIslandWin_Setup.exe`** (или `DinamicIsland-Setup.exe`) из раздела **Releases** (или из папки `dynamic_island/release/`).
+1. Скачайте **`DynamicIslandWin_Setup.exe`** (или `DinamicIsland-Setup.exe`) из раздела **Releases** (или из папки `release/`).
 2. Запустите установщик и нажмите **«Установить Dynamic Island»** — приложение распакуется в `%LOCALAPPDATA%\Programs\DynamicIslandWin`, создаст ярлыки и сразу запустится.
 
 ### Вариант 2 — Сборка из исходников (встроенным компилятором Windows)
@@ -30,14 +30,14 @@ $fw  = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
 $wm  = "C:\Windows\System32\WinMetadata"
 
 & $csc /nologo /optimize+ /target:winexe /platform:x64 `
-  /win32icon:"dynamic_island\DynamicIslandWin.ico" `
-  /out:"dynamic_island\release\DynamicIslandWin.exe" `
+  /win32icon:"DynamicIslandWin.ico" `
+  /out:"release\DynamicIslandWin.exe" `
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
   /r:System.Web.Extensions.dll /r:System.Management.dll `
   /r:"$wpf\UIAutomationClient.dll" /r:"$wpf\UIAutomationTypes.dll" `
   /r:"$fw\System.Runtime.dll" /r:"$fw\System.Runtime.WindowsRuntime.dll" `
   /r:"$wm\Windows.Foundation.winmd" /r:"$wm\Windows.Media.winmd" /r:"$wm\Windows.Storage.winmd" `
-  "dynamic_island\NativeDynamicIsland.cs"
+  "NativeDynamicIsland.cs"
 ```
 
 ---
