@@ -8125,7 +8125,7 @@ namespace DynamicIslandWin
         private Point _vaultDragStartPt;
 
         private readonly uint _ourProcessId = (uint)Process.GetCurrentProcess().Id;
-        private volatile int _ownDialogOrMenuDepth = 0;
+        private int _ownDialogOrMenuDepth = 0;
         private int _lastZOrderCheckTick = 0;
         private bool _wasSuppressedTopMost = false;
         private volatile bool _isVideoPlayingActive = false;
@@ -8228,7 +8228,7 @@ namespace DynamicIslandWin
             _collapseTimer = new System.Windows.Forms.Timer { Interval = _config.collapse_delay_ms };
             _collapseTimer.Tick += (s, e) =>
             {
-                if (_lctrlHeld || _isResizingWithLCtrl || _expandedPage == 1 || _isDraggingDockApp || _ownDialogOrMenuDepth > 0) return;
+                if (_lctrlHeld || _isResizingWithLCtrl || _expandedPage == 1 || _isDraggingDockApp || Volatile.Read(ref _ownDialogOrMenuDepth) > 0) return;
                 _collapseTimer.Stop();
                 if (!_isHovered) CollapseToIdle();
             };
@@ -8573,7 +8573,7 @@ namespace DynamicIslandWin
         private bool ShouldSuppressTopMostAssertion()
         {
             if (_disposing || _isSystemSuspended || !IsHandleCreated) return true;
-            if (_ownDialogOrMenuDepth > 0) return true;
+            if (Volatile.Read(ref _ownDialogOrMenuDepth) > 0) return true;
             if (_updateDialog != null && !_updateDialog.IsDisposed && _updateDialog.Visible) return true;
             if (NativeWin32.IsAltTabHeld() || SystemSensors.IsTransientShellForeground()) return true;
             if (_hiddenByFullscreen || _hiddenByVideo) return true;
@@ -8737,7 +8737,7 @@ namespace DynamicIslandWin
 
         public void CollapseToIdle()
         {
-            if (_isHovered || _lctrlHeld || _isResizingWithLCtrl || _expandedPage == 1 || _isDraggingDockApp || _ownDialogOrMenuDepth > 0) return;
+            if (_isHovered || _lctrlHeld || _isResizingWithLCtrl || _expandedPage == 1 || _isDraggingDockApp || Volatile.Read(ref _ownDialogOrMenuDepth) > 0) return;
             _liveBannerText = "";
             _mode = IslandMode.Idle;
             StartSpringTransition(_config.idle_width, _config.idle_height, 0.0f, Math.Max(130, (int)(_config.anim_duration_ms * 0.80f)), false);
@@ -8795,7 +8795,7 @@ namespace DynamicIslandWin
                                   (_config.fullscreen_mode == "Авто-скрытие" || _config.hide_in_fullscreen);
             bool wantAutoHideVideo = _config.hide_on_video_playback && _isVideoPlayingActive &&
                                      (_expandedPage != 1) && !_ghostUnlockedByUser;
-            if (wantAutoHideVideo && _mode == IslandMode.Expanded && !_isHovered && !_isDraggingDockApp && _ownDialogOrMenuDepth == 0)
+            if (wantAutoHideVideo && _mode == IslandMode.Expanded && !_isHovered && !_isDraggingDockApp && Volatile.Read(ref _ownDialogOrMenuDepth) == 0)
             {
                 CollapseToIdle();
             }
