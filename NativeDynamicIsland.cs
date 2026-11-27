@@ -6249,20 +6249,190 @@ namespace DynamicIslandWin
         public UpdateManager Updater { get; set; }
         private UpdateCheckState _lastShownUpdState = UpdateCheckState.Idle;
 
-        // Motion Lab Palette (Strict Black Hierarchy: #000000 ONLY on Stage Island)
-        private static readonly Color ColChassis = Color.FromArgb(11, 11, 13);        // #0B0B0D
-        private static readonly Color ColStageBg = Color.FromArgb(14, 14, 17);        // #0E0E11
-        private static readonly Color ColPureIsland = Color.FromArgb(0, 0, 0);        // #000000 (Exclusive!)
-        private static readonly Color ColDeckCard = Color.FromArgb(18, 18, 21);       // #121215
-        private static readonly Color ColDeckHover = Color.FromArgb(26, 26, 31);      // #1A1A1F
-        private static readonly Color ColDeckInset = Color.FromArgb(13, 13, 16);      // #0D0D10
-        private static readonly Color ColBorder = Color.FromArgb(21, 255, 255, 255);  // rgba(255,255,255,0.08)
-        private static readonly Color ColBorderHi = Color.FromArgb(56, 255, 255, 255);// rgba(255,255,255,0.22)
-        private static readonly Color ColAccent = Color.FromArgb(255, 85, 0);         // #FF5500 Kinetic Orange
-        private static readonly Color ColLime = Color.FromArgb(200, 255, 0);          // #C8FF00 Acid Lime
-        private static readonly Color ColTextMain = Color.FromArgb(242, 243, 247);
-        private static readonly Color ColTextMuted = Color.FromArgb(138, 142, 154);
-        private static readonly Color ColTextDim = Color.FromArgb(92, 96, 108);
+        // Dynamic Studio Palette (Live-Switchable: Kinetic Dark, Daylight Light, Cyber Neon, Monochrome, Custom + Island Sync)
+        private Color ColChassis = Color.FromArgb(11, 11, 13);
+        private Color ColHeaderBar = Color.FromArgb(14, 14, 17);
+        private Color ColStageBg = Color.FromArgb(14, 14, 17);
+        private readonly Color ColPureIsland = Color.FromArgb(0, 0, 0);
+        private Color ColDeckCard = Color.FromArgb(18, 18, 21);
+        private Color ColDeckHover = Color.FromArgb(26, 26, 31);
+        private Color ColDeckInset = Color.FromArgb(13, 13, 16);
+        private Color ColWellBg = Color.FromArgb(9, 9, 11);
+        private Color ColBorder = Color.FromArgb(21, 255, 255, 255);
+        private Color ColBorderHi = Color.FromArgb(56, 255, 255, 255);
+        private Color ColAccent = Color.FromArgb(255, 85, 0);
+        private Color ColAccentHover = Color.FromArgb(255, 106, 28);
+        private Color ColLime = Color.FromArgb(200, 255, 0);
+        private Color ColTextMain = Color.FromArgb(242, 243, 247);
+        private Color ColTextMuted = Color.FromArgb(138, 142, 154);
+        private Color ColTextDim = Color.FromArgb(92, 96, 108);
+        private Color ColOnAccentText = Color.FromArgb(12, 12, 14);
+        private bool _isLightTheme = false;
+
+        private Color ColAccentAlpha(int a)
+        {
+            return Color.FromArgb(Math.Max(0, Math.Min(255, a)), ColAccent.R, ColAccent.G, ColAccent.B);
+        }
+
+        private Color ColInkAlpha(int a)
+        {
+            int ca = Math.Max(0, Math.Min(255, a));
+            return _isLightTheme ? Color.FromArgb(ca, 16, 22, 38) : Color.FromArgb(ca, 255, 255, 255);
+        }
+
+        private void RefreshSettingsPalette()
+        {
+            string preset = _cfg.settings_theme_preset ?? "Kinetic Dark";
+            Color defAcc = Color.FromArgb(255, 85, 0);
+            Color defSec = Color.FromArgb(200, 255, 0);
+
+            if (preset == "Daylight Light")
+            {
+                _isLightTheme = true;
+                ColChassis = Color.FromArgb(239, 241, 246);
+                ColHeaderBar = Color.FromArgb(229, 233, 241);
+                ColStageBg = Color.FromArgb(231, 235, 243);
+                ColDeckCard = Color.FromArgb(255, 255, 255);
+                ColDeckHover = Color.FromArgb(243, 246, 252);
+                ColDeckInset = Color.FromArgb(234, 238, 246);
+                ColWellBg = Color.FromArgb(223, 228, 239);
+                defAcc = Color.FromArgb(10, 132, 255);
+                defSec = Color.FromArgb(16, 185, 129);
+            }
+            else if (preset == "Cyber Neon")
+            {
+                _isLightTheme = false;
+                ColChassis = Color.FromArgb(7, 9, 19);
+                ColHeaderBar = Color.FromArgb(10, 14, 28);
+                ColStageBg = Color.FromArgb(10, 13, 26);
+                ColDeckCard = Color.FromArgb(16, 21, 40);
+                ColDeckHover = Color.FromArgb(24, 32, 58);
+                ColDeckInset = Color.FromArgb(11, 15, 30);
+                ColWellBg = Color.FromArgb(6, 8, 17);
+                defAcc = Color.FromArgb(34, 211, 238);
+                defSec = Color.FromArgb(236, 72, 153);
+            }
+            else if (preset == "Monochrome")
+            {
+                _isLightTheme = false;
+                ColChassis = Color.FromArgb(14, 14, 16);
+                ColHeaderBar = Color.FromArgb(18, 18, 21);
+                ColStageBg = Color.FromArgb(17, 17, 20);
+                ColDeckCard = Color.FromArgb(24, 24, 28);
+                ColDeckHover = Color.FromArgb(35, 35, 41);
+                ColDeckInset = Color.FromArgb(18, 18, 21);
+                ColWellBg = Color.FromArgb(10, 10, 12);
+                defAcc = Color.FromArgb(228, 228, 234);
+                defSec = Color.FromArgb(161, 161, 170);
+            }
+            else
+            {
+                _isLightTheme = false;
+                ColChassis = Color.FromArgb(11, 11, 13);
+                ColHeaderBar = Color.FromArgb(14, 14, 17);
+                ColStageBg = Color.FromArgb(14, 14, 17);
+                ColDeckCard = Color.FromArgb(18, 18, 21);
+                ColDeckHover = Color.FromArgb(26, 26, 31);
+                ColDeckInset = Color.FromArgb(13, 13, 16);
+                ColWellBg = Color.FromArgb(9, 9, 11);
+                defAcc = Color.FromArgb(255, 85, 0);
+                defSec = Color.FromArgb(200, 255, 0);
+            }
+
+            if (preset == "Custom" && !string.IsNullOrWhiteSpace(_cfg.settings_custom_bg_hex))
+            {
+                Color baseBg = ColorThemeUtils.ParseHex(_cfg.settings_custom_bg_hex, Color.FromArgb(14, 16, 22));
+                _isLightTheme = ColorThemeUtils.GetLuminance(baseBg) >= 140.0;
+                if (_isLightTheme)
+                {
+                    ColChassis = baseBg;
+                    ColHeaderBar = ColorThemeUtils.Blend(baseBg, Color.Black, 0.05f);
+                    ColStageBg = ColorThemeUtils.Blend(baseBg, Color.Black, 0.04f);
+                    ColDeckCard = ColorThemeUtils.Blend(baseBg, Color.White, 0.65f);
+                    ColDeckHover = ColorThemeUtils.Blend(baseBg, Color.White, 0.35f);
+                    ColDeckInset = ColorThemeUtils.Blend(baseBg, Color.Black, 0.04f);
+                    ColWellBg = ColorThemeUtils.Blend(baseBg, Color.Black, 0.09f);
+                }
+                else
+                {
+                    ColChassis = baseBg;
+                    ColHeaderBar = ColorThemeUtils.Blend(baseBg, Color.White, 0.03f);
+                    ColStageBg = ColorThemeUtils.Blend(baseBg, Color.White, 0.025f);
+                    ColDeckCard = ColorThemeUtils.Blend(baseBg, Color.White, 0.055f);
+                    ColDeckHover = ColorThemeUtils.Blend(baseBg, Color.White, 0.105f);
+                    ColDeckInset = ColorThemeUtils.Blend(baseBg, Color.Black, 0.18f);
+                    ColWellBg = ColorThemeUtils.Blend(baseBg, Color.Black, 0.35f);
+                }
+            }
+
+            if (_isLightTheme)
+            {
+                ColTextMain = Color.FromArgb(18, 22, 33);
+                ColTextMuted = Color.FromArgb(78, 86, 106);
+                ColTextDim = Color.FromArgb(118, 126, 146);
+                ColBorder = Color.FromArgb(32, 15, 22, 40);
+                ColBorderHi = Color.FromArgb(76, 15, 22, 40);
+            }
+            else
+            {
+                ColTextMain = Color.FromArgb(242, 243, 247);
+                ColTextMuted = Color.FromArgb(138, 142, 154);
+                ColTextDim = Color.FromArgb(92, 96, 108);
+                ColBorder = Color.FromArgb(22, 255, 255, 255);
+                ColBorderHi = Color.FromArgb(58, 255, 255, 255);
+            }
+
+            Color chosenAcc = defAcc;
+            Color chosenSec = defSec;
+            if (_cfg.settings_sync_island_accent)
+            {
+                ColorThemeUtils.ResolveIslandThemeAccents(_cfg.theme_preset, 255, out chosenAcc, out chosenSec);
+            }
+            else if (preset == "Custom")
+            {
+                chosenAcc = ColorThemeUtils.ParseHex(_cfg.settings_custom_accent_hex, defAcc);
+                chosenSec = ColorThemeUtils.Blend(chosenAcc, _isLightTheme ? Color.FromArgb(16, 185, 129) : Color.White, 0.28f);
+            }
+
+            // Guarantee readable contrast on light cards
+            if (_isLightTheme && ColorThemeUtils.GetLuminance(chosenAcc) > 195.0)
+                chosenAcc = ColorThemeUtils.Blend(chosenAcc, Color.FromArgb(20, 30, 55), 0.38f);
+            if (_isLightTheme && ColorThemeUtils.GetLuminance(chosenSec) > 195.0)
+                chosenSec = ColorThemeUtils.Blend(chosenSec, Color.FromArgb(16, 120, 85), 0.38f);
+
+            ColAccent = chosenAcc;
+            ColLime = chosenSec;
+            ColAccentHover = _isLightTheme
+                ? ColorThemeUtils.Blend(ColAccent, Color.Black, 0.14f)
+                : ColorThemeUtils.Blend(ColAccent, Color.White, 0.16f);
+            ColOnAccentText = ColorThemeUtils.GetLuminance(ColAccent) > 142.0
+                ? Color.FromArgb(12, 13, 16)
+                : Color.FromArgb(250, 251, 255);
+
+            BackColor = ColChassis;
+            ForeColor = ColTextMain;
+            if (_inlineBox != null)
+            {
+                _inlineBox.BackColor = ColDeckInset;
+                _inlineBox.ForeColor = ColAccent;
+            }
+        }
+
+        private void PickColorInteractive(Color current, Action<Color> onChosen)
+        {
+            using (var cd = new ColorDialog())
+            {
+                cd.Color = current;
+                cd.FullOpen = true;
+                cd.AnyColor = true;
+                if (cd.ShowDialog(this) == DialogResult.OK && onChosen != null)
+                {
+                    onChosen(cd.Color);
+                    RefreshSettingsPalette();
+                    ApplyLive();
+                }
+            }
+        }
 
         private enum StagePreviewMode { Idle = 0, Compact = 1, Expanded = 2, Media = 3, Notify = 4 }
 
@@ -6392,6 +6562,7 @@ namespace DynamicIslandWin
             };
             _inlineBox.LostFocus += (s, e) => CommitInlineInput(true);
             Controls.Add(_inlineBox);
+            RefreshSettingsPalette();
 
             SyncStageTargetsFromMode(false);
             _stageCurW = _stageTargetW;
@@ -6655,6 +6826,7 @@ namespace DynamicIslandWin
         private void ApplyLive()
         {
             _lastModifiedTick = Environment.TickCount;
+            RefreshSettingsPalette();
             SyncStageTargetsFromMode(false);
             ConfigManager.SetAutostart(_cfg.autostart);
             ConfigManager.Save(_cfg);
@@ -6677,16 +6849,7 @@ namespace DynamicIslandWin
 
         private void GetPreviewThemeColors(int alpha, out Color c1, out Color c2)
         {
-            string preset = _cfg.theme_preset ?? "Dinasmic Neon";
-            if (preset == "Kinetic Orange") { c1 = Color.FromArgb(alpha, 255, 85, 0); c2 = Color.FromArgb(alpha, 255, 159, 10); }
-            else if (preset == "Acid Lime") { c1 = Color.FromArgb(alpha, 200, 255, 0); c2 = Color.FromArgb(alpha, 16, 185, 129); }
-            else if (preset == "Dinasmic Neon") { c1 = Color.FromArgb(alpha, 34, 211, 238); c2 = Color.FromArgb(alpha, 236, 72, 153); }
-            else if (preset == "Apple Blue") { c1 = Color.FromArgb(alpha, 10, 132, 255); c2 = Color.FromArgb(alpha, 139, 92, 246); }
-            else if (preset == "Yandex Gold-Yellow") { c1 = Color.FromArgb(alpha, 255, 214, 10); c2 = Color.FromArgb(alpha, 255, 159, 10); }
-            else if (preset == "Spotify Neon Green") { c1 = Color.FromArgb(alpha, 48, 209, 88); c2 = Color.FromArgb(alpha, 34, 211, 238); }
-            else if (preset == "Crimson Sunset") { c1 = Color.FromArgb(alpha, 255, 55, 95); c2 = Color.FromArgb(alpha, 255, 159, 10); }
-            else if (preset == "Minimal White") { c1 = Color.FromArgb(alpha, 245, 245, 247); c2 = Color.FromArgb(alpha, 174, 174, 178); }
-            else { c1 = Color.FromArgb(alpha, 34, 211, 238); c2 = Color.FromArgb(alpha, 192, 132, 252); }
+            ColorThemeUtils.ResolveIslandThemeAccents(_cfg.theme_preset, alpha, out c1, out c2);
         }
         // =====================================================================
         // REUSABLE CUSTOM CONTROLS (Zero System Widgets, Zero Blur, 1px Borders)
