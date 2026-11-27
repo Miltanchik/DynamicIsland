@@ -33,8 +33,7 @@ $wm  = "C:\Windows\System32\WinMetadata"
   /win32icon:"DynamicIslandWin.ico" `
   /out:"release\DynamicIslandWin.exe" `
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
-  /r:System.Web.Extensions.dll /r:System.Management.dll `
-  /r:"$wpf\UIAutomationClient.dll" /r:"$wpf\UIAutomationTypes.dll" `
+  /r:System.Web.Extensions.dll /r:System.Management.dll ` `
   /r:"$fw\System.Runtime.dll" /r:"$fw\System.Runtime.WindowsRuntime.dll" `
   /r:"$wm\Windows.Foundation.winmd" /r:"$wm\Windows.Media.winmd" /r:"$wm\Windows.Storage.winmd" `
   "NativeDynamicIsland.cs"

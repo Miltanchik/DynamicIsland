@@ -28,8 +28,6 @@ jobs:
               /win32icon:"DynamicIslandWin.ico" `
               /out:"$relDir\DynamicIslandWin.exe" `
               /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:System.Management.dll `
-              /r:"$wpfDir\UIAutomationClient.dll" `
-              /r:"$wpfDir\UIAutomationTypes.dll" `
               /r:"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Runtime.dll" `
               /r:"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Runtime.InteropServices.WindowsRuntime.dll" `
               /r:"C:\Windows\System32\WinMetadata\Windows.Foundation.winmd" `
