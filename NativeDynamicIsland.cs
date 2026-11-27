@@ -2516,6 +2516,35 @@ namespace DynamicIslandWin
         private static FavWorkItem _pendingToggle = null;
         private static FavWorkItem _pendingSync = null;
         private static int _lastManualToggleTick = 0;
+        private static string _lastLoggedPassiveSync = "";
+
+        public static string RunDiagnosticProbe()
+        {
+            var sb = new StringBuilder();
+            try
+            {
+                var uia = (IUIAutomation2)(new CUIAutomation8ComObject());
+                uia.put_AutoSetFocus(0);
+                uia.put_ConnectionTimeout(750);
+                uia.put_TransactionTimeout(1100);
+
+                var dummyYm = new MediaSessionSnapshot { AppId = "YandexMusic", DisplayAppName = "Яндекс Музыка", Title = "Probe", Artist = "Probe" };
+                string wt; IntPtr rw;
+                IntPtr top = MultiPlayerMediaController.FindPlayerWindowSafe(dummyYm, false, true, out wt, out rw);
+                sb.AppendLine(string.Format("YM Window: top={0} render={1} vis={2} iconic={3} title='{4}'",
+                    top, rw, top != IntPtr.Zero && NativeWin32.IsWindowVisible(top), top != IntPtr.Zero && NativeWin32.IsIconic(top), wt));
+                if (top != IntPtr.Zero)
+                {
+                    bool liked; string dbg;
+                    var btn = FindPlayerBarLikeElement(uia, top, rw, false, wt, true, out liked, out dbg);
+                    sb.AppendLine(string.Format("YM UIA Like Button: found={0} isLiked={1} [{2}]", btn != null, liked, dbg));
+                    ReleaseCom(btn);
+                }
+                ReleaseCom(uia);
+            }
+            catch (Exception ex) { sb.AppendLine("Probe error: " + ex.Message); }
+            return sb.ToString();
+        }
 
         private static void LogDiagnostic(string level, string msg)
         {
@@ -2951,24 +2980,20 @@ namespace DynamicIslandWin
 
             if (!job.IsToggleAction)
             {
-                if (topHwnd == IntPtr.Zero)
-                {
-                    LogDiagnostic("DIAG", "PassiveSync topHwnd=0 for appId='" + (job.Snapshot.AppId ?? "") + "' track='" + job.TrackKey + "'");
-                    return;
-                }
+                if (topHwnd == IntPtr.Zero) return;
                 bool playerLiked; string dbg;
                 var btn = FindPlayerBarLikeElement(uia, topHwnd, renderHwnd, isBrowser, winTitle, true, out playerLiked, out dbg);
                 if (btn != null)
                 {
                     ReleaseCom(btn);
                     res.SyncedFromPlayer = true; res.IsLiked = playerLiked;
-                    LogDiagnostic("SYNC", "Read player favorite state for '" + job.TrackKey + "' -> IsLiked=" + playerLiked + " [" + dbg + "]");
+                    string sigLog = job.TrackKey + "|" + playerLiked;
+                    if (!string.Equals(_lastLoggedPassiveSync, sigLog, StringComparison.Ordinal))
+                    {
+                        _lastLoggedPassiveSync = sigLog;
+                        LogDiagnostic("SYNC", "Synced player favorite state for '" + job.TrackKey + "' -> IsLiked=" + playerLiked + " [" + dbg + "]");
+                    }
                     if (job.Callback != null) job.Callback(res);
-                }
-                else
-                {
-                    LogDiagnostic("DIAG", string.Format("PassiveSync btn=null top={0} render={1} vis={2} iconic={3} title='{4}' dbg='{5}'",
-                        topHwnd, renderHwnd, NativeWin32.IsWindowVisible(topHwnd), NativeWin32.IsIconic(topHwnd), winTitle, dbg));
                 }
                 return;
             }
@@ -6614,6 +6639,7 @@ namespace DynamicIslandWin
         private string _lastLikeSyncSig = "";
         private int _lastLikeSyncTick = 0;
         private int _likeActionGeneration = 0;
+        private int _initialLikeSyncAttempts = 0;
         private volatile bool _livePlayerLikedKnown = false;
         private string _livePlayerLikedTrackKey = "";
         private volatile bool _livePlayerLikedValue = false;
@@ -7575,11 +7601,12 @@ namespace DynamicIslandWin
                             _currentPlayerIdx = activeIdx;
                         }
 
-                        // 2-Way Favorite Sync (Single Source of Truth: immediate on startup/track change + retry until synced + every 2.0s while Expanded)
+                        // 2-Way Favorite Sync (Single Source of Truth: immediate on startup/track change + up to 2 cold retries + every 2.0s while Expanded)
                         int nowSync = Environment.TickCount;
                         string activeTrackKey = PlayerFavoriteEngine.BuildTrackKey(activeSnap);
                         bool trackChangedForLike = !string.Equals(sig, _lastLikeSyncSig, StringComparison.Ordinal);
-                        bool needsInitialSync = !_livePlayerLikedKnown || !string.Equals(_livePlayerLikedTrackKey, activeTrackKey, StringComparison.OrdinalIgnoreCase);
+                        if (trackChangedForLike) _initialLikeSyncAttempts = 0;
+                        bool needsInitialSync = (!_livePlayerLikedKnown || !string.Equals(_livePlayerLikedTrackKey, activeTrackKey, StringComparison.OrdinalIgnoreCase)) && _initialLikeSyncAttempts < 2;
                         bool periodicSync = !_isFullscreenAppActive && (
                             (_mode == IslandMode.Expanded && _expandedPage == 0 && unchecked(nowSync - _lastLikeSyncTick) >= 2000) ||
                             (needsInitialSync && unchecked(nowSync - _lastLikeSyncTick) >= 2200));
@@ -7587,6 +7614,7 @@ namespace DynamicIslandWin
                         {
                             _lastLikeSyncSig = sig;
                             _lastLikeSyncTick = nowSync;
+                            _initialLikeSyncAttempts++;
                             PlayerFavoriteEngine.RequestSyncStateAsync(activeSnap, Volatile.Read(ref _likeActionGeneration), ApplySyncedFavoriteResult, trackChangedForLike);
                         }
                     }
@@ -9974,8 +10002,14 @@ namespace DynamicIslandWin
         private static Mutex _singleInstanceMutex;
 
         [STAThread]
-        private static void Main()
+        private static void Main(string[] args)
         {
+            if (args != null && args.Length > 0 && args[0] == "--probe-players")
+            {
+                string report = PlayerFavoriteEngine.RunDiagnosticProbe();
+                try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "di_player_probe.txt"), report, Encoding.UTF8); } catch { }
+                return;
+            }
             try
             {
                 int myPid = Process.GetCurrentProcess().Id;
