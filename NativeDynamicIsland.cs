@@ -2547,6 +2547,624 @@ namespace DynamicIslandWin
     }
 
     [ComImport, Guid("E22AD333-B25F-460C-83D0-0581107395C9")]
+    public sealed class DiscoveredMusicPlayer
+    {
+        public string Id = "";
+        public string DisplayName = "";
+        public string LaunchTarget = "";
+        public string LaunchArgs = "";
+        public string IconSourcePath = "";
+        public bool IsWebFallback = false;
+        public bool IsLastUsed = false;
+        public string[] MatchKeywords = new string[0];
+    }
+
+    public static class InstalledMusicPlayerDiscovery
+    {
+        private static readonly object _discLock = new object();
+        private static List<DiscoveredMusicPlayer> _cachedPlayers = null;
+        private static int _lastScanTick = 0;
+
+        private sealed class PlayerCatalogSpec
+        {
+            public string Id;
+            public string Name;
+            public string[] ExeCandidates;
+            public string[] ShortcutNames;
+            public string[] UwpPrefixes;
+            public string UwpEntryPoint;
+            public string WebUrl;
+            public string[] Keywords;
+        }
+
+        private static readonly PlayerCatalogSpec[] Catalog = new PlayerCatalogSpec[]
+        {
+            new PlayerCatalogSpec
+            {
+                Id = "yandex_music", Name = "Яндекс Музыка",
+                ExeCandidates = new[] { @"%LOCALAPPDATA%\Programs\YandexMusic\Яндекс Музыка.exe", @"%LOCALAPPDATA%\Programs\YandexMusic\YandexMusic.exe" },
+                ShortcutNames = new[] { "яндекс музыка", "yandex music" },
+                UwpPrefixes = new[] { "Yandex.Music_" }, UwpEntryPoint = "App",
+                WebUrl = "https://music.yandex.ru",
+                Keywords = new[] { "яндекс", "yandexmusic", "yandex.music", "music.yandex" }
+            },
+            new PlayerCatalogSpec
+            {
+                Id = "spotify", Name = "Spotify",
+                ExeCandidates = new[] { @"%APPDATA%\Spotify\Spotify.exe", @"%LOCALAPPDATA%\Microsoft\WindowsApps\Spotify.exe" },
+                ShortcutNames = new[] { "spotify" },
+                UwpPrefixes = new[] { "SpotifyAB.SpotifyMusic_" }, UwpEntryPoint = "Spotify",
+                WebUrl = "https://open.spotify.com",
+                Keywords = new[] { "spotify" }
+            },
+            new PlayerCatalogSpec
+            {
+                Id = "vk_music", Name = "VK Музыка",
+                ExeCandidates = new[] { @"%LOCALAPPDATA%\Programs\vk-music\VK Музыка.exe", @"%LOCALAPPDATA%\Programs\VK Music\VK Music.exe", @"%LOCALAPPDATA%\Programs\vkmusic\VKMusic.exe" },
+                ShortcutNames = new[] { "vk музыка", "vk music", "вк музыка" },
+                UwpPrefixes = new string[0], UwpEntryPoint = "App",
+                WebUrl = "https://vkmusic.vk.com",
+                Keywords = new[] { "vkmusic", "vk музыка", "vk music", "vk.com" }
+            },
+            new PlayerCatalogSpec
+            {
+                Id = "youtube_music", Name = "YouTube Music",
+                ExeCandidates = new[] { @"%LOCALAPPDATA%\Programs\youtube-music\YouTube Music.exe", @"%LOCALAPPDATA%\Programs\YouTube Music Desktop App\YouTube Music Desktop App.exe" },
+                ShortcutNames = new[] { "youtube music", "yt music" },
+                UwpPrefixes = new string[0], UwpEntryPoint = "App",
+                WebUrl = "https://music.youtube.com",
+                Keywords = new[] { "youtube music", "youtube-music", "music.youtube" }
+            },
+            new PlayerCatalogSpec
+            {
+                Id = "soundcloud", Name = "SoundCloud",
+                ExeCandidates = new[] { @"%LOCALAPPDATA%\Programs\SoundCloud\SoundCloud.exe" },
+                ShortcutNames = new[] { "soundcloud" },
+                UwpPrefixes = new[] { "SoundCloud." }, UwpEntryPoint = "App",
+                WebUrl = "https://soundcloud.com/discover",
+                Keywords = new[] { "soundcloud" }
+            },
+            new PlayerCatalogSpec
+            {
+                Id = "apple_music", Name = "Apple Music",
+                ExeCandidates = new[] { @"%LOCALAPPDATA%\Microsoft\WindowsApps\AppleMusic.exe", @"%ProgramFiles%\iTunes\iTunes.exe", @"%ProgramFiles(x86)%\iTunes\iTunes.exe" },
+                ShortcutNames = new[] { "apple music", "itunes" },
+                UwpPrefixes = new[] { "AppleInc.AppleMusicWin_", "AppleInc.iTunes_" }, UwpEntryPoint = "App",
+                WebUrl = "https://music.apple.com",
+                Keywords = new[] { "applemusic", "itunes", "apple music" }
+            },
+            new PlayerCatalogSpec
+            {
+                Id = "aimp", Name = "AIMP",
+                ExeCandidates = new[] { @"%ProgramFiles%\AIMP\AIMP.exe", @"%ProgramFiles(x86)%\AIMP\AIMP.exe", @"%LOCALAPPDATA%\Programs\AIMP\AIMP.exe" },
+                ShortcutNames = new[] { "aimp" },
+                UwpPrefixes = new string[0], UwpEntryPoint = "",
+                WebUrl = "",
+                Keywords = new[] { "aimp" }
+            },
+            new PlayerCatalogSpec
+            {
+                Id = "foobar2000", Name = "foobar2000",
+                ExeCandidates = new[] { @"%ProgramFiles%\foobar2000\foobar2000.exe", @"%ProgramFiles(x86)%\foobar2000\foobar2000.exe" },
+                ShortcutNames = new[] { "foobar2000" },
+                UwpPrefixes = new string[0], UwpEntryPoint = "",
+                WebUrl = "",
+                Keywords = new[] { "foobar" }
+            },
+            new PlayerCatalogSpec
+            {
+                Id = "musicbee", Name = "MusicBee",
+                ExeCandidates = new[] { @"%ProgramFiles%\MusicBee\MusicBee.exe", @"%ProgramFiles(x86)%\MusicBee\MusicBee.exe" },
+                ShortcutNames = new[] { "musicbee" },
+                UwpPrefixes = new string[0], UwpEntryPoint = "",
+                WebUrl = "",
+                Keywords = new[] { "musicbee" }
+            },
+            new PlayerCatalogSpec
+            {
+                Id = "wmp", Name = "Медиаплеер Windows",
+                ExeCandidates = new[] { @"%LOCALAPPDATA%\Microsoft\WindowsApps\Microsoft.Media.Player.exe" },
+                ShortcutNames = new[] { "медиаплеер", "media player" },
+                UwpPrefixes = new[] { "Microsoft.ZuneMusic_" }, UwpEntryPoint = "Microsoft.ZuneMusic",
+                WebUrl = "",
+                Keywords = new[] { "zunemusic", "music.ui", "microsoft.media.player", "wmplayer" }
+            }
+        };
+
+        public static void RememberFromActiveSession(IslandConfigData cfg, MediaSessionSnapshot snap)
+        {
+            if (cfg == null || snap == null || string.IsNullOrEmpty(snap.AppId) || snap.NativeSession == null) return;
+            if (snap.IsVideoPlayback || !snap.IsDedicatedPlayer) return;
+
+            string appLow = (snap.AppId + " " + snap.DisplayAppName).ToLowerInvariant();
+            string matchedId = "";
+            string matchedName = snap.DisplayAppName;
+            foreach (var spec in Catalog)
+            {
+                foreach (string kw in spec.Keywords)
+                {
+                    if (appLow.Contains(kw))
+                    {
+                        matchedId = spec.Id;
+                        matchedName = spec.Name;
+                        break;
+                    }
+                }
+                if (!string.IsNullOrEmpty(matchedId)) break;
+            }
+            if (string.IsNullOrEmpty(matchedId)) matchedId = snap.AppId;
+
+            string exe = snap.ExecutablePath ?? "";
+            if (string.IsNullOrEmpty(exe))
+            {
+                try
+                {
+                    string stem = snap.AppId;
+                    if (stem.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) stem = stem.Substring(0, stem.Length - 4);
+                    if (!stem.Contains("!"))
+                    {
+                        Process[] ps = Process.GetProcessesByName(stem);
+                        if (ps.Length == 0 && matchedId == "yandex_music") ps = Process.GetProcessesByName("Яндекс Музыка");
+                        if (ps.Length > 0) { try { exe = ps[0].MainModule.FileName; } catch { } }
+                    }
+                }
+                catch { }
+            }
+
+            bool changed = !string.Equals(cfg.last_used_music_player_id, matchedId, StringComparison.OrdinalIgnoreCase) ||
+                           (!string.IsNullOrEmpty(exe) && !string.Equals(cfg.last_used_music_player_path, exe, StringComparison.OrdinalIgnoreCase));
+            if (changed)
+            {
+                cfg.last_used_music_player_id = matchedId;
+                cfg.last_used_music_player_name = matchedName;
+                if (!string.IsNullOrEmpty(exe)) cfg.last_used_music_player_path = exe;
+                ConfigManager.Save(cfg);
+            }
+        }
+
+        private static Dictionary<string, string> ScanStartMenuShortcuts()
+        {
+            var found = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string[] roots = new string[]
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.Programs),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms),
+                Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory)
+            };
+            foreach (string root in roots)
+            {
+                if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) continue;
+                try
+                {
+                    foreach (string f in Directory.GetFiles(root, "*.lnk", SearchOption.TopDirectoryOnly))
+                        RegisterShortcutCandidate(found, f);
+                    foreach (string sub in Directory.GetDirectories(root))
+                    {
+                        try
+                        {
+                            foreach (string f in Directory.GetFiles(sub, "*.lnk", SearchOption.TopDirectoryOnly))
+                                RegisterShortcutCandidate(found, f);
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+            return found;
+        }
+
+        private static void RegisterShortcutCandidate(Dictionary<string, string> map, string lnkPath)
+        {
+            string nm = (Path.GetFileNameWithoutExtension(lnkPath) ?? "").ToLowerInvariant();
+            if (nm.Contains("uninstall") || nm.Contains("удалить") || nm.Contains("деинстал")) return;
+            foreach (var spec in Catalog)
+            {
+                if (map.ContainsKey(spec.Id)) continue;
+                foreach (string sn in spec.ShortcutNames)
+                {
+                    if (nm.Equals(sn, StringComparison.OrdinalIgnoreCase) || nm.Contains(sn))
+                    {
+                        map[spec.Id] = lnkPath;
+                        break;
+                    }
+                }
+            }
+        }
+
+        private static Dictionary<string, string> ScanRegistryPlayers()
+        {
+            var found = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string[] uninstPaths = new string[]
+            {
+                @"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+            };
+            RegistryKey[] hives = new RegistryKey[] { Registry.CurrentUser, Registry.LocalMachine, Registry.LocalMachine };
+            for (int r = 0; r < uninstPaths.Length; r++)
+            {
+                try
+                {
+                    using (RegistryKey baseKey = hives[r].OpenSubKey(uninstPaths[r], false))
+                    {
+                        if (baseKey == null) continue;
+                        foreach (string subName in baseKey.GetSubKeyNames())
+                        {
+                            try
+                            {
+                                using (RegistryKey sk = baseKey.OpenSubKey(subName, false))
+                                {
+                                    if (sk == null) continue;
+                                    string disp = Convert.ToString(sk.GetValue("DisplayName") ?? "");
+                                    if (string.IsNullOrEmpty(disp)) continue;
+                                    string dLow = disp.ToLowerInvariant();
+                                    foreach (var spec in Catalog)
+                                    {
+                                        if (found.ContainsKey(spec.Id)) continue;
+                                        bool match = false;
+                                        foreach (string sn in spec.ShortcutNames)
+                                            if (dLow.Contains(sn)) { match = true; break; }
+                                        if (!match) continue;
+
+                                        string iconRaw = Convert.ToString(sk.GetValue("DisplayIcon") ?? "").Trim('"', ' ');
+                                        int comma = iconRaw.IndexOf(',');
+                                        if (comma > 0) iconRaw = iconRaw.Substring(0, comma).Trim('"', ' ');
+                                        if (iconRaw.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) &&
+                                            iconRaw.IndexOf("uninst", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                            File.Exists(iconRaw))
+                                        {
+                                            found[spec.Id] = iconRaw;
+                                            continue;
+                                        }
+                                        string loc = Convert.ToString(sk.GetValue("InstallLocation") ?? "").Trim('"', ' ');
+                                        if (!string.IsNullOrEmpty(loc) && Directory.Exists(loc))
+                                        {
+                                            foreach (string exe in Directory.GetFiles(loc, "*.exe", SearchOption.TopDirectoryOnly))
+                                            {
+                                                string fn = Path.GetFileName(exe).ToLowerInvariant();
+                                                if (!fn.Contains("unins") && !fn.Contains("update") && !fn.Contains("crash"))
+                                                {
+                                                    found[spec.Id] = exe;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+            }
+            return found;
+        }
+
+        private static string TryFindUwpAppUri(string[] prefixes, string entryPoint)
+        {
+            if (prefixes == null || prefixes.Length == 0) return "";
+            try
+            {
+                string pkgRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Packages");
+                if (!Directory.Exists(pkgRoot)) return "";
+                foreach (string dir in Directory.GetDirectories(pkgRoot))
+                {
+                    string folder = Path.GetFileName(dir) ?? "";
+                    foreach (string pref in prefixes)
+                    {
+                        if (folder.StartsWith(pref, StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Convert PackageFamilyName folder (Name_8wekyb3d8bbwe) to shell:AppsFolder URI
+                            return @"shell:AppsFolder\" + folder + "!" + (string.IsNullOrEmpty(entryPoint) ? "App" : entryPoint);
+                        }
+                    }
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        public static List<DiscoveredMusicPlayer> DiscoverPlayers(IslandConfigData cfg, bool forceRefresh = false)
+        {
+            int now = Environment.TickCount;
+            lock (_discLock)
+            {
+                if (!forceRefresh && _cachedPlayers != null && unchecked(now - _lastScanTick) < 30000)
+                    return OrderWithConfig(_cachedPlayers, cfg);
+            }
+
+            var localList = new List<DiscoveredMusicPlayer>();
+            var webFallbacks = new List<DiscoveredMusicPlayer>();
+            var shortcuts = ScanStartMenuShortcuts();
+            var regExes = ScanRegistryPlayers();
+
+            foreach (var spec in Catalog)
+            {
+                string target = "";
+                string args = "";
+                string iconSrc = "";
+
+                // 1) Direct known paths
+                foreach (string raw in spec.ExeCandidates)
+                {
+                    string exp = Environment.ExpandEnvironmentVariables(raw);
+                    if (File.Exists(exp)) { target = exp; iconSrc = exp; break; }
+                }
+                // 2) Registry Uninstall / App Paths
+                if (string.IsNullOrEmpty(target) && regExes.ContainsKey(spec.Id))
+                {
+                    target = regExes[spec.Id];
+                    iconSrc = target;
+                }
+                // 3) Start Menu / Desktop / Browser PWA .lnk
+                if (string.IsNullOrEmpty(target) && shortcuts.ContainsKey(spec.Id))
+                {
+                    target = shortcuts[spec.Id];
+                    iconSrc = target;
+                }
+                // 4) UWP Store package
+                if (string.IsNullOrEmpty(target))
+                {
+                    string uwpUri = TryFindUwpAppUri(spec.UwpPrefixes, spec.UwpEntryPoint);
+                    if (!string.IsNullOrEmpty(uwpUri))
+                    {
+                        target = "explorer.exe";
+                        args = uwpUri;
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(target))
+                {
+                    localList.Add(new DiscoveredMusicPlayer
+                    {
+                        Id = spec.Id,
+                        DisplayName = spec.Name,
+                        LaunchTarget = target,
+                        LaunchArgs = args,
+                        IconSourcePath = iconSrc,
+                        IsWebFallback = false,
+                        MatchKeywords = spec.Keywords
+                    });
+                }
+                else if (!string.IsNullOrEmpty(spec.WebUrl))
+                {
+                    webFallbacks.Add(new DiscoveredMusicPlayer
+                    {
+                        Id = "web_" + spec.Id,
+                        DisplayName = spec.Name + " (Веб)",
+                        LaunchTarget = spec.WebUrl,
+                        LaunchArgs = "",
+                        IconSourcePath = "",
+                        IsWebFallback = true,
+                        MatchKeywords = spec.Keywords
+                    });
+                }
+            }
+
+            // Include custom last-used executable if it wasn't part of standard catalog
+            if (cfg != null && !string.IsNullOrEmpty(cfg.last_used_music_player_path) && File.Exists(cfg.last_used_music_player_path))
+            {
+                bool already = false;
+                foreach (var p in localList)
+                    if (string.Equals(p.LaunchTarget, cfg.last_used_music_player_path, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(p.Id, cfg.last_used_music_player_id, StringComparison.OrdinalIgnoreCase))
+                    { already = true; break; }
+                if (!already)
+                {
+                    string nm = string.IsNullOrEmpty(cfg.last_used_music_player_name) ? Path.GetFileNameWithoutExtension(cfg.last_used_music_player_path) : cfg.last_used_music_player_name;
+                    localList.Insert(0, new DiscoveredMusicPlayer
+                    {
+                        Id = string.IsNullOrEmpty(cfg.last_used_music_player_id) ? nm : cfg.last_used_music_player_id,
+                        DisplayName = nm,
+                        LaunchTarget = cfg.last_used_music_player_path,
+                        IconSourcePath = cfg.last_used_music_player_path,
+                        IsWebFallback = false,
+                        MatchKeywords = new[] { nm.ToLowerInvariant() }
+                    });
+                }
+            }
+
+            var combined = new List<DiscoveredMusicPlayer>(localList.Count + webFallbacks.Count);
+            combined.AddRange(localList);
+            combined.AddRange(webFallbacks);
+
+            lock (_discLock)
+            {
+                _cachedPlayers = combined;
+                _lastScanTick = now;
+            }
+            return OrderWithConfig(combined, cfg);
+        }
+
+        private static List<DiscoveredMusicPlayer> OrderWithConfig(List<DiscoveredMusicPlayer> src, IslandConfigData cfg)
+        {
+            var res = new List<DiscoveredMusicPlayer>(src.Count);
+            string lastId = cfg != null ? (cfg.last_used_music_player_id ?? "") : "";
+            DiscoveredMusicPlayer topLast = null;
+            foreach (var p in src)
+            {
+                bool isLast = !string.IsNullOrEmpty(lastId) && string.Equals(p.Id, lastId, StringComparison.OrdinalIgnoreCase);
+                var copy = new DiscoveredMusicPlayer
+                {
+                    Id = p.Id, DisplayName = p.DisplayName, LaunchTarget = p.LaunchTarget,
+                    LaunchArgs = p.LaunchArgs, IconSourcePath = p.IconSourcePath,
+                    IsWebFallback = p.IsWebFallback, IsLastUsed = isLast, MatchKeywords = p.MatchKeywords
+                };
+                if (isLast && topLast == null) topLast = copy;
+                else res.Add(copy);
+            }
+            if (topLast != null) res.Insert(0, topLast);
+            return res;
+        }
+
+        public static DiscoveredMusicPlayer ResolveDefaultPlayer(IslandConfigData cfg)
+        {
+            if (cfg == null || string.IsNullOrWhiteSpace(cfg.default_music_player_id)) return null;
+            var all = DiscoverPlayers(cfg, false);
+            foreach (var p in all)
+                if (string.Equals(p.Id, cfg.default_music_player_id, StringComparison.OrdinalIgnoreCase))
+                    return p;
+            return null;
+        }
+
+        private static IntPtr FindPlayerMainWindowByKeywords(string[] keywords)
+        {
+            if (keywords == null || keywords.Length == 0) return IntPtr.Zero;
+            IntPtr found = IntPtr.Zero;
+            int bestArea = 0;
+            try
+            {
+                NativeWin32.EnumWindows((hWnd, lParam) =>
+                {
+                    if (!NativeWin32.IsWindowVisible(hWnd) && !NativeWin32.IsIconic(hWnd)) return true;
+                    uint pid;
+                    NativeWin32.GetWindowThreadProcessId(hWnd, out pid);
+                    if (pid == 0) return true;
+                    string pName = "";
+                    try { pName = Process.GetProcessById((int)pid).ProcessName ?? ""; } catch { }
+                    var sbTitle = new StringBuilder(256);
+                    NativeWin32.GetWindowText(hWnd, sbTitle, 256);
+                    string comb = (pName + " " + sbTitle.ToString()).ToLowerInvariant();
+
+                    bool matched = false;
+                    foreach (string kw in keywords)
+                        if (!string.IsNullOrEmpty(kw) && comb.Contains(kw.ToLowerInvariant())) { matched = true; break; }
+                    if (!matched) return true;
+
+                    NativeWin32.RECT rc;
+                    int area = 100;
+                    if (NativeWin32.GetWindowRect(hWnd, out rc))
+                        area = Math.Max(1, (rc.Right - rc.Left) * (rc.Bottom - rc.Top));
+                    if (area > bestArea) { bestArea = area; found = hWnd; }
+                    return true;
+                }, IntPtr.Zero);
+            }
+            catch { }
+            return found;
+        }
+
+        private static void SendAppCommandPlayToWindow(IntPtr hwnd, string command)
+        {
+            if (hwnd == IntPtr.Zero || !NativeWin32.IsWindow(hwnd)) return;
+            int appCmd = command == "next" ? NativeWin32.APPCOMMAND_MEDIA_NEXTTRACK
+                       : (command == "prev" ? NativeWin32.APPCOMMAND_MEDIA_PREVIOUSTRACK : NativeWin32.APPCOMMAND_MEDIA_PLAY);
+            IntPtr lParam = new IntPtr(appCmd << 16);
+            NativeWin32.PostMessage(hwnd, NativeWin32.WM_APPCOMMAND, hwnd, lParam);
+            IntPtr child = MultiPlayerMediaController.FindRenderWidgetChild(hwnd);
+            if (child != IntPtr.Zero)
+                NativeWin32.PostMessage(child, NativeWin32.WM_APPCOMMAND, child, lParam);
+        }
+
+        public static void LaunchPlayerAndAutoPlayAsync(DiscoveredMusicPlayer player, IslandConfigData cfg, CoreAudioBridge audio, string command, Action onReadyWake)
+        {
+            if (player == null || string.IsNullOrEmpty(player.LaunchTarget)) return;
+            if (cfg != null)
+            {
+                cfg.last_used_music_player_id = player.Id;
+                cfg.last_used_music_player_name = player.DisplayName;
+                if (!player.IsWebFallback && File.Exists(player.LaunchTarget) && player.LaunchTarget.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                    cfg.last_used_music_player_path = player.LaunchTarget;
+                ConfigManager.Save(cfg);
+            }
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = player.LaunchTarget,
+                        Arguments = player.LaunchArgs ?? "",
+                        UseShellExecute = true
+                    };
+                    Process.Start(psi);
+                }
+                catch { return; }
+
+                int startTick = Environment.TickCount;
+                int windowFirstSeenTick = 0;
+                bool appCmdSentOnce = false;
+                bool appCmdToggleSent = false;
+
+                while (unchecked(Environment.TickCount - startTick) < 13000)
+                {
+                    Thread.Sleep(420);
+                    try
+                    {
+                        MediaSessionSnapshot activeSnap;
+                        int activeIdx;
+                        var sessions = MultiPlayerMediaController.QueryAllPlayers(true, out activeSnap, out activeIdx);
+                        MediaSessionSnapshot matchedSnap = null;
+                        foreach (var s in sessions)
+                        {
+                            string comb = (s.AppId + " " + s.DisplayAppName + " " + s.Title).ToLowerInvariant();
+                            foreach (string kw in player.MatchKeywords)
+                                if (!string.IsNullOrEmpty(kw) && comb.Contains(kw.ToLowerInvariant()))
+                                { matchedSnap = s; break; }
+                            if (matchedSnap != null) break;
+                        }
+                        if (matchedSnap == null && sessions.Count == 1)
+                            matchedSnap = sessions[0];
+
+                        if (matchedSnap != null && matchedSnap.NativeSession != null)
+                        {
+                            MultiPlayerMediaController.SelectPlayerByAppId(matchedSnap.AppId);
+                            var nativeSes = (GlobalSystemMediaTransportControlsSession)matchedSnap.NativeSession;
+                            if (!matchedSnap.IsPlaying)
+                            {
+                                try { var op = nativeSes.TryPlayAsync(); Thread.Sleep(350); } catch { }
+                                var pbAfter = nativeSes.GetPlaybackInfo();
+                                if (pbAfter == null || pbAfter.PlaybackStatus != GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
+                                {
+                                    try { var op2 = nativeSes.TryTogglePlayPauseAsync(); Thread.Sleep(250); } catch { }
+                                }
+                            }
+                            if (command == "next")
+                            {
+                                try { var opn = nativeSes.TrySkipNextAsync(); } catch { }
+                            }
+                            if (onReadyWake != null) onReadyWake();
+                            return;
+                        }
+
+                        // Cold-start Electron/Desktop fallback (before SMTC session registers)
+                        if (!player.IsWebFallback)
+                        {
+                            if (audio != null && audio.IsAnyAudioSessionActiveForKeywords(player.MatchKeywords))
+                            {
+                                if (onReadyWake != null) onReadyWake();
+                                return;
+                            }
+
+                            IntPtr pHwnd = FindPlayerMainWindowByKeywords(player.MatchKeywords);
+                            if (pHwnd != IntPtr.Zero)
+                            {
+                                if (windowFirstSeenTick == 0) windowFirstSeenTick = Environment.TickCount;
+                                int hydratedMs = unchecked(Environment.TickCount - windowFirstSeenTick);
+                                if (!appCmdSentOnce && hydratedMs >= 2100)
+                                {
+                                    appCmdSentOnce = true;
+                                    SendAppCommandPlayToWindow(pHwnd, "play");
+                                }
+                                else if (appCmdSentOnce && !appCmdToggleSent && hydratedMs >= 3400)
+                                {
+                                    appCmdToggleSent = true;
+                                    IntPtr lp = new IntPtr(NativeWin32.APPCOMMAND_MEDIA_PLAY_PAUSE << 16);
+                                    NativeWin32.PostMessage(pHwnd, NativeWin32.WM_APPCOMMAND, pHwnd, lp);
+                                    if (sessions.Count == 0)
+                                        NativeWin32.SendMediaKey(NativeWin32.VK_MEDIA_PLAY_PAUSE);
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+                if (onReadyWake != null) onReadyWake();
+            });
+        }
+    }
+
     internal class CUIAutomation8ComObject { }
 
     [ComImport, Guid("352FFBA8-0973-437C-A61F-F64CAFD81DF9"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
