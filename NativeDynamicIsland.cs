@@ -2524,102 +2524,96 @@ namespace DynamicIslandWin
         private static int _lastManualToggleTick = 0;
         private static string _lastLoggedPassiveSync = "";
 
+        private static void DumpAccTree(object acc, int depth, StringBuilder sb, ref int btnCount)
+        {
+            if (acc == null || depth > 18 || btnCount > 80) return;
+            object vSelf = 0;
+            int role = 0, state = 0, childCount = 0;
+            string name = "";
+            try
+            {
+                // Query IA2 on every container up to depth 6 to wake WebView's BrowserAccessibilityManagerWin!
+                if (depth <= 7)
+                {
+                    var sp = acc as IComServiceProvider;
+                    if (sp != null)
+                    {
+                        Guid gAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+                        Guid gIA2 = new Guid("E89F726E-C4F4-4C19-BB19-B647D7FA8478");
+                        IntPtr p2;
+                        if (sp.QueryService(ref gAcc, ref gIA2, out p2) == 0 && p2 != IntPtr.Zero)
+                            Marshal.Release(p2);
+                    }
+                }
+                Type t = acc.GetType();
+                object rObj = t.InvokeMember("accRole", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
+                if (rObj is int) role = (int)rObj;
+                object sObj = t.InvokeMember("accState", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
+                if (sObj is int) state = (int)sObj;
+                object cObj = t.InvokeMember("accChildCount", System.Reflection.BindingFlags.GetProperty, null, acc, null);
+                if (cObj is int) childCount = (int)cObj;
+                if (role == 43 || role == 44 || role == 15 || depth <= 6)
+                {
+                    object nObj = t.InvokeMember("accName", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
+                    name = nObj as string ?? "";
+                }
+            }
+            catch { return; }
+
+            if (depth <= 6 || role == 15 || role == 43 || role == 44)
+            {
+                if (role == 43 || role == 44) btnCount++;
+                sb.AppendLine(string.Format("{0}d={1} role={2} state=0x{3:X} ch={4} name='{5}'",
+                    new string(' ', depth * 2), depth, role, state, childCount, name));
+            }
+
+            if (childCount <= 0 || childCount > 400) return;
+            object[] kids = new object[childCount];
+            int got;
+            if (NativeWin32.AccessibleChildren(acc, 0, childCount, kids, out got) == 0 && got > 0)
+            {
+                for (int i = 0; i < got; i++)
+                {
+                    if (kids[i] != null && !(kids[i] is int))
+                    {
+                        DumpAccTree(kids[i], depth + 1, sb, ref btnCount);
+                        ReleaseCom(kids[i]);
+                    }
+                }
+            }
+        }
+
         public static string RunDiagnosticProbe()
         {
             var sb = new StringBuilder();
             try
             {
-                var uia = (IUIAutomation2)(new CUIAutomation8ComObject());
-                uia.put_AutoSetFocus(0);
-                uia.put_ConnectionTimeout(1500);
-                uia.put_TransactionTimeout(2000);
-
                 var dummyYm = new MediaSessionSnapshot { AppId = "YandexMusic", DisplayAppName = "Яндекс Музыка", Title = "Probe", Artist = "Probe" };
                 string wt; IntPtr rw;
                 IntPtr top = MultiPlayerMediaController.FindPlayerWindowSafe(dummyYm, false, true, out wt, out rw);
                 sb.AppendLine("YM top=" + top + " title='" + wt + "'");
-
                 if (top != IntPtr.Zero)
                 {
-                    // 1) Wake Chromium AXModeComplete via MSAA IServiceProvider::QueryService(IID_IAccessible, IID_IAccessible2)!
                     Guid iidAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
-                    Guid iidIA2 = new Guid("E89F726E-C4F4-4C19-BB19-B647D7FA8478");
                     object accObj = null;
-                    int hrAcc = NativeWin32.AccessibleObjectFromWindow(top, 0xFFFFFFFCu, ref iidAcc, out accObj);
-                    if (accObj != null)
+                    if (NativeWin32.AccessibleObjectFromWindow(top, 0xFFFFFFFCu, ref iidAcc, out accObj) == 0 && accObj != null)
                     {
-                        try
-                        {
-                            var sp = accObj as IComServiceProvider;
-                            if (sp != null)
-                            {
-                                IntPtr pIA2;
-                                int hrQS = sp.QueryService(ref iidAcc, ref iidIA2, out pIA2);
-                                sb.AppendLine("IServiceProvider.QueryService(IA2) hr=0x" + hrQS.ToString("X8") + " ptr=" + pIA2);
-                                if (pIA2 != IntPtr.Zero) Marshal.Release(pIA2);
-                            }
-                        }
-                        finally { ReleaseCom(accObj); }
+                        int bc1 = 0;
+                        sb.AppendLine("=== PASS 1 (WAKE) ===");
+                        DumpAccTree(accObj, 0, sb, ref bc1);
+                        ReleaseCom(accObj);
                     }
-
-                    Thread.Sleep(650);
-                    IntPtr rwAfter = MultiPlayerMediaController.FindRenderWidgetChild(top);
-                    sb.AppendLine("After QS renderHwnd=" + rwAfter);
-
-                    foreach (IntPtr hTarget in (rwAfter != IntPtr.Zero ? new IntPtr[] { rwAfter, top } : new IntPtr[] { top }))
+                    Thread.Sleep(550);
+                    if (NativeWin32.AccessibleObjectFromWindow(top, 0xFFFFFFFCu, ref iidAcc, out accObj) == 0 && accObj != null)
                     {
-                        IUIAutomationElement root;
-                        if (uia.ElementFromHandle(hTarget, out root) == 0 && root != null)
-                        {
-                            IUIAutomationCondition cTrue, cBtn;
-                            uia.CreateTrueCondition(out cTrue);
-                            uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out cBtn);
-
-                            IUIAutomationElementArray allArr;
-                            root.FindAll(4, cTrue, out allArr);
-                            int allLen = -1;
-                            if (allArr != null) allArr.get_Length(out allLen);
-
-                            IUIAutomationElementArray btnArr;
-                            root.FindAll(4, cBtn, out btnArr);
-                            int bLen = -1;
-                            if (btnArr != null) btnArr.get_Length(out bLen);
-
-                            sb.AppendLine(string.Format("Target={0}: AllDescendants={1} Buttons={2}", hTarget, allLen, bLen));
-                            for (int i = 0; i < Math.Min(Math.Max(0, bLen), 50); i++)
-                            {
-                                IUIAutomationElement be;
-                                if (btnArr.GetElement(i, out be) == 0 && be != null)
-                                {
-                                    string bn; be.get_CurrentName(out bn);
-                                    object pat; int tv = -1;
-                                    if (be.GetCurrentPattern(UIA_TogglePatternId, out pat) == 0 && pat is IUIAutomationTogglePattern)
-                                    { ((IUIAutomationTogglePattern)pat).get_CurrentToggleState(out tv); ReleaseCom(pat); }
-                                    sb.AppendLine(string.Format("  Btn[{0}] tog={1} name='{2}'", i, tv, bn));
-                                    ReleaseCom(be);
-                                }
-                            }
-                            if (bLen <= 0 && allLen > 0)
-                            {
-                                for (int i = 0; i < Math.Min(allLen, 25); i++)
-                                {
-                                    IUIAutomationElement ae;
-                                    if (allArr.GetElement(i, out ae) == 0 && ae != null)
-                                    {
-                                        string an, ac; int act;
-                                        ae.get_CurrentName(out an); ae.get_CurrentClassName(out ac); ae.get_CurrentControlType(out act);
-                                        sb.AppendLine(string.Format("  Elem[{0}] ct={1} cls='{2}' name='{3}'", i, act, ac, an));
-                                        ReleaseCom(ae);
-                                    }
-                                }
-                            }
-                            ReleaseCom(btnArr); ReleaseCom(allArr); ReleaseCom(cBtn); ReleaseCom(cTrue); ReleaseCom(root);
-                        }
+                        int bc2 = 0;
+                        sb.AppendLine("=== PASS 2 (AFTER 550ms) ===");
+                        DumpAccTree(accObj, 0, sb, ref bc2);
+                        ReleaseCom(accObj);
                     }
                 }
-                ReleaseCom(uia);
             }
-            catch (Exception ex) { sb.AppendLine("Probe error: " + ex); }
+            catch (Exception ex) { sb.AppendLine("ERR: " + ex); }
             return sb.ToString();
         }
 
