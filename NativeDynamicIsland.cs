@@ -6228,7 +6228,7 @@ namespace DynamicIslandWin
             {
                 _activeTab = 1; _inspectorSubMode = 2;
             }
-            else if (lq.Contains("монит") || lq.Contains("экран") || lq.Contains("игр") || lq.Contains("призр") || lq.Contains("микр") || lq.Contains("отступ") || lq.Contains("сдвиг"))
+            else if (lq.Contains("видео") || lq.Contains("кино") || lq.Contains("youtube") || lq.Contains("vlc") || lq.Contains("монит") || lq.Contains("экран") || lq.Contains("игр") || lq.Contains("призр") || lq.Contains("микр") || lq.Contains("отступ") || lq.Contains("сдвиг"))
             {
                 _activeTab = 2;
             }
@@ -7623,20 +7623,53 @@ namespace DynamicIslandWin
             }
             else if (_inspectorSubMode == 1)
             {
-                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 34f),
+                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 28f),
                     "ОБЛОЖКА ТРЕКА В КОМПАКТЕ", _cfg.show_compact_cover, v => _cfg.show_compact_cover = v);
-                iy += 42f;
-                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 34f),
+                iy += 33f;
+                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 28f),
                     "ПРИОРИТЕТ ЯНДЕКС / SPOTIFY", _cfg.prefer_music_players, v => _cfg.prefer_music_players = v);
-                iy += 42f;
-                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 34f),
+                iy += 33f;
+                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 28f),
+                    "СКРЫВАТЬ ОСТРОВ ПРИ ПРОСМОТРЕ ВИДЕО", _cfg.hide_on_video_playback, v => _cfg.hide_on_video_playback = v);
+                iy += 33f;
+                DrawSegmentedToggle(g, new RectangleF(sx, iy, iw, 28f),
                     "LIVE-БАННЕР СМЕНЫ ТРЕКА", _cfg.enable_live_activities, v => _cfg.enable_live_activities = v);
-                iy += 46f;
+                iy += 35f;
 
                 string[] eqVals = { "5 Полос", "7 Полос", "Выкл" };
-                DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 52f),
+                DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 46f),
                     "РЕЖИМ АУДИО-ЭКВАЛАЙЗЕРА", eqVals, eqVals, _cfg.eq_style ?? "5 Полос", 3,
                     val => _cfg.eq_style = val);
+                iy += 52f;
+
+                var defP = InstalledMusicPlayerDiscovery.ResolveDefaultPlayer(_cfg);
+                string defLbl = defP != null ? ("♫ АВТОЗАПУСК PLAY: " + defP.DisplayName + " ▾") : "♫ АВТОЗАПУСК PLAY: СПРАШИВАТЬ (МЕНЮ) ▾";
+                var defBtnRc = new RectangleF(sx, iy, iw, 26f);
+                DrawHardwareButton(g, defBtnRc, defLbl, defP != null, false, () =>
+                {
+                    var menu = new ContextMenuStrip();
+                    var askItem = menu.Items.Add("Спрашивать при нажатии Play / Skip (показывать список)", null, (ms, me) =>
+                    {
+                        _cfg.default_music_player_id = "";
+                        ApplyLive();
+                    });
+                    if (string.IsNullOrEmpty(_cfg.default_music_player_id)) askItem.Font = new Font(menu.Font, FontStyle.Bold);
+                    menu.Items.Add(new ToolStripSeparator());
+                    var found = InstalledMusicPlayerDiscovery.DiscoverPlayers(_cfg, true);
+                    foreach (var fp in found)
+                    {
+                        var capP = fp;
+                        string pTitle = (capP.IsLastUsed ? "★ " : "") + capP.DisplayName;
+                        var mi = menu.Items.Add(pTitle, null, (ms, me) =>
+                        {
+                            _cfg.default_music_player_id = capP.Id;
+                            ApplyLive();
+                        });
+                        if (string.Equals(_cfg.default_music_player_id, capP.Id, StringComparison.OrdinalIgnoreCase))
+                            mi.Font = new Font(menu.Font, FontStyle.Bold);
+                    }
+                    menu.Show(PointToScreen(new Point((int)defBtnRc.X, (int)defBtnRc.Bottom + 2)));
+                });
             }
             else
             {
@@ -7699,33 +7732,37 @@ namespace DynamicIslandWin
                 () => _cfg.top_margin, v => _cfg.top_margin = v);
 
             var modeCell = new RectangleF(468f, 308f, 398f, 318f);
-            DrawBentoCell(g, modeCell, "03.B", "ИГРОВОЙ РЕЖИМ И РЕЖИМ ПРИЗРАКА", "D3D & GHOST");
+            DrawBentoCell(g, modeCell, "03.B", "ИГРОВОЙ РЕЖИМ, ВИДЕО И ПРИЗРАК", "D3D • VIDEO • TOP");
 
             float mx = modeCell.X + 10f;
             float mw = modeCell.Width - 20f;
-            float my = modeCell.Y + 32f;
+            float my = modeCell.Y + 30f;
 
             string[] fsVals = { "Неоновая телеметрия", "Авто-скрытие", "Только по клику" };
             string[] fsShort = { "Неон-телеметрия", "Авто-скрытие", "По клику" };
-            DrawChipSelectorMatrix(g, new RectangleF(mx, my, mw, 48f),
+            DrawChipSelectorMatrix(g, new RectangleF(mx, my, mw, 46f),
                 "ДЕТЕКТОР ПОЛНОЭКРАННЫХ ИГР (D3D FULLSCREEN)", fsVals, fsShort,
                 _cfg.fullscreen_mode ?? "Неоновая телеметрия", 3,
                 val => { _cfg.fullscreen_mode = val; _cfg.hide_in_fullscreen = (val == "Авто-скрытие"); });
-            my += 56f;
+            my += 52f;
 
-            DrawSegmentedToggle(g, new RectangleF(mx, my, mw, 34f),
+            DrawSegmentedToggle(g, new RectangleF(mx, my, mw, 28f),
+                "СКРЫВАТЬ ОСТРОВ ПРИ ВОСПРОИЗВЕДЕНИИ ВИДЕО", _cfg.hide_on_video_playback, v => _cfg.hide_on_video_playback = v);
+            my += 33f;
+
+            DrawSegmentedToggle(g, new RectangleF(mx, my, mw, 28f),
                 "РЕЖИМ «ПРИЗРАКА» (20% OPACITY • ПРОПУСК КЛИКОВ)", _cfg.enable_ghost_mode, v => _cfg.enable_ghost_mode = v);
-            my += 40f;
+            my += 33f;
 
-            DrawSegmentedToggle(g, new RectangleF(mx, my, mw, 34f),
+            DrawSegmentedToggle(g, new RectangleF(mx, my, mw, 28f),
                 "ИНДИКАТОР И 1-CLICK МЬЮТ МИКРОФОНА", _cfg.enable_mic_indicator, v => _cfg.enable_mic_indicator = v);
-            my += 40f;
+            my += 33f;
 
-            DrawSegmentedToggle(g, new RectangleF(mx, my, mw, 34f),
+            DrawSegmentedToggle(g, new RectangleF(mx, my, mw, 28f),
                 "ПРИОРИТЕТ ЯНДЕКС МУЗЫКИ / SPOTIFY", _cfg.prefer_music_players, v => _cfg.prefer_music_players = v);
-            my += 44f;
+            my += 34f;
 
-            var hkBox = new RectangleF(mx, my, mw, 94f);
+            var hkBox = new RectangleF(mx, my, mw, 90f);
             using (GraphicsPath hp = SharpRoundRect(hkBox, 5f))
             using (var hb = new SolidBrush(ColDeckInset))
             using (var hPen = new Pen(ColBorder, 1f))
@@ -7868,10 +7905,10 @@ namespace DynamicIslandWin
             DrawSegmentedToggle(g, new RectangleF(bx, sysCell.Y + 28f, bw, 24f),
                 "АВТОЗАПУСК ПРИ ВХОДЕ В WINDOWS", _cfg.autostart, v => _cfg.autostart = v);
             DrawSegmentedToggle(g, new RectangleF(bx, sysCell.Y + 55f, bw, 24f),
-                "АВТО-УСТАНОВКА РЕЛИЗОВ GITHUB", _cfg.auto_update_enabled, v => _cfg.auto_update_enabled = v);
+                "АВТО-УСТАНОВКА ОБНОВЛЕНИЙ (MAIN/RELEASE)", _cfg.auto_update_enabled, v => _cfg.auto_update_enabled = v);
 
             DrawHardwareButton(g, new RectangleF(bx, sysCell.Y + 81f, bw, 20f),
-                "↻ ЦЕНТР ОБНОВЛЕНИЙ — ПРОВЕРИТЬ СЕЙЧАС", true, false, () =>
+                "↻ ОБНОВИТЬ ПРОГРАММУ — ПРОВЕРИТЬ СЕЙЧАС", true, false, () =>
                 {
                     if (ManualUpdateCheckRequested != null) ManualUpdateCheckRequested();
                 });
