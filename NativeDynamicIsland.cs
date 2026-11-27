@@ -1687,6 +1687,27 @@ namespace DynamicIslandWin
         int GetMute([MarshalAs(UnmanagedType.Bool)] out bool pbMute);
     }
 
+    public enum MicCaptureSummaryState
+    {
+        Idle = 0,
+        ActiveUnmuted = 1,
+        PartiallyMuted = 2,
+        AllMuted = 3
+    }
+
+    public sealed class MicCaptureAppItem
+    {
+        public uint ProcessId;
+        public string ProcessKey = "";
+        public string ProcessName = "";
+        public string DisplayName = "";
+        public string ExecutablePath = "";
+        public bool IsCapturingNow;
+        public bool IsMuted;
+        public bool SupportsMute = true;
+        public int SessionCount = 1;
+    }
+
     public sealed class CoreAudioBridge : IDisposable
     {
         private IAudioEndpointVolume _endpoint;
@@ -1704,7 +1725,16 @@ namespace DynamicIslandWin
         public bool LastMusicMuted { get; private set; }
         public bool IsMicActive { get; private set; }
         public bool IsMicMuted { get; private set; }
+        public bool IsMicPartiallyMuted { get; private set; }
+        public int ActiveMicAppCount { get; private set; }
+        public int MutedMicAppCount { get; private set; }
+        public MicCaptureSummaryState MicSummaryState { get; private set; }
         public string ActiveMicAppName { get; private set; }
+
+        private readonly object _micLock = new object();
+        private readonly HashSet<string> _desiredMutedMicApps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, string> _micFriendlyNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private List<MicCaptureAppItem> _cachedMicApps = new List<MicCaptureAppItem>();
 
         private static readonly string[] MusicProcessKeywords = new string[]
         {
@@ -1980,70 +2010,378 @@ namespace DynamicIslandWin
             catch { _micEndpoint = null; _micSessionMgr = null; }
         }
 
+        private string ResolveFriendlyMicAppName(uint pid, string procName, string exePath)
+        {
+            string key = (procName ?? "").Trim();
+            if (string.IsNullOrEmpty(key)) return "Приложение";
+            lock (_micLock)
+            {
+                string cached;
+                if (_micFriendlyNames.TryGetValue(key, out cached) && !string.IsNullOrEmpty(cached))
+                    return cached;
+            }
+
+            string low = key.ToLowerInvariant();
+            string friendly = "";
+            if (low == "discord" || low == "discordptb" || low == "discordcanary") friendly = "Discord";
+            else if (low == "telegram" || low == "ayugram" || low == "kotatogram") friendly = "Telegram";
+            else if (low == "chrome") friendly = "Google Chrome";
+            else if (low == "msedge") friendly = "Microsoft Edge";
+            else if (low == "firefox") friendly = "Mozilla Firefox";
+            else if (low == "opera" || low == "opera_gx") friendly = "Opera";
+            else if (low == "browser" || low == "yandex") friendly = "Яндекс Браузер";
+            else if (low == "brave") friendly = "Brave";
+            else if (low == "vivaldi") friendly = "Vivaldi";
+            else if (low == "obs64" || low == "obs32" || low == "obs") friendly = "OBS Studio";
+            else if (low == "teams" || low == "ms-teams") friendly = "Microsoft Teams";
+            else if (low == "zoom") friendly = "Zoom";
+            else if (low == "cs2") friendly = "Counter-Strike 2";
+            else if (low == "dota2") friendly = "Dota 2";
+            else if (low == "valorant-win64-shipping" || low == "valorant") friendly = "VALORANT";
+            else if (low == "r5apex") friendly = "Apex Legends";
+            else if (low == "rustclient") friendly = "Rust";
+            else if (low == "gta5" || low == "gta5_enhanced") friendly = "GTA V";
+
+            if (string.IsNullOrEmpty(friendly) && !string.IsNullOrEmpty(exePath) && File.Exists(exePath))
+            {
+                try
+                {
+                    var vi = FileVersionInfo.GetVersionInfo(exePath);
+                    if (vi != null && !string.IsNullOrWhiteSpace(vi.FileDescription))
+                    {
+                        string desc = vi.FileDescription.Trim();
+                        if (desc.Length >= 2 && desc.Length <= 42) friendly = desc;
+                    }
+                }
+                catch { }
+            }
+            if (string.IsNullOrEmpty(friendly))
+            {
+                try
+                {
+                    Process p = Process.GetProcessById((int)pid);
+                    if (p != null && !string.IsNullOrWhiteSpace(p.MainWindowTitle))
+                    {
+                        string wt = p.MainWindowTitle.Trim();
+                        if (wt.Length > 34) wt = wt.Substring(0, 33) + "…";
+                        friendly = wt;
+                    }
+                }
+                catch { }
+            }
+            if (string.IsNullOrEmpty(friendly)) friendly = key;
+
+            lock (_micLock)
+            {
+                if (_micFriendlyNames.Count > 128) _micFriendlyNames.Clear();
+                _micFriendlyNames[key] = friendly;
+            }
+            return friendly;
+        }
+
+        private List<IAudioSessionManager2> GetAllCaptureSessionManagers()
+        {
+            var list = new List<IAudioSessionManager2>();
+            try
+            {
+                var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+                Guid iidSessionMgr2 = new Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
+                int[] roles = new int[] { 0, 2, 1 }; // eConsole, eCommunications, eMultimedia
+                for (int r = 0; r < roles.Length; r++)
+                {
+                    IMMDevice dev;
+                    if (enumerator.GetDefaultAudioEndpoint(1 /* eCapture */, roles[r], out dev) == 0 && dev != null)
+                    {
+                        object oMgr;
+                        if (dev.Activate(ref iidSessionMgr2, 23, IntPtr.Zero, out oMgr) == 0 && oMgr is IAudioSessionManager2)
+                            list.Add((IAudioSessionManager2)oMgr);
+                    }
+                }
+            }
+            catch { }
+            return list;
+        }
+
         public void RefreshMicrophoneState()
         {
             EnsureMicEndpoint();
-            bool muted = false;
-            bool active = false;
-            string appName = "";
+            var grouped = new Dictionary<string, MicCaptureAppItem>(StringComparer.OrdinalIgnoreCase);
+            uint selfPid = (uint)Process.GetCurrentProcess().Id;
 
-            if (_micEndpoint != null)
-            {
-                try { _micEndpoint.GetMute(out muted); }
-                catch { _micEndpoint = null; }
-            }
-
-            if (_micSessionMgr != null)
+            var mgrs = GetAllCaptureSessionManagers();
+            for (int m = 0; m < mgrs.Count; m++)
             {
                 try
                 {
                     IAudioSessionEnumerator sesEnum;
-                    if (_micSessionMgr.GetSessionEnumerator(out sesEnum) == 0 && sesEnum != null)
+                    if (mgrs[m].GetSessionEnumerator(out sesEnum) != 0 || sesEnum == null) continue;
+                    int count;
+                    if (sesEnum.GetCount(out count) != 0) continue;
+
+                    for (int i = 0; i < count; i++)
                     {
-                        int count;
-                        if (sesEnum.GetCount(out count) == 0)
+                        object raw;
+                        if (sesEnum.GetSession(i, out raw) != 0 || raw == null) continue;
+                        var ctrl2 = raw as IAudioSessionControl2;
+                        if (ctrl2 == null) continue;
+                        if (ctrl2.IsSystemSoundsSession() == 0) continue;
+
+                        int state;
+                        if (ctrl2.GetState(out state) != 0 || state != 1) continue; // Only actively capturing sessions (AudioSessionStateActive == 1)
+
+                        uint pid;
+                        ctrl2.GetProcessId(out pid);
+                        if (pid == 0 || pid == selfPid) continue;
+
+                        string procName;
+                        string exePath = SystemSensors.TryQueryProcessPathFast(pid, out procName);
+                        if (string.IsNullOrWhiteSpace(procName))
                         {
-                            for (int i = 0; i < count; i++)
+                            try { procName = Process.GetProcessById((int)pid).ProcessName; } catch { procName = "App_" + pid; }
+                        }
+                        string procKey = procName.Trim().ToLowerInvariant();
+                        if (procKey == "audiodg" || procKey == "svchost") continue;
+
+                        var simpleVol = raw as ISimpleAudioVolume;
+                        bool sesMuted = false;
+                        bool supportsMute = false;
+                        if (simpleVol != null)
+                        {
+                            try
                             {
-                                object raw;
-                                if (sesEnum.GetSession(i, out raw) != 0 || raw == null) continue;
-                                var ctrl2 = raw as IAudioSessionControl2;
-                                if (ctrl2 == null) continue;
-                                int state;
-                                if (ctrl2.GetState(out state) == 0 && state == 1) // AudioSessionStateActive == 1
+                                bool wantForceMute;
+                                lock (_micLock) { wantForceMute = _desiredMutedMicApps.Contains(procKey); }
+                                if (simpleVol.GetMute(out sesMuted) == 0)
                                 {
-                                    uint pid;
-                                    ctrl2.GetProcessId(out pid);
-                                    if (pid > 0)
+                                    supportsMute = true;
+                                    if (wantForceMute && !sesMuted)
                                     {
-                                        active = true;
-                                        try { appName = Process.GetProcessById((int)pid).ProcessName; } catch { appName = "Mic"; }
-                                        break;
+                                        Guid ctx = Guid.Empty;
+                                        if (simpleVol.SetMute(true, ref ctx) == 0)
+                                            sesMuted = true;
                                     }
                                 }
                             }
+                            catch { supportsMute = false; }
+                        }
+
+                        MicCaptureAppItem item;
+                        if (!grouped.TryGetValue(procKey, out item))
+                        {
+                            item = new MicCaptureAppItem
+                            {
+                                ProcessId = pid,
+                                ProcessKey = procKey,
+                                ProcessName = procName,
+                                DisplayName = ResolveFriendlyMicAppName(pid, procName, exePath),
+                                ExecutablePath = exePath ?? "",
+                                IsCapturingNow = true,
+                                IsMuted = sesMuted,
+                                SupportsMute = supportsMute,
+                                SessionCount = 1
+                            };
+                            grouped[procKey] = item;
+                        }
+                        else
+                        {
+                            item.SessionCount++;
+                            if (string.IsNullOrEmpty(item.ExecutablePath) && !string.IsNullOrEmpty(exePath))
+                                item.ExecutablePath = exePath;
+                            if (supportsMute) item.SupportsMute = true;
+                            // Group is considered muted only when all its active capture streams are muted
+                            item.IsMuted = item.IsMuted && sesMuted;
                         }
                     }
                 }
-                catch { _micSessionMgr = null; }
+                catch { }
             }
 
-            IsMicMuted = muted;
-            IsMicActive = active;
-            ActiveMicAppName = appName ?? "";
+            var resultList = new List<MicCaptureAppItem>(grouped.Values);
+            resultList.Sort((a, b) => string.Compare(a.DisplayName, b.DisplayName, StringComparison.CurrentCultureIgnoreCase));
+
+            int activeCnt = resultList.Count;
+            int mutedCnt = 0;
+            string primaryApp = "";
+            for (int i = 0; i < resultList.Count; i++)
+            {
+                if (string.IsNullOrEmpty(primaryApp)) primaryApp = resultList[i].DisplayName;
+                if (resultList[i].IsMuted) mutedCnt++;
+            }
+
+            MicCaptureSummaryState summary;
+            if (activeCnt == 0) summary = MicCaptureSummaryState.Idle;
+            else if (mutedCnt == 0) summary = MicCaptureSummaryState.ActiveUnmuted;
+            else if (mutedCnt < activeCnt) summary = MicCaptureSummaryState.PartiallyMuted;
+            else summary = MicCaptureSummaryState.AllMuted;
+
+            lock (_micLock)
+            {
+                _cachedMicApps = resultList;
+            }
+
+            ActiveMicAppCount = activeCnt;
+            MutedMicAppCount = mutedCnt;
+            MicSummaryState = summary;
+            IsMicActive = activeCnt > 0;
+            IsMicPartiallyMuted = (summary == MicCaptureSummaryState.PartiallyMuted);
+            IsMicMuted = (summary == MicCaptureSummaryState.AllMuted);
+            ActiveMicAppName = primaryApp;
+        }
+
+        public List<MicCaptureAppItem> GetActiveMicCaptureApps(bool refreshNow = true)
+        {
+            if (refreshNow) RefreshMicrophoneState();
+            lock (_micLock)
+            {
+                return new List<MicCaptureAppItem>(_cachedMicApps);
+            }
+        }
+
+        private void EnsureHardwareMicUnmutedIfNeeded()
+        {
+            // Never mute the physical endpoint globally; only clear legacy hardware mute when user explicitly unmutes an app
+            if (_micEndpoint == null) EnsureMicEndpoint();
+            if (_micEndpoint == null) return;
+            try
+            {
+                bool hwMuted;
+                if (_micEndpoint.GetMute(out hwMuted) == 0 && hwMuted)
+                {
+                    Guid ctx = Guid.Empty;
+                    _micEndpoint.SetMute(false, ref ctx);
+                }
+            }
+            catch { }
+        }
+
+        public bool SetAppMicrophoneMute(string processKey, bool mute)
+        {
+            if (string.IsNullOrWhiteSpace(processKey)) return false;
+            string normKey = processKey.Trim().ToLowerInvariant();
+            lock (_micLock)
+            {
+                if (mute) _desiredMutedMicApps.Add(normKey);
+                else _desiredMutedMicApps.Remove(normKey);
+            }
+            if (!mute) EnsureHardwareMicUnmutedIfNeeded();
+
+            bool anyApplied = false;
+            uint selfPid = (uint)Process.GetCurrentProcess().Id;
+            var mgrs = GetAllCaptureSessionManagers();
+            for (int m = 0; m < mgrs.Count; m++)
+            {
+                try
+                {
+                    IAudioSessionEnumerator sesEnum;
+                    if (mgrs[m].GetSessionEnumerator(out sesEnum) != 0 || sesEnum == null) continue;
+                    int count;
+                    if (sesEnum.GetCount(out count) != 0) continue;
+
+                    for (int i = 0; i < count; i++)
+                    {
+                        object raw;
+                        if (sesEnum.GetSession(i, out raw) != 0 || raw == null) continue;
+                        var ctrl2 = raw as IAudioSessionControl2;
+                        var simpleVol = raw as ISimpleAudioVolume;
+                        if (ctrl2 == null || simpleVol == null) continue;
+
+                        uint pid;
+                        ctrl2.GetProcessId(out pid);
+                        if (pid == 0 || pid == selfPid) continue;
+
+                        string procName;
+                        SystemSensors.TryQueryProcessPathFast(pid, out procName);
+                        if (string.IsNullOrWhiteSpace(procName))
+                        {
+                            try { procName = Process.GetProcessById((int)pid).ProcessName; } catch { procName = ""; }
+                        }
+                        if (string.Equals((procName ?? "").Trim(), normKey, StringComparison.OrdinalIgnoreCase))
+                        {
+                            try
+                            {
+                                Guid ctx = Guid.Empty;
+                                if (simpleVol.SetMute(mute, ref ctx) == 0)
+                                    anyApplied = true;
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            RefreshMicrophoneState();
+            return anyApplied;
+        }
+
+        public void SetAllAppsMicrophoneMute(bool mute)
+        {
+            if (!mute)
+            {
+                lock (_micLock) { _desiredMutedMicApps.Clear(); }
+                EnsureHardwareMicUnmutedIfNeeded();
+            }
+
+            uint selfPid = (uint)Process.GetCurrentProcess().Id;
+            var mgrs = GetAllCaptureSessionManagers();
+            for (int m = 0; m < mgrs.Count; m++)
+            {
+                try
+                {
+                    IAudioSessionEnumerator sesEnum;
+                    if (mgrs[m].GetSessionEnumerator(out sesEnum) != 0 || sesEnum == null) continue;
+                    int count;
+                    if (sesEnum.GetCount(out count) != 0) continue;
+
+                    for (int i = 0; i < count; i++)
+                    {
+                        object raw;
+                        if (sesEnum.GetSession(i, out raw) != 0 || raw == null) continue;
+                        var ctrl2 = raw as IAudioSessionControl2;
+                        var simpleVol = raw as ISimpleAudioVolume;
+                        if (ctrl2 == null || simpleVol == null) continue;
+                        if (ctrl2.IsSystemSoundsSession() == 0) continue;
+
+                        int state;
+                        if (ctrl2.GetState(out state) != 0 || state != 1) continue;
+
+                        uint pid;
+                        ctrl2.GetProcessId(out pid);
+                        if (pid == 0 || pid == selfPid) continue;
+
+                        string procName;
+                        SystemSensors.TryQueryProcessPathFast(pid, out procName);
+                        if (!string.IsNullOrWhiteSpace(procName))
+                        {
+                            string pk = procName.Trim().ToLowerInvariant();
+                            if (pk == "audiodg" || pk == "svchost") continue;
+                            lock (_micLock)
+                            {
+                                if (mute) _desiredMutedMicApps.Add(pk);
+                                else _desiredMutedMicApps.Remove(pk);
+                            }
+                        }
+
+                        try
+                        {
+                            Guid ctx = Guid.Empty;
+                            simpleVol.SetMute(mute, ref ctx);
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+
+            RefreshMicrophoneState();
         }
 
         public void ToggleMicrophoneMute()
         {
-            EnsureMicEndpoint();
-            if (_micEndpoint == null) return;
-            try
-            {
-                IsMicMuted = !IsMicMuted;
-                Guid ctx = Guid.Empty;
-                _micEndpoint.SetMute(IsMicMuted, ref ctx);
-            }
-            catch { _micEndpoint = null; }
+            RefreshMicrophoneState();
+            if (ActiveMicAppCount <= 0) return;
+            bool muteAll = (MicSummaryState != MicCaptureSummaryState.AllMuted);
+            SetAllAppsMicrophoneMute(muteAll);
         }
 
         private static readonly HashSet<string> VideoPlayerProcessStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -2234,7 +2572,8 @@ namespace DynamicIslandWin
 
         private static readonly string[] BrowserKeywords = new string[]
         {
-            "chrome", "msedge", "firefox", "opera", "brave", "vivaldi", "browser"
+            "chrome", "msedge", "firefox", "opera", "brave", "vivaldi", "browser",
+            "yandex", "arc", "zen", "waterfox", "thorium", "librewolf", "floorp", "whale"
         };
 
         private static T WaitWinRt<T>(IAsyncOperation<T> op, int timeoutMs = 550)
@@ -2587,69 +2926,138 @@ namespace DynamicIslandWin
             renderWidgetHwnd = IntPtr.Zero;
             if (snap == null) return IntPtr.Zero;
 
-            string stem = snap.AppId ?? "";
+            string rawAppId = (snap.AppId ?? "").Trim();
+            string appLow = rawAppId.ToLowerInvariant();
+            string stem = rawAppId;
             if (stem.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) stem = stem.Substring(0, stem.Length - 4);
-            if (stem.Contains("!")) stem = stem.Split('!')[0];
+            string bangTail = "";
+            if (stem.Contains("!"))
+            {
+                string[] parts = stem.Split('!');
+                stem = parts[0];
+                bangTail = parts[parts.Length - 1];
+            }
+            if (stem.Contains("_"))
+                stem = stem.Split('_')[0];
+
+            var candidateStems = new List<string>();
+            if (!string.IsNullOrWhiteSpace(stem)) candidateStems.Add(stem);
+            if (!string.IsNullOrWhiteSpace(bangTail)) candidateStems.Add(bangTail);
+            if (isYandex) { candidateStems.Add("Яндекс Музыка"); candidateStems.Add("YandexMusic"); }
+            if (isSpotify) { candidateStems.Add("Spotify"); }
+            if (appLow.Contains("applemusic")) { candidateStems.Add("AppleMusic"); candidateStems.Add("AMPLibraryAgent"); }
+            if (appLow.Contains("itunes")) candidateStems.Add("iTunes");
+            if (appLow.Contains("zunemusic") || appLow.Contains("music.ui") || appLow.Contains("microsoft.media.player"))
+            {
+                candidateStems.Add("MediaPlayer");
+                candidateStems.Add("Music.UI");
+            }
+            if (appLow.Contains("msedge")) candidateStems.Add("msedge");
+            else if (appLow.Contains("chrome")) candidateStems.Add("chrome");
+            else if (appLow.Contains("brave")) candidateStems.Add("brave");
+            else if (appLow.Contains("vivaldi")) candidateStems.Add("vivaldi");
+            else if (appLow.Contains("opera")) { candidateStems.Add("opera"); candidateStems.Add("opera_gx"); }
+            else if (appLow.Contains("firefox")) candidateStems.Add("firefox");
+            else if (appLow.Contains("yandex") && appLow.Contains("browser")) candidateStems.Add("browser");
 
             var pidSet = new HashSet<uint>();
             try
             {
-                if (!string.IsNullOrEmpty(stem))
-                    foreach (Process p in Process.GetProcessesByName(stem)) pidSet.Add((uint)p.Id);
-                if (isYandex)
+                for (int i = 0; i < candidateStems.Count; i++)
                 {
-                    foreach (Process p in Process.GetProcessesByName("Яндекс Музыка")) pidSet.Add((uint)p.Id);
-                    foreach (Process p in Process.GetProcessesByName("YandexMusic")) pidSet.Add((uint)p.Id);
+                    string cs = candidateStems[i];
+                    if (string.IsNullOrWhiteSpace(cs)) continue;
+                    foreach (Process p in Process.GetProcessesByName(cs))
+                        pidSet.Add((uint)p.Id);
                 }
-                if (isSpotify)
-                    foreach (Process p in Process.GetProcessesByName("Spotify")) pidSet.Add((uint)p.Id);
+
+                // Fallback substring match for Store/MSIX/portable installs with versioned or package process names
+                if (pidSet.Count == 0 && !string.IsNullOrWhiteSpace(stem) && stem.Length >= 3)
+                {
+                    string needle = stem.ToLowerInvariant();
+                    if (needle.Contains("."))
+                    {
+                        string[] dotParts = needle.Split('.');
+                        needle = dotParts[dotParts.Length - 1];
+                    }
+                    if (needle.Length >= 3)
+                    {
+                        foreach (Process p in Process.GetProcesses())
+                        {
+                            try
+                            {
+                                string pn = (p.ProcessName ?? "").ToLowerInvariant();
+                                if (pn.Contains(needle) || (isYandex && (pn.Contains("yandex") || pn.Contains("яндекс"))) || (isSpotify && pn.Contains("spotify")))
+                                    pidSet.Add((uint)p.Id);
+                            }
+                            catch { }
+                        }
+                    }
+                }
             }
             catch { }
 
             IntPtr bestHwnd = IntPtr.Zero, bestRender = IntPtr.Zero;
             string bestTitle = "";
             int bestScore = int.MinValue;
+            string trackTitleLow = (snap.Title ?? "").Trim().ToLowerInvariant();
+            string artistLow = (snap.Artist ?? "").Trim().ToLowerInvariant();
 
-            if (pidSet.Count > 0)
+            NativeWin32.EnumWindows((hWnd, lParam) =>
             {
-                NativeWin32.EnumWindows((hWnd, lParam) =>
+                uint pid;
+                NativeWin32.GetWindowThreadProcessId(hWnd, out pid);
+
+                var cls = new StringBuilder(256);
+                NativeWin32.GetClassName(hWnd, cls, 256);
+                string clsName = cls.ToString();
+                if (clsName == "Chrome_WidgetWin_0" || clsName == "IME" || clsName == "MSCTFIME UI") return true;
+
+                bool matchedPid = pidSet.Contains(pid);
+                // UWP / Microsoft Store host support: ApplicationFrameWindow owns a child Windows.UI.Core.CoreWindow from the real app PID
+                if (!matchedPid && clsName == "ApplicationFrameWindow" && pidSet.Count > 0)
                 {
-                    uint pid;
-                    NativeWin32.GetWindowThreadProcessId(hWnd, out pid);
-                    if (!pidSet.Contains(pid)) return true;
-
-                    var cls = new StringBuilder(256);
-                    NativeWin32.GetClassName(hWnd, cls, 256);
-                    string clsName = cls.ToString();
-                    if (clsName == "Chrome_WidgetWin_0" || clsName == "IME" || clsName == "MSCTFIME UI") return true;
-
-                    var sbTitle = new StringBuilder(256);
-                    NativeWin32.GetWindowText(hWnd, sbTitle, 256);
-                    string wTitle = sbTitle.ToString();
-
-                    NativeWin32.RECT rc;
-                    NativeWin32.GetWindowRect(hWnd, out rc);
-                    int w = rc.Right - rc.Left, h = rc.Bottom - rc.Top;
-                    bool vis = NativeWin32.IsWindowVisible(hWnd);
-                    bool iconic = NativeWin32.IsIconic(hWnd);
-                    IntPtr childRender = FindRenderWidgetChild(hWnd);
-
-                    int sc = 0;
-                    if (childRender != IntPtr.Zero) sc += 5000;
-                    if (clsName == "Chrome_WidgetWin_1" || clsName.Contains("Qt") || clsName.Contains("AIMP")) sc += 2000;
-                    else if (clsName.Contains("Chrome_WidgetWin")) sc += 600;
-                    if (!string.IsNullOrWhiteSpace(wTitle)) sc += 1200;
-                    if (vis && !iconic && w >= 180 && h >= 120) sc += 1500 + Math.Min(900, (w * h) / 2500);
-                    else if (iconic) sc += 800;
-                    else if (!vis && (w >= 160 || childRender != IntPtr.Zero)) sc += 500;
-
-                    if (sc > bestScore && sc >= 1200)
+                    NativeWin32.EnumChildWindows(hWnd, (ch, lp) =>
                     {
-                        bestScore = sc; bestHwnd = hWnd; bestRender = childRender; bestTitle = wTitle;
-                    }
-                    return true;
-                }, IntPtr.Zero);
-            }
+                        uint chPid;
+                        NativeWin32.GetWindowThreadProcessId(ch, out chPid);
+                        if (pidSet.Contains(chPid)) { matchedPid = true; return false; }
+                        return true;
+                    }, IntPtr.Zero);
+                }
+                if (!matchedPid) return true;
+
+                var sbTitle = new StringBuilder(256);
+                NativeWin32.GetWindowText(hWnd, sbTitle, 256);
+                string wTitle = sbTitle.ToString();
+                string wTitleLow = wTitle.ToLowerInvariant();
+
+                NativeWin32.RECT rc;
+                NativeWin32.GetWindowRect(hWnd, out rc);
+                int w = rc.Right - rc.Left, h = rc.Bottom - rc.Top;
+                bool vis = NativeWin32.IsWindowVisible(hWnd);
+                bool iconic = NativeWin32.IsIconic(hWnd);
+                IntPtr childRender = FindRenderWidgetChild(hWnd);
+
+                int sc = 0;
+                if (childRender != IntPtr.Zero) sc += 5000;
+                if (clsName == "Chrome_WidgetWin_1" || clsName == "ApplicationFrameWindow" || clsName.Contains("WinUIDesktopWin32WindowClass") || clsName.Contains("Qt") || clsName.Contains("AIMP")) sc += 2200;
+                else if (clsName.Contains("Chrome_WidgetWin")) sc += 600;
+                if (!string.IsNullOrWhiteSpace(wTitle)) sc += 1200;
+                if (!string.IsNullOrEmpty(trackTitleLow) && trackTitleLow.Length >= 3 && wTitleLow.Contains(trackTitleLow)) sc += 2400;
+                else if (!string.IsNullOrEmpty(artistLow) && artistLow.Length >= 3 && wTitleLow.Contains(artistLow)) sc += 1100;
+                if (wTitleLow.Contains("музык") || wTitleLow.Contains("music") || wTitleLow.Contains("spotify") || wTitleLow.Contains("deezer") || wTitleLow.Contains("soundcloud") || wTitleLow.Contains("tidal")) sc += 900;
+
+                if (vis && !iconic && w >= 180 && h >= 120) sc += 1500 + Math.Min(900, (w * h) / 2500);
+                else if (iconic) sc += 800;
+                else if (!vis && (w >= 160 || childRender != IntPtr.Zero)) sc += 500;
+
+                if (sc > bestScore && sc >= 1100)
+                {
+                    bestScore = sc; bestHwnd = hWnd; bestRender = childRender; bestTitle = wTitle;
+                }
+                return true;
+            }, IntPtr.Zero);
 
             bestWindowTitle = bestTitle;
             renderWidgetHwnd = bestRender;
@@ -3425,7 +3833,7 @@ namespace DynamicIslandWin
         [PreserveSig] int get_CurrentControlType(out int retVal);
         void _Slot22_LocalizedControlType();
         [PreserveSig] int get_CurrentName([MarshalAs(UnmanagedType.BStr)] out string retVal);
-        void _Slot24_AcceleratorKey();
+        [PreserveSig] int get_CurrentAcceleratorKey([MarshalAs(UnmanagedType.BStr)] out string retVal);
         void _Slot25_AccessKey();
         void _Slot26_HasKeyboardFocus();
         void _Slot27_IsKeyboardFocusable();
@@ -3557,6 +3965,10 @@ namespace DynamicIslandWin
             public bool IsAccNode;
             public string NameLower;
             public string HelpLower;
+            public string AutoIdLower;
+            public string ClassLower;
+            public string AccelLower;
+            public string AriaRoleLower;
             public string AriaProps;
             public int ControlType;
             public bool HasToggle;
@@ -3564,6 +3976,7 @@ namespace DynamicIslandWin
             public int Enabled;
             public NativeWin32.RECT Bounds;
             public bool HasBounds;
+            public bool MatchedByStableId;
         }
 
         [DllImport("oleacc.dll")]
@@ -3625,12 +4038,18 @@ namespace DynamicIslandWin
             if (snap == null) return PlayerFavoriteSupport.Unsupported;
             string combined = ((snap.AppId ?? "") + " " + (snap.DisplayAppName ?? "")).ToLowerInvariant();
             isSpotify = combined.Contains("spotify");
-            isYandex = combined.Contains("яндекс") || combined.Contains("yandex");
-            isBrowser = combined.Contains("chrome") || combined.Contains("msedge") || combined.Contains("opera") ||
-                        combined.Contains("brave") || combined.Contains("firefox") || combined.Contains("vivaldi");
+            isYandex = (combined.Contains("яндекс") || combined.Contains("yandex")) && !combined.Contains("browser");
+            isBrowser = combined.Contains("chrome") || combined.Contains("msedge") || combined.Contains("edge") ||
+                        combined.Contains("opera") || combined.Contains("brave") || combined.Contains("firefox") ||
+                        combined.Contains("vivaldi") || combined.Contains("browser") || combined.Contains("arc") ||
+                        combined.Contains("zen") || combined.Contains("waterfox") || combined.Contains("thorium") ||
+                        combined.Contains("librewolf") || combined.Contains("floorp") || combined.Contains("whale");
             if (isYandex) return PlayerFavoriteSupport.SupportedUiaAndBgKey;
-            if (isSpotify || combined.Contains("aimp") || combined.Contains("itunes") || combined.Contains("applemusic") ||
-                combined.Contains("deezer") || combined.Contains("tidal") || combined.Contains("musicbee") || combined.Contains("foobar") || isBrowser)
+            if (isSpotify || isBrowser || combined.Contains("aimp") || combined.Contains("itunes") ||
+                combined.Contains("applemusic") || combined.Contains("zunemusic") || combined.Contains("music.ui") ||
+                combined.Contains("media player") || combined.Contains("deezer") || combined.Contains("tidal") ||
+                combined.Contains("soundcloud") || combined.Contains("vkmusic") || combined.Contains("musicbee") ||
+                combined.Contains("foobar") || combined.Contains("winamp"))
                 return PlayerFavoriteSupport.SupportedUiaOnly;
             return PlayerFavoriteSupport.Unsupported;
         }
@@ -3678,52 +4097,120 @@ namespace DynamicIslandWin
             return string.IsNullOrEmpty(s) ? "" : s.Trim().ToLowerInvariant().Replace('\u2019', '\'').Replace('ё', 'е');
         }
 
-        private static bool IsStrongAnchor(string n)
+        private static bool IsStrongAnchor(string n, string aid = "")
         {
+            if (!string.IsNullOrEmpty(aid))
+            {
+                if (aid.Contains("skip-forward") || aid.Contains("skip-back") || aid.Contains("control-button-skip") ||
+                    aid.Contains("nextbutton") || aid.Contains("previousbutton") || aid.Contains("transportcontrols_next") ||
+                    aid.Contains("sonata") || aid.Contains("player-bar") || aid.Contains("dislike"))
+                    return true;
+            }
             if (string.IsNullOrEmpty(n)) return false;
-            return n.Contains("следующ") || n.Contains("предыдущ") || n.Contains("next song") || n.Contains("previous song") ||
-                   n.Contains("next track") || n.Contains("previous track") || n == "next" || n == "previous" ||
+            return n.Contains("следующ") || n.Contains("предыдущ") || n.Contains("наступн") || n.Contains("попередн") ||
+                   n.Contains("next song") || n.Contains("previous song") || n.Contains("next track") || n.Contains("previous track") ||
+                   n == "next" || n == "previous" || n.Contains("nächster") || n.Contains("vorheriger") ||
+                   n.Contains("suivant") || n.Contains("précédent") || n.Contains("siguiente") || n.Contains("anterior") ||
+                   n.Contains("sonraki") || n.Contains("önceki") || n.Contains("następny") || n.Contains("poprzedni") ||
                    n.Contains("не нравится") || n.Contains("don't like") || n.Contains("dont like") ||
                    n.Contains("ұнамайды") || n.Contains("yoqmaydi") || n.Contains("келесі ән") || n.Contains("алдыңғы ән") ||
                    n.Contains("keyingi tarona") || n.Contains("avvalgi tarona");
         }
 
-        private static bool IsPlayAnchor(string n)
+        private static bool IsPlayAnchor(string n, string aid = "")
         {
-            return n == "пауза" || n == "воспроизведение" || n == "pause" || n == "play" || n == "playback";
+            if (!string.IsNullOrEmpty(aid) && (aid.Contains("play-pause") || aid.Contains("playpause") || aid.Contains("control-button-playpause") || aid.Contains("playbutton")))
+                return true;
+            return n == "пауза" || n == "воспроизведение" || n == "відтворити" || n == "pause" || n == "play" || n == "playback" ||
+                   n == "wiedergabe" || n == "lecture" || n == "reproducir" || n == "oynat" || n == "odtwórz";
         }
+
+        private static bool MatchStableLikeIdentifier(CandidateMeta m, out bool explicitUnlikeId)
+        {
+            explicitUnlikeId = false;
+            string aid = m.AutoIdLower ?? "";
+            string cls = m.ClassLower ?? "";
+            string acc = m.AccelLower ?? "";
+            string idCombo = aid + " | " + cls;
+
+            if (idCombo.Contains("dislike") || idCombo.Contains("thumbs-down") || idCombo.Contains("thumbs_down") || idCombo.Contains("ban-button") || idCombo.Contains("not-interested"))
+                return false;
+
+            if (idCombo.Contains("unlike") || idCombo.Contains("remove-from-liked") || idCombo.Contains("unfavorite"))
+            {
+                explicitUnlikeId = true;
+                return true;
+            }
+
+            if (aid == "likebutton" || aid == "favoritebutton" || aid == "lovebutton" || aid == "heartbutton" ||
+                aid.Contains("control-button-heart") || aid.Contains("context-item-info-save") || aid.Contains("add-to-liked") ||
+                aid.Contains("transportcontrols_like") || aid.Contains("button-shape-like") || aid.Contains("like-button-renderer") ||
+                aid.Contains("audio_page_player_add") || aid.Contains("player_like") || aid.Contains("track-like") ||
+                cls.Contains("playbacksoundbadge__like") || cls.Contains("like-button-shape") || cls.Contains("heart-button") ||
+                (cls.Contains("player") && cls.Contains("like") && !cls.Contains("dislike")) ||
+                (cls.Contains("sonata") && cls.Contains("like") && !cls.Contains("dislike")) ||
+                acc == "alt+shift+b")
+            {
+                return true;
+            }
+            return false;
+        }
+
         private static bool EvaluateSemantics(CandidateMeta m, bool nearStrong, out bool resolvedLiked)
         {
             resolvedLiked = false;
-            string nm = m.NameLower;
-            string n = string.IsNullOrEmpty(m.HelpLower) ? nm : (nm + " | " + m.HelpLower);
-            if (n.Length < 2) return false;
+            m.MatchedByStableId = false;
 
-            if (n.Contains("не нравится") || n.Contains("не рекомендовать") || n.Contains("дизлайк") ||
-                n.Contains("dislike") || n.Contains("thumbs down") || n.Contains("don't like") || n.Contains("dont like") ||
-                n.Contains("do not like") || n.Contains("ұнамайды") || n.Contains("yoqmaydi") ||
+            string nm = m.NameLower ?? "";
+            string n = string.IsNullOrEmpty(m.HelpLower) ? nm : (nm + " | " + m.HelpLower);
+            string idCombo = (m.AutoIdLower ?? "") + " | " + (m.ClassLower ?? "");
+
+            // Strict universal exclusion of Dislike / Ban / Share / Repeat / Shuffle / Pin across 12 languages + IDs
+            if (idCombo.Contains("dislike") || idCombo.Contains("thumbs-down") || idCombo.Contains("thumbs_down") || idCombo.Contains("ban") ||
+                n.Contains("не нравится") || n.Contains("не рекомендовать") || n.Contains("дизлайк") ||
+                n.Contains("не подобається") || n.Contains("dislike") || n.Contains("thumbs down") ||
+                n.Contains("don't like") || n.Contains("dont like") || n.Contains("do not like") ||
+                n.Contains("mag ich nicht") || n.Contains("gefällt mir nicht") || n.Contains("je n'aime pas") ||
+                n.Contains("no me gusta") || n.Contains("non mi piace") || n.Contains("não gostei") ||
+                n.Contains("beğenme") || n.Contains("nie podoba") || n.Contains("ұнамайды") || n.Contains("yoqmaydi") ||
                 n.Contains("скрыть") || n.Contains("закрепить") || n.Contains("открепить") || n.Contains("pin") ||
                 n.Contains("повтор") || n.Contains("случайн") || n.Contains("перемеш") || n.Contains("очеред") ||
                 n.Contains("контекстное меню") || n.Contains("поделиться") || n.Contains("share"))
                 return false;
 
-            bool explicitRemove =
+            bool explicitUnlikeId;
+            bool byStableId = MatchStableLikeIdentifier(m, out explicitUnlikeId);
+
+            bool explicitRemove = explicitUnlikeId ||
                 n.Contains("удалить из") || n.Contains("убрать из") || n.Contains("убрать отметку") ||
-                n.Contains("снять лайк") || n.Contains("убрать лайк") || n.Contains("remove from") || n.Contains("unlike");
+                n.Contains("снять лайк") || n.Contains("убрать лайк") || n.Contains("видалити з") || n.Contains("прибрати з") ||
+                n.Contains("remove from") || n.Contains("saved to") || n.Contains("unlike") ||
+                n.Contains("aus lieblingssongs entfernen") || n.Contains("aus mediathek entfernen") ||
+                n.Contains("supprimer des titres") || n.Contains("retirer des favoris") ||
+                n.Contains("quitar de") || n.Contains("eliminar de") || n.Contains("beğenilenlerden kaldır") ||
+                n.Contains("usuń z polubionych");
 
-            bool spotifyCheckedBox = nearStrong && m.ControlType == UIA_CheckBoxControlTypeId && m.HasToggle && m.ToggleVal == 1 &&
-                                     (n.Contains("добавить в плейлист") || n.Contains("add to playlist"));
+            bool spotifyCheckedBox = nearStrong && m.ControlType == UIA_CheckBoxControlTypeId && m.HasToggle &&
+                                     (n.Contains("добавить в плейлист") || n.Contains("add to playlist") ||
+                                      n.Contains("добавить в «любимые") || n.Contains("add to liked") ||
+                                      n.Contains("додати до") || n.Contains("zu lieblingssongs") ||
+                                      n.Contains("ajouter aux titres") || n.Contains("añadir a canciones"));
 
-            bool isLikeCtrl =
+            bool isLikeText =
                 explicitRemove || spotifyCheckedBox ||
-                nm == "нравится" || nm == "like" || nm == "ұнайды" || nm == "yoqadi" ||
+                nm == "нравится" || nm == "like" || nm == "подобається" || nm == "ұнайды" || nm == "yoqadi" ||
+                nm == "gefällt mir" || nm == "j'aime" || nm == "me gusta" || nm == "mi piace" || nm == "gostei" || nm == "beğen" || nm == "lubię to" ||
                 n.Contains("нравится") || n.Contains("лайк") || n.Contains("любить") || n.Contains("любимое") || n.Contains("любимые") ||
+                n.Contains("подобається") || n.Contains("улюблені") || n.Contains("в обране") ||
                 n.Contains("в коллекцию") || n.Contains("в мою коллекцию") || n.Contains("добавить в коллекцию") ||
                 n.Contains("в медиатеку") || n.Contains("добавить в медиатеку") || n.Contains("в избранное") ||
                 n == "like" || n.StartsWith("like |") || n.EndsWith("| like") ||
-                n.Contains("save to your library") || n.Contains("add to liked") || n.Contains("add to favorites") || n.Contains("favorite");
+                n.Contains("save to your library") || n.Contains("add to liked") || n.Contains("add to favorites") || n.Contains("favourite") || n.Contains("favorite") ||
+                n.Contains("gefällt mir") || n.Contains("lieblingssongs") || n.Contains("j'aime") || n.Contains("titres likés") ||
+                n.Contains("me gusta") || n.Contains("canciones que te gustan") || n.Contains("beğen") || n.Contains("polubione");
 
-            if (!isLikeCtrl) return false;
+            if (!byStableId && !isLikeText) return false;
+            m.MatchedByStableId = byStableId;
 
             if (m.HasToggle && (m.ToggleVal == 0 || m.ToggleVal == 1))
             {
@@ -3733,22 +4220,47 @@ namespace DynamicIslandWin
             if (!string.IsNullOrEmpty(m.AriaProps))
             {
                 string ap = m.AriaProps.ToLowerInvariant();
-                if (ap.Contains("pressed=true") || ap.Contains("checked=true")) { resolvedLiked = true; return true; }
+                if (ap.Contains("pressed=true") || ap.Contains("checked=true") || ap.Contains("selected=true")) { resolvedLiked = true; return true; }
                 if (ap.Contains("pressed=false") || ap.Contains("checked=false")) { resolvedLiked = explicitRemove; return true; }
+            }
+            if ((m.ClassLower ?? "").Contains("active") || (m.ClassLower ?? "").Contains("is-liked") || (m.ClassLower ?? "").Contains("liked") && !(m.ClassLower ?? "").Contains("unliked"))
+            {
+                resolvedLiked = true;
+                return true;
             }
             resolvedLiked = explicitRemove;
             return true;
         }
 
-        private static CandidateMeta SelectBestCandidate(List<CandidateMeta> items, List<int> strongAnchors, List<int> playAnchors, NativeWin32.RECT topWinRc, bool topIconic, out bool resolvedLiked, out string dbg)
+        private static CandidateMeta SelectBestCandidate(
+            List<CandidateMeta> items, List<int> strongAnchors, List<int> playAnchors,
+            IntPtr topHwnd, NativeWin32.RECT topWinRc, bool topIconic,
+            out bool resolvedLiked, out string dbg)
         {
             resolvedLiked = false; dbg = "";
-            if (items == null || items.Count == 0) return null;
+            if (items == null || items.Count == 0) { dbg = "btns=0"; return null; }
+
+            float dpiScale = 1.0f;
+            try
+            {
+                if (topHwnd != IntPtr.Zero)
+                {
+                    uint wDpi = NativeWin32.GetDpiForWindow(topHwnd);
+                    if (wDpi >= 72 && wDpi <= 480) dpiScale = wDpi / 96f;
+                }
+            }
+            catch { }
 
             int winW = topWinRc.Right - topWinRc.Left, winH = topWinRc.Bottom - topWinRc.Top;
             bool validWin = !topIconic && winW >= 200 && winH >= 120;
+            int maxBtnW = (int)Math.Ceiling(260f * dpiScale);
+            int maxBtnH = (int)Math.Ceiling(150f * dpiScale);
+            int bottomBandPx = Math.Max((int)Math.Ceiling(165f * dpiScale), (int)(winH * 0.26f));
+            int topBandPx = Math.Max((int)Math.Ceiling(140f * dpiScale), (int)(winH * 0.22f));
+
             int bestIdx = -1, bestScore = int.MinValue;
             bool bestLiked = false;
+            string nearMiss = "";
 
             for (int k = 0; k < items.Count; k++)
             {
@@ -3759,35 +4271,55 @@ namespace DynamicIslandWin
                 for (int s = 0; s < strongAnchors.Count; s++) { int d = Math.Abs(k - strongAnchors[s]); if (d < minStrong) minStrong = d; }
                 for (int p = 0; p < playAnchors.Count; p++) { int d = Math.Abs(k - playAnchors[p]); if (d < minPlay) minPlay = d; }
 
-                bool nearStrong = minStrong <= 14;
-                bool nearPlay = minPlay <= 10;
+                bool nearStrong = minStrong <= 18;
+                bool nearPlay = minPlay <= 14;
                 bool candLiked;
                 if (!EvaluateSemantics(m, nearStrong, out candLiked)) continue;
 
                 int score = 0;
-                if (nearStrong) score += 3600 - minStrong * 60;
-                else if (nearPlay) score += 1200 - minPlay * 40;
+                if (m.MatchedByStableId) score += 2600;
+                if (nearStrong) score += 3600 - minStrong * 55;
+                else if (nearPlay) score += 1400 - minPlay * 40;
 
                 int bw = m.Bounds.Right - m.Bounds.Left, bh = m.Bounds.Bottom - m.Bounds.Top;
-                bool validBtn = m.HasBounds && bw >= 8 && bw <= 180 && bh >= 8 && bh <= 110;
+                bool validBtn = m.HasBounds && bw >= 6 && bw <= maxBtnW && bh >= 6 && bh <= maxBtnH;
 
                 if (validWin && validBtn)
                 {
+                    float cx = (m.Bounds.Left + m.Bounds.Right) * 0.5f;
                     float cy = (m.Bounds.Top + m.Bounds.Bottom) * 0.5f;
+                    float relX = (cx - topWinRc.Left) / Math.Max(1f, (float)winW);
                     float relY = (cy - topWinRc.Top) / Math.Max(1f, (float)winH);
-                    if (cy >= topWinRc.Bottom - Math.Max(148, (int)(winH * 0.25f)) && cy <= topWinRc.Bottom + 16)
-                        score += 1400 + (int)(relY * 200f);
-                    else if (relY >= 0.70f) score += 750 + (int)(relY * 100f);
-                    else if (relY <= 0.15f) score += 480;
-                    else if (!nearStrong) continue;
+
+                    if (cy >= topWinRc.Bottom - bottomBandPx && cy <= topWinRc.Bottom + 24 * dpiScale)
+                        score += 1500 + (int)(relY * 220f);
+                    else if (relY >= 0.68f)
+                        score += 850 + (int)(relY * 120f);
+                    else if (cy <= topWinRc.Top + topBandPx || relY <= 0.22f)
+                        score += 720; // Top transport bar (Apple Music / iTunes / VK / WMP)
+                    else if (relX >= 0.66f && relY >= 0.22f && relY <= 0.96f)
+                        score += 680; // Right Now-Playing sidebar (Spotify Desktop / Store)
+                    else if (!nearStrong && !m.MatchedByStableId)
+                    {
+                        if (string.IsNullOrEmpty(nearMiss))
+                            nearMiss = string.Format("midScreenReject(name='{0}',aid='{1}',rel={2:0.00},{3:0.00})", m.NameLower, m.AutoIdLower, relX, relY);
+                        continue;
+                    }
                 }
                 else
                 {
-                    if (!nearStrong && !nearPlay && k < items.Count - 24) continue;
-                    if (k >= items.Count - 24) score += 400 + (k - (items.Count - 24)) * 10;
+                    if (!nearStrong && !nearPlay && !m.MatchedByStableId && k < items.Count - 32 && k > 28)
+                    {
+                        if (string.IsNullOrEmpty(nearMiss))
+                            nearMiss = string.Format("noBoundsReject(name='{0}',aid='{1}',idx={2}/{3})", m.NameLower, m.AutoIdLower, k, items.Count);
+                        continue;
+                    }
+                    if (k >= items.Count - 32) score += 450 + (k - (items.Count - 32)) * 10;
+                    else if (k <= 28) score += 320;
                 }
 
-                if (m.HasToggle) score += 120;
+                if (m.HasToggle) score += 160;
+                if (!string.IsNullOrEmpty(m.AriaProps)) score += 90;
                 if (score >= bestScore) { bestScore = score; bestIdx = k; bestLiked = candLiked; }
             }
 
@@ -3797,10 +4329,16 @@ namespace DynamicIslandWin
                 if (k == bestIdx)
                 {
                     winner = items[k];
-                    dbg = string.Format("mode={0}, name='{1}', tog={2}:{3}, score={4}, btns={5}",
-                        winner.IsAccNode ? "IA2" : "UIA", winner.NameLower, winner.HasToggle ? 1 : 0, winner.ToggleVal, bestScore, items.Count);
+                    dbg = string.Format("mode={0}, name='{1}', aid='{2}', cls='{3}', tog={4}:{5}, dpi={6:0.00}x, score={7}, btns={8}",
+                        winner.IsAccNode ? "IA2" : "UIA", winner.NameLower, winner.AutoIdLower, winner.ClassLower,
+                        winner.HasToggle ? 1 : 0, winner.ToggleVal, dpiScale, bestScore, items.Count);
                 }
                 else { ReleaseCom(items[k].ComNode); items[k].ComNode = null; }
+            }
+            if (winner == null)
+            {
+                dbg = string.Format("noMatch(btns={0}, strong={1}, play={2}, dpi={3:0.00}x, near='{4}')",
+                    items.Count, strongAnchors.Count, playAnchors.Count, dpiScale, nearMiss);
             }
             resolvedLiked = bestLiked;
             return winner;
@@ -3810,11 +4348,12 @@ namespace DynamicIslandWin
             object acc, int depth, ref int visitedNodes,
             List<CandidateMeta> items, List<int> strongAnchors, List<int> playAnchors)
         {
-            if (acc == null || depth > 24 || visitedNodes > 1800) return;
+            if (acc == null || depth > 26 || visitedNodes > 2200) return;
             visitedNodes++;
 
             object vSelf = 0;
             int role = 0, state = 0, childCount = 0;
+            bool addedSelf = false;
             try
             {
                 if (depth <= 8)
@@ -3840,26 +4379,34 @@ namespace DynamicIslandWin
 
                 if (role == 43 || role == 44 || role == 62)
                 {
-                    string rawNm = t.InvokeMember("accName", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string;
+                    string rawNm = null, rawDesc = null, rawKey = null;
+                    try { rawNm = t.InvokeMember("accName", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string; } catch { }
+                    try { rawDesc = t.InvokeMember("accDescription", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string; } catch { }
+                    try { rawKey = t.InvokeMember("accKeyboardShortcut", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string; } catch { }
+
                     string nmNorm = Norm(rawNm);
-                    if (IsStrongAnchor(nmNorm)) strongAnchors.Add(items.Count);
-                    else if (IsPlayAnchor(nmNorm)) playAnchors.Add(items.Count);
+                    string descNorm = Norm(rawDesc);
+                    string keyNorm = Norm(rawKey);
+                    if (IsStrongAnchor(nmNorm) || IsStrongAnchor(descNorm)) strongAnchors.Add(items.Count);
+                    else if (IsPlayAnchor(nmNorm) || IsPlayAnchor(descNorm)) playAnchors.Add(items.Count);
 
                     int enabled = ((state & 0x01) == 0) ? 1 : 0;
                     int pressed = (((state & 0x08) != 0) || ((state & 0x10) != 0)) ? 1 : 0;
 
                     items.Add(new CandidateMeta
                     {
-                        ComNode = acc, IsAccNode = true, NameLower = nmNorm, HelpLower = "", AriaProps = null,
+                        ComNode = acc, IsAccNode = true, NameLower = nmNorm, HelpLower = descNorm,
+                        AutoIdLower = "", ClassLower = "", AccelLower = keyNorm, AriaRoleLower = "", AriaProps = null,
                         ControlType = (role == 44) ? UIA_CheckBoxControlTypeId : UIA_ButtonControlTypeId,
                         HasToggle = true, ToggleVal = pressed, Enabled = enabled, HasBounds = false
                     });
-                    return;
+                    addedSelf = true;
+                    if (childCount <= 0) return;
                 }
             }
-            catch { return; }
+            catch { if (!addedSelf) return; }
 
-            if (childCount <= 0 || childCount > 450) return;
+            if (childCount <= 0 || childCount > 500) return;
             object[] kids = new object[childCount];
             int got;
             if (AccessibleChildren(acc, 0, childCount, kids, out got) == 0 && got > 0)
@@ -3871,16 +4418,21 @@ namespace DynamicIslandWin
                     {
                         int beforeCount = items.Count;
                         CollectAccButtonsRecursive(k, depth + 1, ref visitedNodes, items, strongAnchors, playAnchors);
-                        bool retained = (items.Count > beforeCount && ReferenceEquals(items[items.Count - 1].ComNode, k));
+                        bool retained = false;
+                        for (int checkIdx = beforeCount; checkIdx < items.Count; checkIdx++)
+                        {
+                            if (ReferenceEquals(items[checkIdx].ComNode, k)) { retained = true; break; }
+                        }
                         if (!retained) ReleaseCom(k);
                     }
                 }
             }
         }
-        private static CandidateMeta ScanAccWindow(IntPtr hwnd, NativeWin32.RECT topWinRc, bool topIconic, out bool resolvedLiked, out int totalBtns, out string dbg)
+
+        private static CandidateMeta ScanAccWindow(IntPtr topHwnd, IntPtr scanHwnd, NativeWin32.RECT topWinRc, bool topIconic, out bool resolvedLiked, out int totalBtns, out string dbg)
         {
             resolvedLiked = false; totalBtns = 0; dbg = "";
-            if (hwnd == IntPtr.Zero || !IsWindowResponsive(hwnd)) return null;
+            if (scanHwnd == IntPtr.Zero || !IsWindowResponsive(scanHwnd)) return null;
 
             Guid iidAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
             object accRoot = null;
@@ -3889,16 +4441,20 @@ namespace DynamicIslandWin
             var playAnchors = new List<int>();
             try
             {
-                if (NativeWin32.AccessibleObjectFromWindow(hwnd, 0xFFFFFFFCu, ref iidAcc, out accRoot) != 0 || accRoot == null)
+                if (NativeWin32.AccessibleObjectFromWindow(scanHwnd, 0xFFFFFFFCu, ref iidAcc, out accRoot) != 0 || accRoot == null)
                     return null;
 
                 int visited = 0;
                 CollectAccButtonsRecursive(accRoot, 0, ref visited, items, strongAnchors, playAnchors);
-                bool rootRetained = (items.Count > 0 && ReferenceEquals(items[0].ComNode, accRoot));
+                bool rootRetained = false;
+                for (int i = 0; i < items.Count; i++)
+                {
+                    if (ReferenceEquals(items[i].ComNode, accRoot)) { rootRetained = true; break; }
+                }
                 if (!rootRetained) { ReleaseCom(accRoot); accRoot = null; }
 
                 totalBtns = items.Count;
-                return SelectBestCandidate(items, strongAnchors, playAnchors, topWinRc, topIconic, out resolvedLiked, out dbg);
+                return SelectBestCandidate(items, strongAnchors, playAnchors, topHwnd, topWinRc, topIconic, out resolvedLiked, out dbg);
             }
             catch (Exception ex)
             {
@@ -3909,12 +4465,52 @@ namespace DynamicIslandWin
             }
         }
 
+        private static void AppendUiaCandidateAtIndex(
+            IUIAutomationElementArray arr, int index,
+            List<CandidateMeta> items, List<int> strongAnchors, List<int> playAnchors)
+        {
+            IUIAutomationElement el = null;
+            if (arr.GetElement(index, out el) != 0 || el == null) return;
+            string rawNm = null, rawHelp = null, rawAria = null, rawAid = null, rawCls = null, rawAcc = null, rawRole = null;
+            int en = 1, ct = UIA_ButtonControlTypeId;
+            el.get_CurrentIsEnabled(out en);
+            el.get_CurrentControlType(out ct);
+            el.get_CurrentName(out rawNm);
+            el.get_CurrentAutomationId(out rawAid);
+            el.get_CurrentClassName(out rawCls);
+            el.get_CurrentHelpText(out rawHelp);
+            el.get_CurrentAcceleratorKey(out rawAcc);
+            el.get_CurrentAriaRole(out rawRole);
+            el.get_CurrentAriaProperties(out rawAria);
+
+            string nmNorm = Norm(rawNm), helpNorm = Norm(rawHelp), aidNorm = Norm(rawAid), clsNorm = Norm(rawCls), accNorm = Norm(rawAcc), roleNorm = Norm(rawRole);
+            if (IsStrongAnchor(nmNorm, aidNorm) || IsStrongAnchor(helpNorm, clsNorm)) strongAnchors.Add(items.Count);
+            else if (IsPlayAnchor(nmNorm, aidNorm) || IsPlayAnchor(helpNorm, clsNorm)) playAnchors.Add(items.Count);
+
+            bool hasTog = false; int togVal = -1; object patObj = null;
+            if (el.GetCurrentPattern(UIA_TogglePatternId, out patObj) == 0 && patObj != null)
+            {
+                var tp = patObj as IUIAutomationTogglePattern;
+                if (tp != null && tp.get_CurrentToggleState(out togVal) == 0) hasTog = true;
+                ReleaseCom(patObj);
+            }
+            NativeWin32.RECT brc;
+            bool hasBounds = (el.get_CurrentBoundingRectangle(out brc) == 0);
+            items.Add(new CandidateMeta
+            {
+                ComNode = el, IsAccNode = false, NameLower = nmNorm, HelpLower = helpNorm,
+                AutoIdLower = aidNorm, ClassLower = clsNorm, AccelLower = accNorm, AriaRoleLower = roleNorm,
+                AriaProps = rawAria, ControlType = ct, HasToggle = hasTog, ToggleVal = togVal,
+                Enabled = en, Bounds = brc, HasBounds = hasBounds
+            });
+        }
+
         private static CandidateMeta ScanUiaWindow(
-            IUIAutomation2 uia, IntPtr hwnd, NativeWin32.RECT topWinRc, bool topIconic,
+            IUIAutomation2 uia, IntPtr topHwnd, IntPtr scanHwnd, NativeWin32.RECT topWinRc, bool topIconic,
             IUIAutomationCondition condInteractive, out bool resolvedLiked, out int totalBtns, out string dbg)
         {
             resolvedLiked = false; totalBtns = 0; dbg = "";
-            if (uia == null || hwnd == IntPtr.Zero || !IsWindowResponsive(hwnd)) return null;
+            if (uia == null || scanHwnd == IntPtr.Zero || !IsWindowResponsive(scanHwnd)) return null;
 
             IUIAutomationElement root = null;
             IUIAutomationElementArray arr = null;
@@ -3923,42 +4519,30 @@ namespace DynamicIslandWin
             var playAnchors = new List<int>();
             try
             {
-                if (uia.ElementFromHandle(hwnd, out root) != 0 || root == null) return null;
+                if (uia.ElementFromHandle(scanHwnd, out root) != 0 || root == null) return null;
                 if (root.FindAll(UIA_TreeScope_Descendants, condInteractive, out arr) != 0 || arr == null) return null;
                 int len;
                 if (arr.get_Length(out len) != 0 || len <= 0) return null;
                 totalBtns = len;
 
-                int limit = Math.Min(len, 500);
-                for (int i = Math.Max(0, len - limit); i < len; i++)
+                // Scan BOTH head (top player bars like Apple Music / iTunes / VK) AND tail (bottom/sidebar bars like Spotify / Yandex / YouTube Music)
+                if (len <= 640)
                 {
-                    IUIAutomationElement el = null;
-                    if (arr.GetElement(i, out el) != 0 || el == null) continue;
-                    string rawNm = null, rawHelp = null, rawAria = null;
-                    int en = 1, ct = UIA_ButtonControlTypeId;
-                    el.get_CurrentIsEnabled(out en);
-                    el.get_CurrentControlType(out ct);
-                    el.get_CurrentName(out rawNm);
-                    el.get_CurrentHelpText(out rawHelp);
-                    el.get_CurrentAriaProperties(out rawAria);
-
-                    string nmNorm = Norm(rawNm), helpNorm = Norm(rawHelp);
-                    if (IsStrongAnchor(nmNorm) || IsStrongAnchor(helpNorm)) strongAnchors.Add(items.Count);
-                    else if (IsPlayAnchor(nmNorm) || IsPlayAnchor(helpNorm)) playAnchors.Add(items.Count);
-
-                    bool hasTog = false; int togVal = -1; object patObj = null;
-                    if (el.GetCurrentPattern(UIA_TogglePatternId, out patObj) == 0 && patObj != null)
-                    {
-                        var tp = patObj as IUIAutomationTogglePattern;
-                        if (tp != null && tp.get_CurrentToggleState(out togVal) == 0) hasTog = true;
-                        ReleaseCom(patObj);
-                    }
-                    NativeWin32.RECT brc;
-                    bool hasBounds = (el.get_CurrentBoundingRectangle(out brc) == 0);
-                    items.Add(new CandidateMeta { ComNode = el, IsAccNode = false, NameLower = nmNorm, HelpLower = helpNorm, AriaProps = rawAria, ControlType = ct, HasToggle = hasTog, ToggleVal = togVal, Enabled = en, Bounds = brc, HasBounds = hasBounds });
+                    for (int i = 0; i < len; i++)
+                        AppendUiaCandidateAtIndex(arr, i, items, strongAnchors, playAnchors);
+                }
+                else
+                {
+                    const int headCount = 260;
+                    const int tailCount = 380;
+                    for (int i = 0; i < headCount; i++)
+                        AppendUiaCandidateAtIndex(arr, i, items, strongAnchors, playAnchors);
+                    int tailStart = Math.Max(headCount, len - tailCount);
+                    for (int i = tailStart; i < len; i++)
+                        AppendUiaCandidateAtIndex(arr, i, items, strongAnchors, playAnchors);
                 }
 
-                return SelectBestCandidate(items, strongAnchors, playAnchors, topWinRc, topIconic, out resolvedLiked, out dbg);
+                return SelectBestCandidate(items, strongAnchors, playAnchors, topHwnd, topWinRc, topIconic, out resolvedLiked, out dbg);
             }
             catch
             {
@@ -3973,30 +4557,45 @@ namespace DynamicIslandWin
             bool allowColdWakeRetry, out bool isCurrentlyLiked, out string debugSummary)
         {
             isCurrentlyLiked = false; debugSummary = "";
-            if (topHwnd == IntPtr.Zero) return null;
+            if (topHwnd == IntPtr.Zero) { debugSummary = "topHwnd=0"; return null; }
 
-            if (isBrowser)
-            {
-                string tl = (windowTitle ?? "").ToLowerInvariant();
-                if (!(tl.Contains("музык") || tl.Contains("music") || tl.Contains("spotify") || tl.Contains("яндекс") || tl.Contains("deezer") || tl.Contains("soundcloud") || tl.Contains("vk")))
-                    return null;
-            }
-
+            // Note: do NOT filter browsers by RU/EN window title words — SMTC already confirmed this process owns the active media session!
             NativeWin32.RECT winRc;
             if (!NativeWin32.GetWindowRect(topHwnd, out winRc)) winRc = new NativeWin32.RECT();
             bool isIconic = NativeWin32.IsIconic(topHwnd);
 
+            var clsSb = new StringBuilder(128);
+            NativeWin32.GetClassName(topHwnd, clsSb, 128);
+            string winClass = clsSb.ToString();
+
+            // Locate UWP CoreWindow child when player runs inside ApplicationFrameHost (Microsoft Store Spotify / Apple Music / Media Player)
+            IntPtr uwpCoreHwnd = IntPtr.Zero;
+            if (winClass == "ApplicationFrameWindow")
+            {
+                NativeWin32.EnumChildWindows(topHwnd, (ch, lp) =>
+                {
+                    var ccls = new StringBuilder(128);
+                    NativeWin32.GetClassName(ch, ccls, 128);
+                    if (ccls.ToString() == "Windows.UI.Core.CoreWindow") { uwpCoreHwnd = ch; return false; }
+                    return true;
+                }, IntPtr.Zero);
+            }
+
+            string lastAttemptDbg = "";
             int maxAttempts = allowColdWakeRetry ? 3 : 1;
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
                 int accBtns = 0;
+                string subDbg;
                 if (renderHwnd != IntPtr.Zero)
                 {
-                    var hitAccR = ScanAccWindow(renderHwnd, winRc, isIconic, out isCurrentlyLiked, out accBtns, out debugSummary);
-                    if (hitAccR != null) return hitAccR;
+                    var hitAccR = ScanAccWindow(topHwnd, renderHwnd, winRc, isIconic, out isCurrentlyLiked, out accBtns, out subDbg);
+                    if (hitAccR != null) { debugSummary = subDbg; return hitAccR; }
+                    if (!string.IsNullOrEmpty(subDbg)) lastAttemptDbg = "IA2Render:" + subDbg;
                 }
-                var hitAccTop = ScanAccWindow(topHwnd, winRc, isIconic, out isCurrentlyLiked, out accBtns, out debugSummary);
-                if (hitAccTop != null) return hitAccTop;
+                var hitAccTop = ScanAccWindow(topHwnd, topHwnd, winRc, isIconic, out isCurrentlyLiked, out accBtns, out subDbg);
+                if (hitAccTop != null) { debugSummary = subDbg; return hitAccTop; }
+                if (!string.IsNullOrEmpty(subDbg)) lastAttemptDbg = "IA2Top:" + subDbg;
 
                 int uiaBtns = 0;
                 if (uia != null)
@@ -4009,8 +4608,21 @@ namespace DynamicIslandWin
                         uia.CreateOrCondition(cBtn, cChk, out cInter);
                         if (cInter != null)
                         {
-                            var hitUia = ScanUiaWindow(uia, topHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out debugSummary);
-                            if (hitUia != null) return hitUia;
+                            if (uwpCoreHwnd != IntPtr.Zero)
+                            {
+                                var hitCore = ScanUiaWindow(uia, topHwnd, uwpCoreHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out subDbg);
+                                if (hitCore != null) { debugSummary = "UWPCore+" + subDbg; return hitCore; }
+                                if (!string.IsNullOrEmpty(subDbg)) lastAttemptDbg = "UWPCore:" + subDbg;
+                            }
+                            if (renderHwnd != IntPtr.Zero)
+                            {
+                                var hitRenderUia = ScanUiaWindow(uia, topHwnd, renderHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out subDbg);
+                                if (hitRenderUia != null) { debugSummary = "UIARender+" + subDbg; return hitRenderUia; }
+                                if (!string.IsNullOrEmpty(subDbg)) lastAttemptDbg = "UIARender:" + subDbg;
+                            }
+                            var hitUia = ScanUiaWindow(uia, topHwnd, topHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out subDbg);
+                            if (hitUia != null) { debugSummary = subDbg; return hitUia; }
+                            if (!string.IsNullOrEmpty(subDbg)) lastAttemptDbg = "UIATop:" + subDbg;
                         }
                     }
                     finally { ReleaseCom(cInter); ReleaseCom(cChk); ReleaseCom(cBtn); }
@@ -4023,6 +4635,9 @@ namespace DynamicIslandWin
                 }
                 break;
             }
+
+            debugSummary = string.Format("cls='{0}', iconic={1}, rect={2}x{3}, {4}",
+                winClass, isIconic ? 1 : 0, winRc.Right - winRc.Left, winRc.Bottom - winRc.Top, lastAttemptDbg);
             return null;
         }
         private static bool InvokeLikeControlSafe(CandidateMeta ctrl)
@@ -4164,7 +4779,16 @@ namespace DynamicIslandWin
 
             if (!job.IsToggleAction)
             {
-                if (topHwnd == IntPtr.Zero) return;
+                if (topHwnd == IntPtr.Zero)
+                {
+                    string missWinSig = "MISS_WIN|" + (job.Snapshot.AppId ?? "") + "|" + job.TrackKey;
+                    if (!string.Equals(_lastLoggedPassiveSync, missWinSig, StringComparison.Ordinal))
+                    {
+                        _lastLoggedPassiveSync = missWinSig;
+                        LogDiagnostic("DIAG", "Passive sync: window not found for AppId='" + (job.Snapshot.AppId ?? "") + "' Display='" + (job.Snapshot.DisplayAppName ?? "") + "'");
+                    }
+                    return;
+                }
                 bool playerLiked; string dbg;
                 var ctrl = FindPlayerBarLikeControl(uia, topHwnd, renderHwnd, isBrowser, winTitle, true, out playerLiked, out dbg);
                 if (ctrl != null)
@@ -4176,9 +4800,18 @@ namespace DynamicIslandWin
                     if (!string.Equals(_lastLoggedPassiveSync, sigLog, StringComparison.Ordinal))
                     {
                         _lastLoggedPassiveSync = sigLog;
-                        LogDiagnostic("SYNC", "Synced player favorite state for '" + job.TrackKey + "' -> IsLiked=" + playerLiked + " [" + dbg + "]");
+                        LogDiagnostic("SYNC", "Synced player favorite state for '" + job.TrackKey + "' (AppId='" + job.Snapshot.AppId + "') -> IsLiked=" + playerLiked + " [" + dbg + "]");
                     }
                     if (job.Callback != null) job.Callback(res);
+                }
+                else
+                {
+                    string missCtrlSig = "MISS_CTRL|" + (job.Snapshot.AppId ?? "") + "|" + job.TrackKey;
+                    if (!string.Equals(_lastLoggedPassiveSync, missCtrlSig, StringComparison.Ordinal))
+                    {
+                        _lastLoggedPassiveSync = missCtrlSig;
+                        LogDiagnostic("DIAG", "Passive sync: Like control not matched for AppId='" + (job.Snapshot.AppId ?? "") + "' Title='" + winTitle + "' [" + dbg + "]");
+                    }
                 }
                 return;
             }
@@ -4249,7 +4882,7 @@ namespace DynamicIslandWin
             }
 
             res.PlayerSupported = false; res.SyncedFromPlayer = false; res.IsLiked = job.ExpectedTargetLiked;
-            LogDiagnostic("INFO", "Like button unreachable in background for '" + job.Snapshot.DisplayAppName + "' — kept local state without window activation.");
+            LogDiagnostic("DIAG", "Toggle fallback: Like control unreachable for AppId='" + (job.Snapshot.AppId ?? "") + "' Display='" + (job.Snapshot.DisplayAppName ?? "") + "' WinTitle='" + winTitle + "' [" + beforeDbg + "] — kept local state.");
             if (job.Callback != null) job.Callback(res);
         }
     }
@@ -4334,7 +4967,7 @@ namespace DynamicIslandWin
         private static readonly object _cacheLock = new object();
         private static readonly Dictionary<uint, CachedPidClassification> _pidCache = new Dictionary<uint, CachedPidClassification>();
 
-        private static string TryQueryProcessPathFast(uint pid, out string procNameNoExt)
+        public static string TryQueryProcessPathFast(uint pid, out string procNameNoExt)
         {
             procNameNoExt = "";
             string fullPath = "";
@@ -7104,12 +7737,17 @@ namespace DynamicIslandWin
                 g.DrawPath(cPen, cp);
             }
 
+            bool compactCell = (cellRc.Height < 42f);
+            float topPad = compactCell ? 2.5f : 4f;
+            float topRowH = compactCell ? 15.5f : 19f;
+            float valW = compactCell ? 56f : 66f;
+
             // Top row: Label on left, Clickable Tabular Monospace Readout on right
-            var valBoxRc = new RectangleF(cellRc.Right - 72f, cellRc.Y + 4f, 66f, 19f);
+            var valBoxRc = new RectangleF(cellRc.Right - valW - 5f, cellRc.Y + topPad, valW, topRowH);
             bool valHov = valBoxRc.Contains(_mousePt);
 
             using (var lblBr = new SolidBrush(hov ? ColTextMain : ColTextMuted))
-                g.DrawString(label, _fChip, lblBr, new RectangleF(cellRc.X + 8f, cellRc.Y + 4f, cellRc.Width - 84f, 19f), _sfLeft);
+                g.DrawString(label, compactCell ? _fMonoTiny : _fChip, lblBr, new RectangleF(cellRc.X + 7f, cellRc.Y + topPad, Math.Max(24f, cellRc.Width - valW - 15f), topRowH), _sfLeft);
 
             using (GraphicsPath vp = SharpRoundRect(valBoxRc, 3f))
             using (var vb = new SolidBrush(ColWellBg))
@@ -7118,15 +7756,16 @@ namespace DynamicIslandWin
             {
                 g.FillPath(vb, vp);
                 g.DrawPath(vPen, vp);
-                g.DrawString(formattedReadout, _fMonoVal, vt, valBoxRc, _sfCenter);
+                g.DrawString(formattedReadout, compactCell ? _fMonoTiny : _fMonoVal, vt, valBoxRc, _sfCenter);
             }
 
             // Bottom row: Precision Graduated Ruler Scale + Active Bar + Hairline Cursor
-            float trackLeft = cellRc.X + 10f;
-            float trackRight = cellRc.Right - 10f;
+            float trackLeft = cellRc.X + (compactCell ? 8f : 10f);
+            float trackRight = cellRc.Right - (compactCell ? 8f : 10f);
             float trackW = Math.Max(24f, trackRight - trackLeft);
-            float rulerBaseY = cellRc.Bottom - 8f;
-            var trackHitRc = new RectangleF(trackLeft, cellRc.Y + 24f, trackW, Math.Max(14f, cellRc.Height - 26f));
+            float rulerBaseY = cellRc.Bottom - (compactCell ? 4.5f : 8f);
+            float trackTopY = cellRc.Y + (compactCell ? 18f : 24f);
+            var trackHitRc = new RectangleF(trackLeft, trackTopY, trackW, Math.Max(12f, cellRc.Bottom - trackTopY - 1f));
 
             float ratio = (maxVal > minVal)
                 ? Math.Max(0f, Math.Min(1f, (curVal - minVal) / (float)(maxVal - minVal)))
@@ -7147,13 +7786,15 @@ namespace DynamicIslandWin
                 {
                     float tx = trackLeft + (trackW * i) / ticks;
                     bool major = (i == 0 || i == ticks || i == ticks / 2 || i % 4 == 0);
-                    float th = major ? 7.5f : 4.0f;
+                    float th = compactCell ? (major ? 5.2f : 2.8f) : (major ? 7.5f : 4.0f);
                     g.DrawLine(tx <= activeX + 0.5f ? penActTick : penDimTick, tx, rulerBaseY - th, tx, rulerBaseY);
                 }
             }
 
             // Precision Hairline Thumb Marker
-            var thumbRc = new RectangleF(activeX - 3.5f, rulerBaseY - 10f, 7f, 12f);
+            var thumbRc = compactCell
+                ? new RectangleF(activeX - 3.0f, rulerBaseY - 7.5f, 6f, 9f)
+                : new RectangleF(activeX - 3.5f, rulerBaseY - 10f, 7f, 12f);
             using (GraphicsPath tp = SharpRoundRect(thumbRc, 2f))
             using (var tb = new SolidBrush(ColTextMain))
             using (var tPen = new Pen(ColAccent, 1.2f))
@@ -7747,6 +8388,123 @@ namespace DynamicIslandWin
         {
             if (_stageCurExp > 0.55f)
             {
+                // Live Expanded Equalizer Preview inside Stage Capsule
+                string expStyle = _cfg.exp_eq_style ?? "Столбики";
+                Color ec1 = tc1, ec2 = tc2, ec3 = tc1;
+                string ecm = _cfg.exp_eq_color_mode ?? "Градиент темы";
+                if (ecm == "Один цвет")
+                {
+                    ec1 = ColorThemeUtils.ParseHex(_cfg.exp_eq_color1_hex, tc1);
+                    ec2 = ec1; ec3 = ec1;
+                }
+                else if (ecm == "Градиент 2 цвета")
+                {
+                    ec1 = ColorThemeUtils.ParseHex(_cfg.exp_eq_color1_hex, tc1);
+                    ec2 = ColorThemeUtils.ParseHex(_cfg.exp_eq_color2_hex, tc2);
+                    ec3 = ec2;
+                }
+                else if (ecm == "Градиент 3 цвета")
+                {
+                    ec1 = ColorThemeUtils.ParseHex(_cfg.exp_eq_color1_hex, tc1);
+                    ec2 = ColorThemeUtils.ParseHex(_cfg.exp_eq_color2_hex, tc2);
+                    ec3 = ColorThemeUtils.ParseHex(_cfg.exp_eq_color3_hex, Color.FromArgb(236, 72, 153));
+                }
+                else if (ecm == "Обложка трека")
+                {
+                    ec1 = Color.FromArgb(255, 244, 114, 182);
+                    ec2 = Color.FromArgb(255, 56, 189, 248);
+                    ec3 = Color.FromArgb(255, 168, 85, 247);
+                }
+                else
+                {
+                    ec3 = ColorThemeUtils.Blend(tc2, Color.White, 0.22f);
+                }
+
+                float opAlpha = Math.Max(0.15f, Math.Min(1.0f, _cfg.exp_eq_opacity_pct / 100f));
+                int baseA = Math.Max(20, Math.Min(255, (int)Math.Round(240f * opAlpha)));
+                float hGain = Math.Max(0.35f, Math.Min(1.80f, _cfg.exp_eq_height_pct / 100f));
+                int eCnt = Math.Max(8, Math.Min(48, _cfg.exp_eq_bar_count));
+                float roundNorm = Math.Max(0f, Math.Min(1f, _cfg.exp_eq_roundness_pct / 100f));
+
+                if (expStyle != "Выкл" && expStyle != "Off" && expStyle != "Круговой")
+                {
+                    float eqL = pillRc.X + 12f;
+                    float eqSpan = Math.Max(60f, pillRc.Width - 24f);
+                    float maxEqH = Math.Min(pillRc.Height * 0.34f, 28f * hGain);
+                    float stepX = eqSpan / eCnt;
+                    float bw = Math.Max(1.4f, Math.Min(stepX * 0.85f, _cfg.exp_eq_thickness_px * 0.68f));
+
+                    if (expStyle == "Волна")
+                    {
+                        PointF[] wp1 = new PointF[eCnt + 2];
+                        float wy = pillRc.Bottom - maxEqH * 0.45f;
+                        for (int i = 0; i < wp1.Length; i++)
+                        {
+                            float t = i / (float)(wp1.Length - 1);
+                            float env = (float)Math.Sin(t * Math.PI);
+                            wp1[i] = new PointF(eqL + eqSpan * t, wy + (float)Math.Sin(_stageWavePhase * 1.25f + i * 0.55f) * env * maxEqH * 0.46f);
+                        }
+                        if (_cfg.exp_eq_glow_enabled)
+                        {
+                            using (var gp = new Pen(Color.FromArgb(Math.Max(12, baseA / 3), ec2.R, ec2.G, ec2.B), bw + 2.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                                g.DrawCurve(gp, wp1, 0.45f);
+                        }
+                        using (var lgw = new LinearGradientBrush(new PointF(eqL, wy), new PointF(eqL + eqSpan, wy), Color.FromArgb(baseA, ec1.R, ec1.G, ec1.B), Color.FromArgb(baseA, ec3.R, ec3.G, ec3.B)))
+                        using (var cp2 = new Pen(lgw, Math.Max(1.3f, bw * 0.65f)) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                            g.DrawCurve(cp2, wp1, 0.45f);
+                    }
+                    else
+                    {
+                        float mirY = pillRc.Bottom - maxEqH * 0.52f;
+                        for (int i = 0; i < eCnt; i++)
+                        {
+                            float t = eCnt > 1 ? (i / (float)(eCnt - 1)) : 0f;
+                            Color c = (ecm == "Градиент 3 цвета" || ecm == "Обложка трека")
+                                ? ColorThemeUtils.SampleGradient3(ec1, ec2, ec3, t)
+                                : ColorThemeUtils.Blend(ec1, ec2, t);
+                            float raw = 0.16f + 0.72f * Math.Abs((float)Math.Sin(_stageWavePhase * 1.15f + i * 0.46f)) * (0.55f + 0.45f * (float)Math.Sin(t * Math.PI));
+                            float bx = eqL + i * stepX + (stepX - bw) * 0.5f;
+                            if (expStyle == "Точки")
+                            {
+                                float dSz = Math.Max(2.2f, bw + 0.8f);
+                                float dy = pillRc.Bottom - 4f - raw * (maxEqH - 4f);
+                                var dRc = new RectangleF(bx, dy, dSz, dSz);
+                                if (_cfg.exp_eq_glow_enabled)
+                                {
+                                    using (var gb = new SolidBrush(Color.FromArgb(Math.Max(10, baseA / 4), c.R, c.G, c.B)))
+                                        g.FillEllipse(gb, RectangleF.Inflate(dRc, 1.8f, 1.8f));
+                                }
+                                using (var db = new SolidBrush(Color.FromArgb(baseA, c.R, c.G, c.B)))
+                                using (GraphicsPath dp = SharpRoundRect(dRc, dSz * 0.5f * roundNorm))
+                                    g.FillPath(db, dp);
+                            }
+                            else if (expStyle == "Зеркальный")
+                            {
+                                float hh = Math.Max(1.6f, raw * maxEqH * 0.46f);
+                                using (var ub = new SolidBrush(Color.FromArgb(baseA, c.R, c.G, c.B)))
+                                using (var lb = new SolidBrush(Color.FromArgb(Math.Max(14, baseA / 2), c.R, c.G, c.B)))
+                                {
+                                    g.FillRectangle(ub, bx, mirY - hh - 0.5f, bw, hh);
+                                    g.FillRectangle(lb, bx, mirY + 0.5f, bw, hh);
+                                }
+                            }
+                            else // Столбики
+                            {
+                                float bh = Math.Max(2.5f, raw * maxEqH);
+                                var bRc = new RectangleF(bx, pillRc.Bottom - bh - 1.5f, bw, bh);
+                                if (_cfg.exp_eq_glow_enabled)
+                                {
+                                    using (var gb = new SolidBrush(Color.FromArgb(Math.Max(8, baseA / 5), c.R, c.G, c.B)))
+                                        g.FillRectangle(gb, bRc.X - 1f, bRc.Y - 1f, bRc.Width + 2f, bRc.Height + 1.5f);
+                                }
+                                using (GraphicsPath bp = SharpRoundRect(bRc, bw * 0.5f * roundNorm))
+                                using (var bb = new SolidBrush(Color.FromArgb(baseA, c.R, c.G, c.B)))
+                                    g.FillPath(bb, bp);
+                            }
+                        }
+                    }
+                }
+
                 // Expanded Dashboard Mini-Preview inside Stage Capsule
                 float pad = 10f;
                 var mediaBox = new RectangleF(pillRc.X + pad, pillRc.Y + 8f, pillRc.Width - pad * 2f, Math.Min(42f, pillRc.Height * 0.34f));
@@ -7757,7 +8515,41 @@ namespace DynamicIslandWin
                 }
 
                 var covRc = new RectangleF(mediaBox.X + 6f, mediaBox.Y + 5f, mediaBox.Height - 10f, mediaBox.Height - 10f);
-                using (GraphicsPath cp = SharpRoundRect(covRc, 5f))
+                if (expStyle == "Круговой")
+                {
+                    float cx = covRc.X + covRc.Width * 0.5f;
+                    float cy = covRc.Y + covRc.Height * 0.5f;
+                    float baseR = covRc.Width * 0.54f + 1.5f;
+                    int spokes = Math.Max(12, Math.Min(36, eCnt));
+                    float spokeW = Math.Max(1.3f, Math.Min(3.4f, _cfg.exp_eq_thickness_px * 0.42f));
+                    for (int i = 0; i < spokes; i++)
+                    {
+                        float t = i / (float)spokes;
+                        double ang = t * Math.PI * 2.0 - Math.PI * 0.5;
+                        float amp = (2.5f + 6.5f * hGain * Math.Abs((float)Math.Sin(_stageWavePhase * 1.3f + i * 0.55f)));
+                        Color sc = (ecm == "Градиент 3 цвета" || ecm == "Обложка трека")
+                            ? ColorThemeUtils.SampleGradient3(ec1, ec2, ec3, t)
+                            : ColorThemeUtils.Blend(ec1, ec2, (float)Math.Sin(t * Math.PI));
+                        float x1 = cx + (float)Math.Cos(ang) * baseR;
+                        float y1 = cy + (float)Math.Sin(ang) * baseR;
+                        float x2 = cx + (float)Math.Cos(ang) * (baseR + amp);
+                        float y2 = cy + (float)Math.Sin(ang) * (baseR + amp);
+                        if (_cfg.exp_eq_glow_enabled)
+                        {
+                            using (var gp = new Pen(Color.FromArgb(Math.Max(10, baseA / 3), sc.R, sc.G, sc.B), spokeW + 1.8f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                                g.DrawLine(gp, x1, y1, x2, y2);
+                        }
+                        using (var sp = new Pen(Color.FromArgb(baseA, sc.R, sc.G, sc.B), spokeW)
+                        {
+                            StartCap = roundNorm > 0.35f ? LineCap.Round : LineCap.Flat,
+                            EndCap = roundNorm > 0.35f ? LineCap.Round : LineCap.Flat
+                        })
+                        {
+                            g.DrawLine(sp, x1, y1, x2, y2);
+                        }
+                    }
+                }
+                using (GraphicsPath cp = SharpRoundRect(covRc, expStyle == "Круговой" ? covRc.Width * 0.5f : 5f))
                 using (var cg = new LinearGradientBrush(covRc, tc1, tc2, 45f))
                     g.FillPath(cg, cp);
 
@@ -8253,50 +9045,187 @@ namespace DynamicIslandWin
             }
             else if (_inspectorSubMode == 2)
             {
-                string[] eqStyles = { "Столбики", "Точки", "Волна", "Зеркальный", "Выкл" };
-                string[] eqShort = { "Столбики", "Точки", "Волна", "Зеркало", "Выкл" };
-                DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 64f),
-                    "СТИЛЬ ВИЗУАЛИЗАТОРА (4 ВИДА + ВЫКЛ)", eqStyles, eqShort, _cfg.eq_style ?? "Столбики", 3,
-                    val => { _cfg.eq_style = val; if (val != "Выкл") _stageMode = StagePreviewMode.Media; SyncStageTargetsFromMode(true); });
-                iy += 70f;
+                // Top Scope Switcher: [ КАПСУЛА (КОМПАКТ) ] vs [ РАСКРЫТЫЙ ОСТРОВ ]
+                float scopeHalfW = (iw - 4f) * 0.5f;
+                var scCompactRc = new RectangleF(sx, iy - 4f, scopeHalfW, 20f);
+                var scExpRc = new RectangleF(sx + scopeHalfW + 4f, iy - 4f, scopeHalfW, 20f);
 
-                string[] colModes = { "Градиент темы", "Обложка трека", "Один цвет" };
-                string[] colShort = { "Градиент", "Под обложку", "Один цвет" };
-                DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 40f),
-                    "РЕЖИМ ЦВЕТА ЭКВАЛАЙЗЕРА", colModes, colShort, _cfg.eq_color_mode ?? "Градиент темы", 3,
-                    val => _cfg.eq_color_mode = val);
-                iy += 44f;
-
-                Color curEqCol = ColorThemeUtils.ParseHex(_cfg.eq_custom_color_hex, Color.FromArgb(34, 211, 238));
-                var swRc = new RectangleF(sx, iy + 2f, 22f, 20f);
-                using (GraphicsPath swp = SharpRoundRect(swRc, 4f))
-                using (var swb = new SolidBrush(curEqCol))
-                using (var swPen = new Pen(ColBorderHi, 1f))
+                for (int sm = 0; sm < 2; sm++)
                 {
-                    g.FillPath(swb, swp);
-                    g.DrawPath(swPen, swp);
-                }
-                DrawHardwareButton(g, new RectangleF(sx + 26f, iy, iw - 26f, 23f),
-                    "🎨 ВЫБРАТЬ СВОЙ ЦВЕТ ЭКВАЛАЙЗЕРА (" + (_cfg.eq_custom_color_hex ?? "#22D3EE") + ")", _cfg.eq_color_mode == "Один цвет", false,
-                    () => PickColorInteractive(curEqCol, picked =>
+                    var sRc = (sm == 0) ? scCompactRc : scExpRc;
+                    bool sAct = (_eqTargetExpandedMode == sm);
+                    using (GraphicsPath sp = SharpRoundRect(sRc, 3.5f))
+                    using (var sb = new SolidBrush(sAct ? ColAccentAlpha(46) : ColDeckInset))
+                    using (var sPen = new Pen(sAct ? ColAccent : ColBorder, 1f))
+                    using (var st = new SolidBrush(sAct ? ColTextMain : ColTextMuted))
                     {
-                        _cfg.eq_custom_color_hex = ColorThemeUtils.ToHex(picked);
-                        _cfg.eq_color_mode = "Один цвет";
-                    }));
-                iy += 28f;
+                        g.FillPath(sb, sp);
+                        g.DrawPath(sPen, sp);
+                        g.DrawString(sm == 0 ? "КАПСУЛА (КОМПАКТ)" : "РАСКРЫТЫЙ ОСТРОВ", _fMonoTiny, st, sRc, _sfCenter);
+                    }
+                    int capSm = sm;
+                    _hits.Add(new HitZone
+                    {
+                        Rect = sRc,
+                        OnClick = () =>
+                        {
+                            CommitInlineInput(true);
+                            _eqTargetExpandedMode = capSm;
+                            _stageMode = (capSm == 1) ? StagePreviewMode.Expanded : StagePreviewMode.Media;
+                            SyncStageTargetsFromMode(true);
+                            Invalidate();
+                        }
+                    });
+                }
+                iy += 20f;
 
-                float halfEqW = (iw - 6f) * 0.5f;
-                DrawPrecisionTickSlider(g, new RectangleF(sx, iy, halfEqW, 52f),
-                    "ПОЛОСЫ / ТОЧКИ", _cfg.eq_bar_count, 4, 12, _cfg.eq_bar_count.ToString(), 8,
-                    () => _cfg.eq_bar_count, v => _cfg.eq_bar_count = v);
-                DrawPrecisionTickSlider(g, new RectangleF(sx + halfEqW + 6f, iy, halfEqW, 52f),
-                    "ЧУВСТВИТЕЛЬНОСТЬ", _cfg.eq_sensitivity_pct, 40, 220, _cfg.eq_sensitivity_pct + "%", 9,
-                    () => _cfg.eq_sensitivity_pct, v => _cfg.eq_sensitivity_pct = v);
-                iy += 58f;
+                if (_eqTargetExpandedMode == 0)
+                {
+                    string[] eqStyles = { "Столбики", "Точки", "Волна", "Зеркальный", "Выкл" };
+                    string[] eqShort = { "Столбики", "Точки", "Волна", "Зеркало", "Выкл" };
+                    DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 60f),
+                        "СТИЛЬ КОМПАКТ-ЭКВАЛАЙЗЕРА", eqStyles, eqShort, _cfg.eq_style ?? "Столбики", 3,
+                        val => { _cfg.eq_style = val; if (val != "Выкл") _stageMode = StagePreviewMode.Media; SyncStageTargetsFromMode(true); });
+                    iy += 64f;
 
-                DrawPrecisionTickSlider(g, new RectangleF(sx, iy, iw, 52f),
-                    "ПЛАВНОСТЬ АНИМАЦИИ (ИНЕРЦИЯ СПАДА)", _cfg.eq_smoothing_pct, 10, 95, _cfg.eq_smoothing_pct + "%", 14,
-                    () => _cfg.eq_smoothing_pct, v => _cfg.eq_smoothing_pct = v);
+                    string[] colModes = { "Градиент темы", "Обложка трека", "Один цвет" };
+                    string[] colShort = { "Градиент", "Под обложку", "Один цвет" };
+                    DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 38f),
+                        "РЕЖИМ ЦВЕТА", colModes, colShort, _cfg.eq_color_mode ?? "Градиент темы", 3,
+                        val => _cfg.eq_color_mode = val);
+                    iy += 42f;
+
+                    Color curEqCol = ColorThemeUtils.ParseHex(_cfg.eq_custom_color_hex, Color.FromArgb(34, 211, 238));
+                    var swRc = new RectangleF(sx, iy + 1f, 22f, 20f);
+                    using (GraphicsPath swp = SharpRoundRect(swRc, 4f))
+                    using (var swb = new SolidBrush(curEqCol))
+                    using (var swPen = new Pen(ColBorderHi, 1f))
+                    {
+                        g.FillPath(swb, swp);
+                        g.DrawPath(swPen, swp);
+                    }
+                    DrawHardwareButton(g, new RectangleF(sx + 26f, iy, iw - 26f, 22f),
+                        "🎨 СВОЙ ЦВЕТ (" + (_cfg.eq_custom_color_hex ?? "#22D3EE") + ")", _cfg.eq_color_mode == "Один цвет", false,
+                        () => PickColorInteractive(curEqCol, picked =>
+                        {
+                            _cfg.eq_custom_color_hex = ColorThemeUtils.ToHex(picked);
+                            _cfg.eq_color_mode = "Один цвет";
+                        }));
+                    iy += 26f;
+
+                    float halfEqW = (iw - 6f) * 0.5f;
+                    DrawPrecisionTickSlider(g, new RectangleF(sx, iy, halfEqW, 44f),
+                        "ПОЛОСЫ / ТОЧКИ", _cfg.eq_bar_count, 4, 12, _cfg.eq_bar_count.ToString(), 8,
+                        () => _cfg.eq_bar_count, v => _cfg.eq_bar_count = v);
+                    DrawPrecisionTickSlider(g, new RectangleF(sx + halfEqW + 6f, iy, halfEqW, 44f),
+                        "ЧУВСТВИТЕЛЬНОСТЬ", _cfg.eq_sensitivity_pct, 40, 220, _cfg.eq_sensitivity_pct + "%", 9,
+                        () => _cfg.eq_sensitivity_pct, v => _cfg.eq_sensitivity_pct = v);
+                    iy += 48f;
+
+                    DrawPrecisionTickSlider(g, new RectangleF(sx, iy, iw, 44f),
+                        "ПЛАВНОСТЬ АНИМАЦИИ", _cfg.eq_smoothing_pct, 10, 95, _cfg.eq_smoothing_pct + "%", 14,
+                        () => _cfg.eq_smoothing_pct, v => _cfg.eq_smoothing_pct = v);
+                }
+                else
+                {
+                    // Multi-Faceted Expanded Island Equalizer Studio
+                    string[] expStyles = { "Столбики", "Точки", "Волна", "Круговой", "Зеркальный", "Выкл" };
+                    string[] expShort = { "Столбики", "Точки", "Волна", "Круговой", "Зеркало", "Выкл" };
+                    DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 45f),
+                        "", expStyles, expShort, _cfg.exp_eq_style ?? "Столбики", 3,
+                        val => { _cfg.exp_eq_style = val; _stageMode = StagePreviewMode.Expanded; SyncStageTargetsFromMode(true); });
+                    iy += 49f;
+
+                    string[] expCols = { "Градиент темы", "Обложка трека", "Один цвет", "Градиент 2 цвета", "Градиент 3 цвета" };
+                    string[] expColShort = { "Тема", "Обложка", "1 Цвет", "2 Цвета", "3 Цвета" };
+                    DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 45f),
+                        "", expCols, expColShort, _cfg.exp_eq_color_mode ?? "Градиент темы", 3,
+                        val => { _cfg.exp_eq_color_mode = val; _stageMode = StagePreviewMode.Expanded; SyncStageTargetsFromMode(false); });
+                    iy += 49f;
+
+                    // 3 Interactive Color Swatches [🎨 C1] [🎨 C2] [🎨 C3] + [✨ GLOW] toggle
+                    Color c1 = ColorThemeUtils.ParseHex(_cfg.exp_eq_color1_hex, Color.FromArgb(34, 211, 238));
+                    Color c2 = ColorThemeUtils.ParseHex(_cfg.exp_eq_color2_hex, Color.FromArgb(168, 85, 247));
+                    Color c3 = ColorThemeUtils.ParseHex(_cfg.exp_eq_color3_hex, Color.FromArgb(236, 72, 153));
+                    Color[] swArr = { c1, c2, c3 };
+                    string[] swLbls = { "C1", "C2", "C3" };
+                    float swBtnW = 58f;
+                    for (int ci = 0; ci < 3; ci++)
+                    {
+                        var bRc = new RectangleF(sx + ci * (swBtnW + 4f), iy, swBtnW, 20f);
+                        bool bHov = bRc.Contains(_mousePt);
+                        using (GraphicsPath bp = SharpRoundRect(bRc, 3.5f))
+                        using (var bb = new SolidBrush(bHov ? ColDeckHover : ColDeckInset))
+                        using (var bPen = new Pen(bHov ? ColAccent : ColBorder, 1f))
+                        using (var swBrush = new SolidBrush(swArr[ci]))
+                        using (var tb = new SolidBrush(ColTextMain))
+                        {
+                            g.FillPath(bb, bp);
+                            g.DrawPath(bPen, bp);
+                            g.FillRectangle(swBrush, bRc.X + 5f, bRc.Y + 4f, 12f, 12f);
+                            g.DrawString("🎨 " + swLbls[ci], _fMonoTiny, tb, new RectangleF(bRc.X + 19f, bRc.Y, bRc.Width - 21f, 20f), _sfLeft);
+                        }
+                        int capCi = ci;
+                        Color capStart = swArr[ci];
+                        _hits.Add(new HitZone
+                        {
+                            Rect = bRc,
+                            OnClick = () => PickColorInteractive(capStart, picked =>
+                            {
+                                string hex = ColorThemeUtils.ToHex(picked);
+                                if (capCi == 0)
+                                {
+                                    _cfg.exp_eq_color1_hex = hex;
+                                    if (_cfg.exp_eq_color_mode == "Градиент темы" || _cfg.exp_eq_color_mode == "Обложка трека")
+                                        _cfg.exp_eq_color_mode = "Один цвет";
+                                }
+                                else if (capCi == 1)
+                                {
+                                    _cfg.exp_eq_color2_hex = hex;
+                                    if (_cfg.exp_eq_color_mode != "Градиент 2 цвета" && _cfg.exp_eq_color_mode != "Градиент 3 цвета")
+                                        _cfg.exp_eq_color_mode = "Градиент 2 цвета";
+                                }
+                                else
+                                {
+                                    _cfg.exp_eq_color3_hex = hex;
+                                    _cfg.exp_eq_color_mode = "Градиент 3 цвета";
+                                }
+                                _stageMode = StagePreviewMode.Expanded;
+                            })
+                        });
+                    }
+
+                    float glowX = sx + 3f * (swBtnW + 4f);
+                    DrawHardwareButton(g, new RectangleF(glowX, iy, iw - (glowX - sx), 20f),
+                        _cfg.exp_eq_glow_enabled ? "✨ GLOW: ВКЛ" : "✨ GLOW: ВЫКЛ", _cfg.exp_eq_glow_enabled, false,
+                        () => { _cfg.exp_eq_glow_enabled = !_cfg.exp_eq_glow_enabled; _stageMode = StagePreviewMode.Expanded; ApplyLive(); });
+                    iy += 24f;
+
+                    float halfW = (iw - 6f) * 0.5f;
+                    float slH = 34f;
+                    DrawPrecisionTickSlider(g, new RectangleF(sx, iy, halfW, slH),
+                        "ПОЛОСЫ", _cfg.exp_eq_bar_count, 8, 48, _cfg.exp_eq_bar_count.ToString(), 8,
+                        () => _cfg.exp_eq_bar_count, v => { _cfg.exp_eq_bar_count = v; _stageMode = StagePreviewMode.Expanded; });
+                    DrawPrecisionTickSlider(g, new RectangleF(sx + halfW + 6f, iy, halfW, slH),
+                        "ВЫСОТА", _cfg.exp_eq_height_pct, 35, 180, _cfg.exp_eq_height_pct + "%", 8,
+                        () => _cfg.exp_eq_height_pct, v => { _cfg.exp_eq_height_pct = v; _stageMode = StagePreviewMode.Expanded; });
+                    iy += slH + 4f;
+
+                    DrawPrecisionTickSlider(g, new RectangleF(sx, iy, halfW, slH),
+                        "ТОЛЩИНА", _cfg.exp_eq_thickness_px, 2, 14, _cfg.exp_eq_thickness_px + "px", 6,
+                        () => _cfg.exp_eq_thickness_px, v => { _cfg.exp_eq_thickness_px = v; _stageMode = StagePreviewMode.Expanded; });
+                    DrawPrecisionTickSlider(g, new RectangleF(sx + halfW + 6f, iy, halfW, slH),
+                        "СКРУГЛ.", _cfg.exp_eq_roundness_pct, 0, 100, _cfg.exp_eq_roundness_pct + "%", 6,
+                        () => _cfg.exp_eq_roundness_pct, v => { _cfg.exp_eq_roundness_pct = v; _stageMode = StagePreviewMode.Expanded; });
+                    iy += slH + 4f;
+
+                    DrawPrecisionTickSlider(g, new RectangleF(sx, iy, halfW, slH),
+                        "ПРОЗРАЧН.", _cfg.exp_eq_opacity_pct, 15, 100, _cfg.exp_eq_opacity_pct + "%", 6,
+                        () => _cfg.exp_eq_opacity_pct, v => { _cfg.exp_eq_opacity_pct = v; _stageMode = StagePreviewMode.Expanded; });
+                    DrawPrecisionTickSlider(g, new RectangleF(sx + halfW + 6f, iy, halfW, slH),
+                        "ПЛАВНОСТЬ", _cfg.exp_eq_smoothing_pct, 10, 95, _cfg.exp_eq_smoothing_pct + "%", 6,
+                        () => _cfg.exp_eq_smoothing_pct, v => { _cfg.exp_eq_smoothing_pct = v; _stageMode = StagePreviewMode.Expanded; });
+                }
             }
             else
             {
@@ -8731,12 +9660,430 @@ namespace DynamicIslandWin
         }
     }
     // =========================================================================
+    public sealed class MicCapturePopupForm : Form
+    {
+        private const int LogicalW = 336;
+        private readonly CoreAudioBridge _audio;
+        private readonly IslandConfigData _cfg;
+        private readonly Action _onChanged;
+        private readonly System.Windows.Forms.Timer _pollTimer;
+        private readonly Dictionary<string, Bitmap> _icoCache = new Dictionary<string, Bitmap>(StringComparer.OrdinalIgnoreCase);
+
+        private List<MicCaptureAppItem> _apps = new List<MicCaptureAppItem>();
+        private float _dpiScale = 1.0f;
+        private int _logicalH = 150;
+        private float _scrollY = 0f;
+        private float _maxScrollY = 0f;
+        private PointF _mousePt = new PointF(-999f, -999f);
+
+        private sealed class PopupHit { public RectangleF Rect; public Action Click; }
+        private readonly List<PopupHit> _hits = new List<PopupHit>();
+
+        private readonly Font _fHead = new Font("Consolas", 10.8f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fApp = new Font("Segoe UI Semibold", 12.0f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fSub = new Font("Segoe UI", 10.4f, FontStyle.Regular, GraphicsUnit.Pixel);
+        private readonly Font _fBtn = new Font("Consolas", 10.6f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly StringFormat _sfL = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+        private readonly StringFormat _sfC = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+
+        public MicCapturePopupForm(CoreAudioBridge audio, IslandConfigData cfg, Action onChanged)
+        {
+            _audio = audio;
+            _cfg = cfg;
+            _onChanged = onChanged;
+
+            Text = "Dynamic Island — Микрофон по приложениям";
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ShowInTaskbar = false;
+            TopMost = true;
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+            BackColor = Color.FromArgb(12, 14, 20);
+
+            RefreshAppsList(true);
+
+            _pollTimer = new System.Windows.Forms.Timer { Interval = 450 };
+            _pollTimer.Tick += (s, e) =>
+            {
+                if (!IsDisposed && Visible)
+                {
+                    RefreshAppsList(true);
+                    Invalidate();
+                    if (_onChanged != null) _onChanged();
+                }
+            };
+            _pollTimer.Start();
+
+            Deactivate += (s, e) =>
+            {
+                if (!IsDisposed) { try { Close(); } catch { } }
+            };
+            KeyPreview = true;
+            KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Escape) Close();
+            };
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= NativeWin32.WS_EX_TOOLWINDOW | NativeWin32.WS_EX_TOPMOST;
+                return cp;
+            }
+        }
+
+        public void PositionBelowAnchor(Point anchorCenterScreen)
+        {
+            UpdateScaleAndHeight();
+            Rectangle wa = Screen.FromPoint(anchorCenterScreen).WorkingArea;
+            int x = Math.Max(wa.Left + 8, Math.Min(wa.Right - Width - 8, anchorCenterScreen.X - Width / 2));
+            int y = Math.Max(wa.Top + 6, Math.Min(wa.Bottom - Height - 8, anchorCenterScreen.Y));
+            Location = new Point(x, y);
+        }
+
+        private void RefreshAppsList(bool queryAudio)
+        {
+            _apps = _audio.GetActiveMicCaptureApps(queryAudio);
+            UpdateScaleAndHeight();
+        }
+
+        private void UpdateScaleAndHeight()
+        {
+            float dpi = 96f;
+            try { if (IsHandleCreated) { uint wd = NativeWin32.GetDpiForWindow(Handle); if (wd >= 72 && wd <= 384) dpi = wd; } } catch { }
+            if (dpi == 96f) { try { using (Graphics g = CreateGraphics()) dpi = g.DpiX; } catch { } }
+            float uiFactor = _cfg != null ? (1.0f + ((_cfg.ui_scale_percent - 100f) / 100f) * 0.35f) : 1.0f;
+            _dpiScale = Math.Max(0.85f, Math.Min(1.75f, (dpi / 96f) * Math.Max(0.88f, Math.Min(1.25f, uiFactor))));
+
+            int rows = Math.Max(1, Math.Min(6, _apps.Count));
+            int contentH = (_apps.Count == 0) ? 58 : (_apps.Count * 44);
+            int viewH = (_apps.Count == 0) ? 58 : (rows * 44);
+            _maxScrollY = Math.Max(0f, contentH - viewH);
+            _scrollY = Math.Max(0f, Math.Min(_maxScrollY, _scrollY));
+            _logicalH = 82 + viewH + 12;
+
+            int cw = (int)Math.Round(LogicalW * _dpiScale);
+            int ch = (int)Math.Round(_logicalH * _dpiScale);
+            if (ClientSize.Width != cw || ClientSize.Height != ch)
+            {
+                ClientSize = new Size(cw, ch);
+                int rad = Math.Max(10, (int)Math.Round(13f * _dpiScale));
+                Region = Region.FromHrgn(NativeWin32.CreateRoundRectRgn(0, 0, Width + 1, Height + 1, rad, rad));
+            }
+        }
+
+        private Bitmap GetCachedAppIcon(string exePath)
+        {
+            if (string.IsNullOrEmpty(exePath)) return null;
+            Bitmap cached;
+            if (_icoCache.TryGetValue(exePath, out cached)) return cached;
+            Bitmap bmp = null;
+            try
+            {
+                if (File.Exists(exePath))
+                {
+                    using (Icon ico = Icon.ExtractAssociatedIcon(exePath))
+                    {
+                        if (ico != null)
+                        {
+                            bmp = new Bitmap(24, 24, PixelFormat.Format32bppPArgb);
+                            using (Graphics g = Graphics.FromImage(bmp))
+                            {
+                                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                                g.DrawIcon(ico, new Rectangle(0, 0, 24, 24));
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            _icoCache[exePath] = bmp;
+            return bmp;
+        }
+
+        private static GraphicsPath RoundRect(RectangleF r, float rad)
+        {
+            float d = Math.Min(rad * 2f, Math.Min(r.Width, r.Height));
+            var p = new GraphicsPath();
+            if (d <= 1f) { p.AddRectangle(r); return p; }
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            g.ScaleTransform(_dpiScale, _dpiScale);
+            _hits.Clear();
+
+            Color acc1, acc2;
+            ColorThemeUtils.ResolveIslandThemeAccents(_cfg != null ? _cfg.theme_preset : "Dinasmic Neon", 255, out acc1, out acc2);
+
+            Color colBg = Color.FromArgb(12, 14, 21);
+            Color colHead = Color.FromArgb(17, 20, 29);
+            Color colCard = Color.FromArgb(22, 26, 37);
+            Color colCardHov = Color.FromArgb(30, 35, 49);
+            Color colBorder = Color.FromArgb(38, 255, 255, 255);
+            Color colWhite = Color.FromArgb(246, 247, 252);
+            Color colMuted = Color.FromArgb(156, 163, 182);
+
+            using (var bBg = new SolidBrush(colBg))
+                g.FillRectangle(bBg, 0, 0, LogicalW, _logicalH);
+
+            using (var bHead = new SolidBrush(colHead))
+            using (var pDiv = new Pen(colBorder, 1f))
+            {
+                g.FillRectangle(bHead, 0, 0, LogicalW, 34);
+                g.DrawLine(pDiv, 0, 34, LogicalW, 34);
+            }
+
+            MicCaptureSummaryState sum = _audio.MicSummaryState;
+            Color ledCol = sum == MicCaptureSummaryState.AllMuted ? Color.FromArgb(255, 69, 58)
+                         : (sum == MicCaptureSummaryState.PartiallyMuted ? Color.FromArgb(245, 158, 11)
+                         : (sum == MicCaptureSummaryState.ActiveUnmuted ? Color.FromArgb(48, 209, 88) : colMuted));
+
+            using (var ledBr = new SolidBrush(ledCol))
+            using (var tBr = new SolidBrush(colWhite))
+            using (var mBr = new SolidBrush(colMuted))
+            {
+                g.FillEllipse(ledBr, 12f, 13f, 8f, 8f);
+                g.DrawString("МИКРОФОН ПО ПРИЛОЖЕНИЯМ", _fHead, tBr, new RectangleF(25f, 0f, 205f, 34f), _sfL);
+                string cntTxt = string.Format("{0} АКТ • {1} МЬЮТ", _audio.ActiveMicAppCount, _audio.MutedMicAppCount);
+                g.DrawString(cntTxt, _fBtn, mBr, new RectangleF(LogicalW - 122f, 0f, 88f, 34f), _sfC);
+            }
+
+            var closeRc = new RectangleF(LogicalW - 30f, 6f, 22f, 22f);
+            bool closeHov = closeRc.Contains(_mousePt);
+            using (GraphicsPath cp = RoundRect(closeRc, 5f))
+            using (var cb = new SolidBrush(closeHov ? Color.FromArgb(56, 255, 69, 58) : colCard))
+            using (var tb = new SolidBrush(colWhite))
+            {
+                g.FillPath(cb, cp);
+                g.DrawString("✕", _fBtn, tb, closeRc, _sfC);
+            }
+            _hits.Add(new PopupHit { Rect = closeRc, Click = () => Close() });
+
+            // Top Dedicated "Mute All At Once" / "Unmute All" Button
+            var muteAllRc = new RectangleF(10f, 42f, LogicalW - 20f, 30f);
+            bool allMutedNow = (_apps.Count > 0 && sum == MicCaptureSummaryState.AllMuted);
+            bool maHov = muteAllRc.Contains(_mousePt);
+            Color maBg = _apps.Count == 0
+                ? colCard
+                : (allMutedNow
+                    ? (maHov ? Color.FromArgb(62, 48, 209, 88) : Color.FromArgb(42, 48, 209, 88))
+                    : (maHov ? Color.FromArgb(72, 255, 69, 58) : Color.FromArgb(48, 255, 69, 58)));
+            Color maBd = _apps.Count == 0
+                ? colBorder
+                : (allMutedNow ? Color.FromArgb(175, 48, 209, 88) : Color.FromArgb(185, 255, 69, 58));
+            string maText = _apps.Count == 0
+                ? "НЕТ АКТИВНЫХ СЕССИЙ ЗАХВАТА"
+                : (allMutedNow ? ("🎙 РАЗМУТИТЬ ВСЁ СРАЗУ (" + _apps.Count + ")") : ("🔇 ЗАМУТИТЬ ВСЁ СРАЗУ (" + _apps.Count + ")"));
+
+            using (GraphicsPath mp = RoundRect(muteAllRc, 7f))
+            using (var mb = new SolidBrush(maBg))
+            using (var mPen = new Pen(maBd, 1.1f))
+            using (var mt = new SolidBrush(_apps.Count == 0 ? colMuted : colWhite))
+            {
+                g.FillPath(mb, mp);
+                g.DrawPath(mPen, mp);
+                g.DrawString(maText, _fBtn, mt, muteAllRc, _sfC);
+            }
+            if (_apps.Count > 0)
+            {
+                bool targetMuteAll = !allMutedNow;
+                _hits.Add(new PopupHit
+                {
+                    Rect = muteAllRc,
+                    Click = () =>
+                    {
+                        _audio.SetAllAppsMicrophoneMute(targetMuteAll);
+                        RefreshAppsList(false);
+                        if (_onChanged != null) _onChanged();
+                        Invalidate();
+                    }
+                });
+            }
+
+            // Per-App List Viewport
+            float listTop = 80f;
+            float listH = _logicalH - listTop - 10f;
+            var viewRc = new RectangleF(10f, listTop, LogicalW - 20f, listH);
+
+            if (_apps.Count == 0)
+            {
+                using (GraphicsPath ep = RoundRect(viewRc, 8f))
+                using (var eb = new SolidBrush(colCard))
+                using (var ePen = new Pen(colBorder, 1f))
+                using (var et = new SolidBrush(colMuted))
+                {
+                    g.FillPath(eb, ep);
+                    g.DrawPath(ePen, ep);
+                    g.DrawString("Сейчас ни одна программа или игра
+не использует ваш микрофон.", _fSub, et, viewRc, _sfC);
+                }
+            }
+            else
+            {
+                Region prevClip = g.Clip;
+                g.SetClip(viewRc);
+                for (int i = 0; i < _apps.Count; i++)
+                {
+                    MicCaptureAppItem app = _apps[i];
+                    float ry = listTop + i * 44f - _scrollY;
+                    if (ry + 40f < listTop || ry > viewRc.Bottom) continue;
+
+                    var rowRc = new RectangleF(10f, ry, LogicalW - 20f, 40f);
+                    bool rHov = rowRc.Contains(_mousePt);
+                    using (GraphicsPath rp = RoundRect(rowRc, 8f))
+                    using (var rb = new SolidBrush(rHov ? colCardHov : colCard))
+                    using (var rPen = new Pen(app.IsMuted ? Color.FromArgb(95, 255, 69, 58) : colBorder, 1f))
+                    {
+                        g.FillPath(rb, rp);
+                        g.DrawPath(rPen, rp);
+                    }
+
+                    Bitmap ico = GetCachedAppIcon(app.ExecutablePath);
+                    var icoRc = new RectangleF(rowRc.X + 8f, rowRc.Y + 8f, 24f, 24f);
+                    if (ico != null)
+                    {
+                        g.DrawImage(ico, icoRc);
+                    }
+                    else
+                    {
+                        using (GraphicsPath ip = RoundRect(icoRc, 6f))
+                        using (var ib = new SolidBrush(Color.FromArgb(45, acc1.R, acc1.G, acc1.B)))
+                        using (var it = new SolidBrush(colWhite))
+                        {
+                            g.FillPath(ib, ip);
+                            string ini = app.DisplayName.Substring(0, Math.Min(2, app.DisplayName.Length)).ToUpperInvariant();
+                            g.DrawString(ini, _fBtn, it, icoRc, _sfC);
+                        }
+                    }
+
+                    var toggleRc = new RectangleF(rowRc.Right - 86f, rowRc.Y + 7f, 78f, 26f);
+                    float txtW = Math.Max(60f, toggleRc.Left - (icoRc.Right + 8f) - 6f);
+                    string subTxt = !app.SupportsMute
+                        ? "Мьют сессии недоступен"
+                        : (app.IsMuted ? "● Замучен только здесь" : "● Микрофон активен");
+                    Color subCol = !app.SupportsMute
+                        ? colMuted
+                        : (app.IsMuted ? Color.FromArgb(255, 95, 86) : Color.FromArgb(48, 209, 88));
+
+                    using (var nb = new SolidBrush(colWhite))
+                    using (var sb = new SolidBrush(subCol))
+                    {
+                        g.DrawString(app.DisplayName, _fApp, nb, new RectangleF(icoRc.Right + 8f, rowRc.Y + 4f, txtW, 17f), _sfL);
+                        g.DrawString(subTxt, _fSub, sb, new RectangleF(icoRc.Right + 8f, rowRc.Y + 20f, txtW, 15f), _sfL);
+                    }
+
+                    Color tBg = !app.SupportsMute
+                        ? Color.FromArgb(25, 255, 255, 255)
+                        : (app.IsMuted ? Color.FromArgb(55, 255, 69, 58) : Color.FromArgb(42, 48, 209, 88));
+                    Color tBd = !app.SupportsMute
+                        ? colBorder
+                        : (app.IsMuted ? Color.FromArgb(185, 255, 69, 58) : Color.FromArgb(170, 48, 209, 88));
+                    string tLbl = !app.SupportsMute ? "LOCKED" : (app.IsMuted ? "🔇 МЬЮТ" : "🎙 ВКЛ");
+
+                    using (GraphicsPath tp = RoundRect(toggleRc, 6f))
+                    using (var tb = new SolidBrush(tBg))
+                    using (var tPen = new Pen(tBd, 1f))
+                    using (var tt = new SolidBrush(!app.SupportsMute ? colMuted : colWhite))
+                    {
+                        g.FillPath(tb, tp);
+                        g.DrawPath(tPen, tp);
+                        g.DrawString(tLbl, _fBtn, tt, toggleRc, _sfC);
+                    }
+
+                    if (app.SupportsMute)
+                    {
+                        string capKey = app.ProcessKey;
+                        bool nextMute = !app.IsMuted;
+                        _hits.Add(new PopupHit
+                        {
+                            Rect = rowRc,
+                            Click = () =>
+                            {
+                                _audio.SetAppMicrophoneMute(capKey, nextMute);
+                                RefreshAppsList(false);
+                                if (_onChanged != null) _onChanged();
+                                Invalidate();
+                            }
+                        });
+                    }
+                }
+                g.Clip = prevClip;
+            }
+
+            using (GraphicsPath fp = RoundRect(new RectangleF(0.5f, 0.5f, LogicalW - 1f, _logicalH - 1f), 12f))
+            using (var fPen = new Pen(Color.FromArgb(64, acc1.R, acc1.G, acc1.B), 1f))
+                g.DrawPath(fPen, fp);
+        }
+
+        private PointF ToLogical(Point p)
+        {
+            float s = Math.Max(0.5f, _dpiScale);
+            return new PointF(p.X / s, p.Y / s);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            _mousePt = ToLogical(e.Location);
+            Invalidate();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            PointF pt = ToLogical(e.Location);
+            for (int i = 0; i < _hits.Count; i++)
+            {
+                if (_hits[i].Rect.Contains(pt))
+                {
+                    _hits[i].Click();
+                    return;
+                }
+            }
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            if (_maxScrollY <= 0f || e.Delta == 0) return;
+            _scrollY = Math.Max(0f, Math.Min(_maxScrollY, _scrollY - Math.Sign(e.Delta) * 28f));
+            Invalidate();
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            try { _pollTimer.Stop(); _pollTimer.Dispose(); } catch { }
+            foreach (var kv in _icoCache)
+            {
+                if (kv.Value != null) { try { kv.Value.Dispose(); } catch { } }
+            }
+            _icoCache.Clear();
+            base.OnFormClosed(e);
+        }
+    }
+
     public enum IslandMode { Idle, LiveActivity, Expanded }
 
     public sealed class DynamicIslandOverlayForm : Form
     {
-        private const int CanvasW = 960;
-        private const int CanvasH = 500;
+        private const int CanvasW = 1280;
+        private const int CanvasH = 720;
 
         private IslandConfigData _config;
         private readonly CoreAudioBridge _audio;
@@ -8857,10 +10204,15 @@ namespace DynamicIslandWin
         private long _lastExpandedProgressRedrawTick = 0;
 
         private readonly float[] _eqBars = new float[12] { 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f };
-        private readonly float[] _expEqBars = new float[36];
+        private readonly float[] _expEqBars = new float[48];
         private float _eqPhase = 0f;
         private Color _smoothCoverEq1 = Color.FromArgb(34, 211, 238);
         private Color _smoothCoverEq2 = Color.FromArgb(236, 72, 153);
+        private Color _smoothCoverEq3 = Color.FromArgb(168, 85, 247);
+        private float _layoutScale = 1.0f;
+        private MicCapturePopupForm _micPopup = null;
+        private int _dockScrollOffset = 0;
+        private RectangleF _rcDockRowArea = RectangleF.Empty;
 
         private readonly object _stateLock = new object();
         private string _clockStr = DateTime.Now.ToString("HH:mm");
@@ -8901,8 +10253,7 @@ namespace DynamicIslandWin
             EnsureCachedFonts();
             InitPersistentDibSurface();
 
-            _curW = _config.idle_width;
-            _curH = _config.idle_height;
+            GetEffectiveIdleBounds(out _curW, out _curH);
             _targetW = _curW;
             _targetH = _curH;
 
@@ -8964,6 +10315,42 @@ namespace DynamicIslandWin
             _dibGraphics.CompositingQuality = CompositingQuality.HighSpeed;
         }
 
+        private void GetEffectiveIdleBounds(out float effW, out float effH)
+        {
+            float s = Math.Max(0.80f, Math.Min(1.55f, _layoutScale));
+            float minW = Math.Max(160f, 236f * Math.Min(1.28f, s));
+            float minH = Math.Max(26f, (float)Math.Ceiling(33f * s));
+            effW = Math.Max(_config.idle_width, minW);
+            effH = Math.Max(_config.idle_height, minH);
+            effW = Math.Min(CanvasW - 32f, effW);
+            effH = Math.Min(92f, effH);
+        }
+
+        private void GetEffectiveExpandedBounds(out float effW, out float effH)
+        {
+            float s = Math.Max(0.80f, Math.Min(1.55f, _layoutScale));
+            bool hasRow4 = _config.show_dropzone || _config.show_telemetry;
+            float minW = (float)Math.Ceiling(450f * Math.Max(0.92f, Math.Min(1.42f, s)));
+            float minH = (float)Math.Ceiling((hasRow4 ? 206f : 176f) * Math.Max(0.92f, Math.Min(1.44f, s)));
+
+            int monW = CanvasW - 24;
+            int monH = CanvasH - 28;
+            try
+            {
+                Screen[] scrs = Screen.AllScreens;
+                if (scrs.Length > 0)
+                {
+                    int idx = Math.Max(0, Math.Min(_config.monitor_index, scrs.Length - 1));
+                    monW = Math.Min(monW, scrs[idx].WorkingArea.Width - 16);
+                    monH = Math.Min(monH, scrs[idx].WorkingArea.Height - 24);
+                }
+            }
+            catch { }
+
+            effW = Math.Min(monW, Math.Max(_config.expanded_width, minW));
+            effH = Math.Min(monH, Math.Max(_config.expanded_height, minH));
+        }
+
         private void EnsureCachedFonts()
         {
             int scalePct = Math.Max(75, Math.Min(160, _config.ui_scale_percent));
@@ -8973,7 +10360,11 @@ namespace DynamicIslandWin
             if (scalePct == _cachedFontScalePct && dpi == _cachedWindowDpi && _fontCompact != null && _fontMono != null) return;
             _cachedFontScalePct = scalePct;
             _cachedWindowDpi = dpi;
-            float s = scalePct / 100f;
+
+            // Normalized pixel typography: honors both user UI scale (80..150%) and Windows DPI (100..200%) without overflowing fixed pixel buttons
+            float userScale = scalePct / 100f;
+            float dpiBoost = 1.0f + Math.Max(0f, (dpi / 96f) - 1.0f) * 0.45f;
+            _layoutScale = Math.Max(0.80f, Math.Min(1.58f, userScale * dpiBoost));
 
             if (_fontCompact != null) _fontCompact.Dispose();
             if (_fontTitle != null) _fontTitle.Dispose();
@@ -8982,12 +10373,12 @@ namespace DynamicIslandWin
             if (_fontMono != null) _fontMono.Dispose();
             if (_fontMonoCompact != null) _fontMonoCompact.Dispose();
 
-            _fontCompact = new Font("Segoe UI Semibold", 9.5f * s, FontStyle.Bold);
-            _fontTitle = new Font("Segoe UI Semibold", 10.2f * s, FontStyle.Bold);
-            _fontSub = new Font("Segoe UI", 8.5f * s, FontStyle.Regular);
-            _fontSmall = new Font("Segoe UI Semibold", 7.9f * s, FontStyle.Bold);
-            _fontMono = new Font("Consolas", 8.3f * s, FontStyle.Bold);
-            _fontMonoCompact = new Font("Consolas", 9.6f * s, FontStyle.Bold);
+            _fontCompact = new Font("Segoe UI Semibold", 12.6f * _layoutScale, FontStyle.Bold, GraphicsUnit.Pixel);
+            _fontTitle = new Font("Segoe UI Semibold", 13.5f * _layoutScale, FontStyle.Bold, GraphicsUnit.Pixel);
+            _fontSub = new Font("Segoe UI", 11.3f * _layoutScale, FontStyle.Regular, GraphicsUnit.Pixel);
+            _fontSmall = new Font("Segoe UI Semibold", 10.5f * _layoutScale, FontStyle.Bold, GraphicsUnit.Pixel);
+            _fontMono = new Font("Consolas", 11.0f * _layoutScale, FontStyle.Bold, GraphicsUnit.Pixel);
+            _fontMonoCompact = new Font("Consolas", 12.8f * _layoutScale, FontStyle.Bold, GraphicsUnit.Pixel);
         }
 
         private void OnDisplaySettingsChanged(object sender, EventArgs e)
@@ -9421,9 +10812,11 @@ namespace DynamicIslandWin
                 lock (_stateLock) { snapNow = _currentMedia; }
                 PlayerFavoriteEngine.RequestSyncStateAsync(snapNow, Volatile.Read(ref _likeActionGeneration), ApplySyncedFavoriteResult);
             }
-            if (_mode == IslandMode.Expanded && !_isAnimating) return;
+            float ew, eh;
+            GetEffectiveExpandedBounds(out ew, out eh);
+            if (_mode == IslandMode.Expanded && !_isAnimating && Math.Abs(_curW - ew) < 1f && Math.Abs(_curH - eh) < 1f) return;
             _mode = IslandMode.Expanded;
-            StartSpringTransition(_config.expanded_width, _config.expanded_height, 1.0f, _config.anim_duration_ms, true);
+            StartSpringTransition(ew, eh, 1.0f, _config.anim_duration_ms, true);
         }
 
         public void CollapseToIdle()
@@ -9431,7 +10824,9 @@ namespace DynamicIslandWin
             if (_isHovered || _lctrlHeld || _isResizingWithLCtrl || _expandedPage == 1 || _isDraggingDockApp || Volatile.Read(ref _ownDialogOrMenuDepth) > 0) return;
             _liveBannerText = "";
             _mode = IslandMode.Idle;
-            StartSpringTransition(_config.idle_width, _config.idle_height, 0.0f, Math.Max(130, (int)(_config.anim_duration_ms * 0.80f)), false);
+            float iw, ih;
+            GetEffectiveIdleBounds(out iw, out ih);
+            StartSpringTransition(iw, ih, 0.0f, Math.Max(130, (int)(_config.anim_duration_ms * 0.80f)), false);
         }
 
         public void TriggerLiveActivity(string bannerText, int holdMs = 1850)
@@ -9616,9 +11011,9 @@ namespace DynamicIslandWin
             }
 
             // MODULE 2 & 5: Pulsing Microphone Glow & Download Watchdog Border Wave
-            if (_config.enable_mic_indicator && _audio.IsMicActive && !_audio.IsMicMuted)
+            if (_config.enable_mic_indicator && _audio.IsMicActive && _audio.MicSummaryState != MicCaptureSummaryState.AllMuted)
             {
-                _micPulsePhase += 0.11f;
+                _micPulsePhase += (_audio.MicSummaryState == MicCaptureSummaryState.PartiallyMuted) ? 0.07f : 0.11f;
                 needsRedraw = true;
             }
             if (_watchdog.IsActiveDownloadDetected || _watchdog.IsWatchdogArmed || _watchdog.IsCountdownActive)
@@ -9650,7 +11045,9 @@ namespace DynamicIslandWin
                 needsRedraw = true;
             }
 
-            if (!gameThrottle && (_mode != IslandMode.Expanded || _expandedPage != 1) && _config.eq_style != "Выкл" && _config.eq_style != "Off")
+            bool wantCompactEq = (_config.eq_style != "Выкл" && _config.eq_style != "Off");
+            bool wantExpEq = (_config.exp_eq_style != "Выкл" && _config.exp_eq_style != "Off");
+            if (!gameThrottle && (_mode != IslandMode.Expanded || _expandedPage != 1) && (wantCompactEq || wantExpEq))
             {
                 float masterPeak, leftPeak, rightPeak;
                 _audio.SampleAudioPeaks(out masterPeak, out leftPeak, out rightPeak);
@@ -9661,19 +11058,28 @@ namespace DynamicIslandWin
                 float releaseRate = Math.Max(0.07f, 0.42f - smoothNorm * 0.33f);
                 float idleDecay = 0.64f + smoothNorm * 0.30f;
 
-                float boostedL = (float)Math.Pow(Math.Max(0f, leftPeak), 0.50) * sensGain;
-                float boostedR = (float)Math.Pow(Math.Max(0f, rightPeak), 0.50) * sensGain;
-                float boostedM = (float)Math.Pow(Math.Max(0f, masterPeak), 0.48) * sensGain;
+                float expSensGain = Math.Max(0.35f, Math.Min(1.80f, _config.exp_eq_height_pct / 100f));
+                float expSmoothNorm = Math.Max(0.10f, Math.Min(0.95f, _config.exp_eq_smoothing_pct / 100f));
+                float expAttackRate = Math.Max(0.18f, 0.74f - expSmoothNorm * 0.52f);
+                float expReleaseRate = Math.Max(0.07f, 0.42f - expSmoothNorm * 0.33f);
+                float expIdleDecay = 0.64f + expSmoothNorm * 0.30f;
+
+                float rawL = (float)Math.Pow(Math.Max(0f, leftPeak), 0.50);
+                float rawR = (float)Math.Pow(Math.Max(0f, rightPeak), 0.50);
+                float rawM = (float)Math.Pow(Math.Max(0f, masterPeak), 0.48);
 
                 bool audioActive = (masterPeak > 0.0025f) && !_audio.LastMuted;
                 if (!audioActive && _currentMedia.IsPlaying && !_audio.LastMuted)
                 {
-                    boostedM = 0.46f * sensGain; boostedL = 0.43f * sensGain; boostedR = 0.43f * sensGain;
+                    rawM = 0.46f; rawL = 0.43f; rawR = 0.43f;
                     audioActive = true;
                 }
 
+                float boostedL = rawL * sensGain, boostedR = rawR * sensGain, boostedM = rawM * sensGain;
+                float expBoostL = rawL * expSensGain, expBoostR = rawR * expSensGain, expBoostM = rawM * expSensGain;
+
                 // Smoothly cross-fade cover-adaptive equalizer colors when "Обложка трека" mode is active
-                if (_config.eq_color_mode == "Обложка трека")
+                if (_config.eq_color_mode == "Обложка трека" || _config.exp_eq_color_mode == "Обложка трека")
                 {
                     Color targetC1, targetC2;
                     if (_currentMedia != null && _currentMedia.HasCoverColors)
@@ -9685,11 +11091,13 @@ namespace DynamicIslandWin
                     {
                         GetThemeAccentColors(255, out targetC1, out targetC2);
                     }
+                    Color targetC3 = ColorThemeUtils.BoostVibrance(ColorThemeUtils.Blend(targetC1, targetC2, 0.5f), 0.62f);
                     if (Math.Abs(_smoothCoverEq1.R - targetC1.R) + Math.Abs(_smoothCoverEq1.G - targetC1.G) + Math.Abs(_smoothCoverEq1.B - targetC1.B) > 3 ||
                         Math.Abs(_smoothCoverEq2.R - targetC2.R) + Math.Abs(_smoothCoverEq2.G - targetC2.G) + Math.Abs(_smoothCoverEq2.B - targetC2.B) > 3)
                     {
                         _smoothCoverEq1 = ColorThemeUtils.Blend(_smoothCoverEq1, targetC1, 0.16f);
                         _smoothCoverEq2 = ColorThemeUtils.Blend(_smoothCoverEq2, targetC2, 0.16f);
+                        _smoothCoverEq3 = ColorThemeUtils.Blend(_smoothCoverEq3, targetC3, 0.16f);
                         needsRedraw = true;
                     }
                 }
@@ -9697,40 +11105,50 @@ namespace DynamicIslandWin
                 int compactBands = Math.Max(4, Math.Min(_eqBars.Length, _config.eq_bar_count));
                 if (audioActive)
                 {
-                    _eqPhase += (0.26f + Math.Min(1.3f, boostedM) * 0.36f) * (1.18f - smoothNorm * 0.45f);
-                    for (int i = 0; i < compactBands; i++)
+                    float activeSmooth = (_mode == IslandMode.Expanded) ? expSmoothNorm : smoothNorm;
+                    _eqPhase += (0.26f + Math.Min(1.3f, rawM) * 0.36f) * (1.18f - activeSmooth * 0.45f);
+                    if (wantCompactEq && _curProg < 0.95f)
                     {
-                        float normI = compactBands > 1 ? (i / (float)(compactBands - 1)) : 0.5f;
-                        float chanPeak = (normI < 0.34f) ? boostedL : (normI > 0.66f ? boostedR : boostedM);
-                        float bell = 0.66f + 0.38f * (float)Math.Sin(normI * Math.PI);
-                        float harmonic = 0.72f
-                            + 0.26f * (float)Math.Sin(_eqPhase * (1.15f + (i % 3) * 0.28f) + i * 0.85f)
-                            + 0.16f * (float)Math.Cos(_eqPhase * 1.55f - i * 0.62f);
-                        float target = Math.Max(0.08f, Math.Min(1.0f, chanPeak * harmonic * bell));
-                        float rate = (target > _eqBars[i]) ? attackRate : releaseRate;
-                        float nextVal = _eqBars[i] + (target - _eqBars[i]) * rate;
-                        if (Math.Abs(nextVal - _eqBars[i]) > 0.004f)
+                        for (int i = 0; i < compactBands; i++)
                         {
-                            _eqBars[i] = nextVal;
-                            needsRedraw = true;
+                            float normI = compactBands > 1 ? (i / (float)(compactBands - 1)) : 0.5f;
+                            float chanPeak = (normI < 0.34f) ? boostedL : (normI > 0.66f ? boostedR : boostedM);
+                            float bell = 0.66f + 0.38f * (float)Math.Sin(normI * Math.PI);
+                            float harmonic = 0.72f
+                                + 0.26f * (float)Math.Sin(_eqPhase * (1.15f + (i % 3) * 0.28f) + i * 0.85f)
+                                + 0.16f * (float)Math.Cos(_eqPhase * 1.55f - i * 0.62f);
+                            float target = Math.Max(0.08f, Math.Min(1.0f, chanPeak * harmonic * bell));
+                            float rate = (target > _eqBars[i]) ? attackRate : releaseRate;
+                            float nextVal = _eqBars[i] + (target - _eqBars[i]) * rate;
+                            if (Math.Abs(nextVal - _eqBars[i]) > 0.004f)
+                            {
+                                _eqBars[i] = nextVal;
+                                needsRedraw = true;
+                            }
                         }
                     }
 
-                    for (int i = 0; i < _expEqBars.Length; i++)
+                    if (wantExpEq && _curProg > 0.05f)
                     {
-                        float normX = i / (float)(_expEqBars.Length - 1);
-                        float centerBell = 0.52f + 0.48f * (float)Math.Sin(normX * Math.PI);
-                        float chanPeak = (normX < 0.38f) ? boostedL : (normX > 0.62f ? boostedR : boostedM);
-                        float wave = 0.68f
-                            + 0.24f * (float)Math.Sin(_eqPhase * 1.35f + i * 0.52f)
-                            + 0.18f * (float)Math.Cos(_eqPhase * 0.95f - i * 0.37f);
-                        float target = Math.Max(0.06f, Math.Min(1.0f, chanPeak * wave * centerBell));
-                        float rate = (target > _expEqBars[i]) ? attackRate : releaseRate;
-                        float nextVal = _expEqBars[i] + (target - _expEqBars[i]) * rate;
-                        if (Math.Abs(nextVal - _expEqBars[i]) > 0.004f)
+                        int expCount = Math.Max(8, Math.Min(_expEqBars.Length, _config.exp_eq_bar_count));
+                        for (int i = 0; i < expCount; i++)
                         {
-                            _expEqBars[i] = nextVal;
-                            needsRedraw = true;
+                            float normX = expCount > 1 ? (i / (float)(expCount - 1)) : 0.5f;
+                            float centerBell = (_config.exp_eq_style == "Круговой")
+                                ? (0.76f + 0.24f * (float)Math.Sin(normX * Math.PI * 2.0))
+                                : (0.52f + 0.48f * (float)Math.Sin(normX * Math.PI));
+                            float chanPeak = (normX < 0.38f) ? expBoostL : (normX > 0.62f ? expBoostR : expBoostM);
+                            float wave = 0.68f
+                                + 0.24f * (float)Math.Sin(_eqPhase * 1.35f + i * 0.52f)
+                                + 0.18f * (float)Math.Cos(_eqPhase * 0.95f - i * 0.37f);
+                            float target = Math.Max(0.06f, Math.Min(1.35f, chanPeak * wave * centerBell));
+                            float rate = (target > _expEqBars[i]) ? expAttackRate : expReleaseRate;
+                            float nextVal = _expEqBars[i] + (target - _expEqBars[i]) * rate;
+                            if (Math.Abs(nextVal - _expEqBars[i]) > 0.004f)
+                            {
+                                _expEqBars[i] = nextVal;
+                                needsRedraw = true;
+                            }
                         }
                     }
                 }
@@ -9748,7 +11166,7 @@ namespace DynamicIslandWin
                     {
                         if (_expEqBars[i] > 0.065f)
                         {
-                            _expEqBars[i] = Math.Max(0.05f, _expEqBars[i] * idleDecay);
+                            _expEqBars[i] = Math.Max(0.05f, _expEqBars[i] * expIdleDecay);
                             needsRedraw = true;
                         }
                     }
@@ -9820,7 +11238,7 @@ namespace DynamicIslandWin
             bool cursorNearTop = (localPt.Y >= -20 && localPt.Y <= 125 && localPt.X >= 80 && localPt.X <= CanvasW - 80);
             bool activeVisuals = _isAnimating || _isHovered || _lctrlHeld || _isResizingWithLCtrl ||
                                  _mode != IslandMode.Idle || _bgEngine.IsAnimated ||
-                                 (_currentMedia.IsPlaying && _config.eq_style != "Выкл") ||
+                                 (_currentMedia.IsPlaying && (_config.eq_style != "Выкл" || _config.exp_eq_style != "Выкл")) ||
                                  (_config.enable_mic_indicator && _audio.IsMicActive && !_audio.IsMicMuted) ||
                                  _watchdog.IsActiveDownloadDetected || _watchdog.IsCountdownActive || _updater.IsDownloading;
 
@@ -10160,12 +11578,22 @@ namespace DynamicIslandWin
                 int step = e.Delta > 0 ? 5 : -5;
                 _config.ui_scale_percent = Math.Max(80, Math.Min(150, _config.ui_scale_percent + step));
                 EnsureCachedFonts();
+                if (_mode == IslandMode.Expanded) GetEffectiveExpandedBounds(out _curW, out _curH);
+                else GetEffectiveIdleBounds(out _curW, out _curH);
+                _targetW = _curW; _targetH = _curH;
                 ConfigManager.Save(_config);
                 RenderLayeredFrame();
                 return;
             }
 
             PointF pt = new PointF(e.X, e.Y);
+            if (_mode == IslandMode.Expanded && _expandedPage == 0 && _rcDockRowArea.Width > 0 && _rcDockRowArea.Contains(pt) && _config.pinned_apps.Count > _dockVisibleCount)
+            {
+                int maxOff = Math.Max(0, _config.pinned_apps.Count - Math.Max(1, _dockVisibleCount));
+                _dockScrollOffset = Math.Max(0, Math.Min(maxOff, _dockScrollOffset + (e.Delta > 0 ? -1 : 1)));
+                RenderLayeredFrame();
+                return;
+            }
             if (_mode == IslandMode.Expanded && _rcMusicVolCard.Contains(pt))
             {
                 _audio.SetMusicVolume(_audio.LastMusicVolume + (e.Delta > 0 ? 2 : -2), _currentMedia.AppId);
@@ -10229,15 +11657,32 @@ namespace DynamicIslandWin
                     }
                     if (_config.enable_mic_indicator && _rcCompactMicBtn.Width > 0 && _rcCompactMicBtn.Contains(pt))
                     {
-                        _audio.ToggleMicrophoneMute();
-                        TriggerLiveActivity(_audio.IsMicMuted ? "🎙✕ Микрофон отключён (Muted)" : "🎙 Микрофон включён", 1600);
-                        RenderLayeredFrame();
+                        ToggleMicCapturePopup(new Point(Left + (int)(_rcCompactMicBtn.X + _rcCompactMicBtn.Width * 0.5f), Top + (int)pill.Bottom + 6));
                         return;
                     }
                     ExpandIsland();
                 }
-                else if (e.Button == MouseButtons.Right) OpenSettingsDialog();
-                else if (e.Button == MouseButtons.Middle) MultiPlayerMediaController.ActivatePlayerWindowAsync(_currentMedia);
+                else if (e.Button == MouseButtons.Right)
+                {
+                    if (_config.enable_mic_indicator && _rcCompactMicBtn.Width > 0 && _rcCompactMicBtn.Contains(pt))
+                    {
+                        _audio.ToggleMicrophoneMute();
+                        TriggerLiveActivity(_audio.MicSummaryState == MicCaptureSummaryState.AllMuted ? "🔇 Все приложения в мьюте" : "🎙 Все приложения размучены", 1600);
+                        RenderLayeredFrame();
+                        return;
+                    }
+                    OpenSettingsDialog();
+                }
+                else if (e.Button == MouseButtons.Middle)
+                {
+                    if (_config.enable_mic_indicator && _rcCompactMicBtn.Width > 0 && _rcCompactMicBtn.Contains(pt))
+                    {
+                        _audio.ToggleMicrophoneMute();
+                        RenderLayeredFrame();
+                        return;
+                    }
+                    MultiPlayerMediaController.ActivatePlayerWindowAsync(_currentMedia);
+                }
                 return;
             }
 
@@ -10480,8 +11925,7 @@ namespace DynamicIslandWin
                 }
                 if (_rcExpandedMicBtn.Width > 0 && _rcExpandedMicBtn.Contains(pt))
                 {
-                    _audio.ToggleMicrophoneMute();
-                    RenderLayeredFrame();
+                    ToggleMicCapturePopup(new Point(Left + (int)(_rcExpandedMicBtn.X + _rcExpandedMicBtn.Width * 0.5f), Top + (int)pill.Bottom + 6));
                     return;
                 }
                 if (_rcExpandedVaultBtn.Width > 0 && _rcExpandedVaultBtn.Contains(pt))
@@ -10510,6 +11954,12 @@ namespace DynamicIslandWin
                 if (_expandedPage == 1)
                 {
                     ShowStreamSourceMenu(PointToScreen(e.Location));
+                    return;
+                }
+                if (_rcExpandedMicBtn.Width > 0 && _rcExpandedMicBtn.Contains(pt))
+                {
+                    _audio.ToggleMicrophoneMute();
+                    RenderLayeredFrame();
                     return;
                 }
                 if (_rcPlayerBadge.Contains(pt) || _rcSongClickZone.Contains(pt))
@@ -11181,8 +12631,8 @@ namespace DynamicIslandWin
                         _bgEngine.EnsureLoaded(_config.custom_bg_path);
                         EnsureCachedFonts();
                         _collapseTimer.Interval = Math.Max(100, _config.collapse_delay_ms);
-                        _curW = (_mode == IslandMode.Expanded) ? _config.expanded_width : _config.idle_width;
-                        _curH = (_mode == IslandMode.Expanded) ? _config.expanded_height : _config.idle_height;
+                        if (_mode == IslandMode.Expanded) GetEffectiveExpandedBounds(out _curW, out _curH);
+                        else GetEffectiveIdleBounds(out _curW, out _curH);
                         _targetW = _curW;
                         _targetH = _curH;
                         PositionOnMonitor(_config.monitor_index);
@@ -11256,6 +12706,100 @@ namespace DynamicIslandWin
                 }
             }
             GetThemeAccentColors(a, out eq1, out eq2);
+        }
+
+        private void ToggleMicCapturePopup(Point anchorScreenPt)
+        {
+            if (_micPopup != null && !_micPopup.IsDisposed)
+            {
+                try { _micPopup.Close(); } catch { }
+                _micPopup = null;
+                return;
+            }
+
+            Interlocked.Increment(ref _ownDialogOrMenuDepth);
+            _collapseTimer.Stop();
+            var pop = new MicCapturePopupForm(_audio, _config, () =>
+            {
+                _bgStateDirty = true;
+                RenderLayeredFrame();
+            });
+            _micPopup = pop;
+            pop.FormClosed += (s, e) =>
+            {
+                if (ReferenceEquals(_micPopup, pop)) _micPopup = null;
+                if (Interlocked.Decrement(ref _ownDialogOrMenuDepth) < 0)
+                    Interlocked.Exchange(ref _ownDialogOrMenuDepth, 0);
+                if (!_isHovered && _mode == IslandMode.Expanded && _expandedPage != 1)
+                {
+                    _collapseTimer.Interval = Math.Max(180, _config.collapse_delay_ms);
+                    _collapseTimer.Start();
+                }
+                AssertIslandTopMostSafe(false, false);
+                RenderLayeredFrame();
+            };
+            pop.PositionBelowAnchor(anchorScreenPt);
+            pop.Show();
+        }
+
+        private void GetExpandedEqualizerPalette(int alpha, out Color c1, out Color c2, out Color c3, out bool useThreeStops)
+        {
+            int a = Math.Max(0, Math.Min(255, alpha));
+            string mode = _config.exp_eq_color_mode ?? "Градиент темы";
+            useThreeStops = false;
+            if (mode == "Один цвет")
+            {
+                Color p1 = ColorThemeUtils.ParseHex(_config.exp_eq_color1_hex, Color.FromArgb(34, 211, 238));
+                c1 = Color.FromArgb(a, p1.R, p1.G, p1.B);
+                c2 = c1; c3 = c1;
+                return;
+            }
+            if (mode == "Градиент 2 цвета")
+            {
+                Color p1 = ColorThemeUtils.ParseHex(_config.exp_eq_color1_hex, Color.FromArgb(34, 211, 238));
+                Color p2 = ColorThemeUtils.ParseHex(_config.exp_eq_color2_hex, Color.FromArgb(168, 85, 247));
+                c1 = Color.FromArgb(a, p1.R, p1.G, p1.B);
+                c2 = Color.FromArgb(a, p2.R, p2.G, p2.B);
+                c3 = c2;
+                return;
+            }
+            if (mode == "Градиент 3 цвета")
+            {
+                Color p1 = ColorThemeUtils.ParseHex(_config.exp_eq_color1_hex, Color.FromArgb(34, 211, 238));
+                Color p2 = ColorThemeUtils.ParseHex(_config.exp_eq_color2_hex, Color.FromArgb(168, 85, 247));
+                Color p3 = ColorThemeUtils.ParseHex(_config.exp_eq_color3_hex, Color.FromArgb(236, 72, 153));
+                c1 = Color.FromArgb(a, p1.R, p1.G, p1.B);
+                c2 = Color.FromArgb(a, p2.R, p2.G, p2.B);
+                c3 = Color.FromArgb(a, p3.R, p3.G, p3.B);
+                useThreeStops = true;
+                return;
+            }
+            if (mode == "Обложка трека" && _currentMedia != null && _currentMedia.HasCoverColors)
+            {
+                c1 = Color.FromArgb(a, _smoothCoverEq1.R, _smoothCoverEq1.G, _smoothCoverEq1.B);
+                c2 = Color.FromArgb(a, _smoothCoverEq2.R, _smoothCoverEq2.G, _smoothCoverEq2.B);
+                c3 = Color.FromArgb(a, _smoothCoverEq3.R, _smoothCoverEq3.G, _smoothCoverEq3.B);
+                useThreeStops = true;
+                return;
+            }
+            GetThemeAccentColors(a, out c1, out c2);
+            c3 = c2;
+        }
+
+        private static void DrawVectorMicIcon3State(Graphics g, RectangleF rc, MicCaptureSummaryState state, Color color)
+        {
+            DrawVectorMicIcon(g, rc, state == MicCaptureSummaryState.AllMuted, color);
+            if (state == MicCaptureSummaryState.PartiallyMuted)
+            {
+                float bx = rc.Right - 5.2f;
+                float by = rc.Bottom - 5.2f;
+                using (var bg = new SolidBrush(Color.FromArgb(color.A, 14, 16, 22)))
+                using (var fg = new SolidBrush(Color.FromArgb(color.A, 255, 179, 25)))
+                {
+                    g.FillEllipse(bg, bx - 0.8f, by - 0.8f, 5.6f, 5.6f);
+                    g.FillEllipse(fg, bx, by, 4.0f, 4.0f);
+                }
+            }
         }
 
         private RectangleF ApplyMicroInteraction(Graphics g, RectangleF rc, float cornerRadius, int alpha, Color accentCol, bool isCircle = false)
@@ -11635,15 +13179,21 @@ namespace DynamicIslandWin
                             g.DrawPath(neonPen, capsulePath);
                     }
 
-                    // MODULE 2: Microphone Active Pulsing Glow / Muted Static Red-Orange Contour
-                    if (_config.enable_mic_indicator && (_audio.IsMicActive || _audio.IsMicMuted))
+                    // MODULE 2: 3-State Per-App Microphone Contour (Green = Active, Amber = Partial Mute, Red = All Muted)
+                    if (_config.enable_mic_indicator && _audio.MicSummaryState != MicCaptureSummaryState.Idle)
                     {
-                        if (_audio.IsMicMuted)
+                        if (_audio.MicSummaryState == MicCaptureSummaryState.AllMuted)
                         {
-                            using (var mutePen = new Pen(Color.FromArgb(220, 255, 69, 58), 1.65f))
+                            using (var mutePen = new Pen(Color.FromArgb(225, 255, 69, 58), 1.65f))
                                 g.DrawPath(mutePen, capsulePath);
                         }
-                        else if (_audio.IsMicActive)
+                        else if (_audio.MicSummaryState == MicCaptureSummaryState.PartiallyMuted)
+                        {
+                            int ambA = 135 + (int)(85 * (0.5f + 0.5f * (float)Math.Sin(_micPulsePhase)));
+                            using (var partPen = new Pen(Color.FromArgb(Math.Min(255, ambA), 245, 158, 11), 1.70f))
+                                g.DrawPath(partPen, capsulePath);
+                        }
+                        else
                         {
                             int pulseA = 110 + (int)(115 * (0.5f + 0.5f * (float)Math.Sin(_micPulsePhase)));
                             using (var micPen = new Pen(Color.FromArgb(Math.Min(255, pulseA), 48, 209, 88), 1.75f))
@@ -11817,27 +13367,34 @@ namespace DynamicIslandWin
             else if (_config.show_clock)
                 leftText = _clockStr;
 
+            float cs = Math.Max(0.85f, Math.Min(1.35f, _layoutScale));
             float leftX = pill.Left + 11f;
-            float clockW = string.IsNullOrEmpty(leftText) ? 0f : 42f;
+            float clockW = string.IsNullOrEmpty(leftText) ? 0f : (42f * cs);
             if (!string.IsNullOrEmpty(leftText))
             {
                 Color leftCol = _pomoRunning ? acc1 : Color.FromArgb(alpha, 252, 252, 255);
-                DrawContrastText(g, leftText, _fontMonoCompact, leftCol, new RectangleF(leftX, pill.Top, 50f, pill.Height), _sfLeft);
+                DrawContrastText(g, leftText, _fontMonoCompact, leftCol, new RectangleF(leftX, pill.Top, clockW + 8f, pill.Height), _sfLeft);
             }
 
-            // MODULE 2: Compact Microphone Active / Muted Icon (1-click mute toggle)
-            if (_config.enable_mic_indicator && (_audio.IsMicActive || _audio.IsMicMuted))
+            // MODULE 2: Compact 3-State Microphone Button (Left-click = Per-App Selector, Right-click = Mute All)
+            if (_config.enable_mic_indicator && _audio.MicSummaryState != MicCaptureSummaryState.Idle)
             {
+                float micW = Math.Max(22f, 22f * Math.Min(1.20f, cs));
+                float micH = Math.Max(20f, Math.Min(pill.Height - 6f, 20f * Math.Min(1.20f, cs)));
                 float micX = leftX + clockW + 2f;
-                _rcCompactMicBtn = new RectangleF(micX, pill.Top + (pill.Height - 20f) / 2f, 22f, 20f);
-                Color micCol = _audio.IsMicMuted ? Color.FromArgb(alpha, 255, 69, 58) : Color.FromArgb(alpha, 48, 209, 88);
+                _rcCompactMicBtn = new RectangleF(micX, pill.Top + (pill.Height - micH) / 2f, micW, micH);
+                Color micCol = _audio.MicSummaryState == MicCaptureSummaryState.AllMuted
+                    ? Color.FromArgb(alpha, 255, 69, 58)
+                    : (_audio.MicSummaryState == MicCaptureSummaryState.PartiallyMuted
+                        ? Color.FromArgb(alpha, 245, 158, 11)
+                        : Color.FromArgb(alpha, 48, 209, 88));
                 using (GraphicsPath mp = CreateRoundedRectPath(_rcCompactMicBtn, 6f))
                 using (var mb = new SolidBrush(Color.FromArgb((int)(alpha * 0.24f), micCol.R, micCol.G, micCol.B)))
                 {
                     g.FillPath(mb, mp);
                 }
-                DrawVectorMicIcon(g, _rcCompactMicBtn, _audio.IsMicMuted, micCol);
-                clockW += 24f;
+                DrawVectorMicIcon3State(g, _rcCompactMicBtn, _audio.MicSummaryState, micCol);
+                clockW += micW + 4f;
             }
             else if (_watchdog.IsActiveDownloadDetected && _watchdog.CurrentDownMBps >= 0.5f)
             {
@@ -12052,14 +13609,15 @@ namespace DynamicIslandWin
 
             var activeSrc = _streamEngine.GetActiveSource(Handle);
 
-            // Top Control Strip: [ ● LIVE • Discord / YouTube ▾ ]   [ 16:9 Видео ] [ ↗ Окно ]
-            float openBtnW = 58f;
-            float cropBtnW = 84f;
-            float srcBtnW = Math.Max(120f, innerW - openBtnW - cropBtnW - 12f);
-
-            _rcStreamSourceBtn = new RectangleF(padX, topY, srcBtnW, 24f);
-            _rcStreamCropBtn = new RectangleF(_rcStreamSourceBtn.Right + 6f, topY, cropBtnW, 24f);
-            _rcStreamOpenBtn = new RectangleF(_rcStreamCropBtn.Right + 6f, topY, openBtnW, 24f);
+            // Top Control Strip (Right-Anchored Priority Buttons): [ ● LIVE • Discord / YouTube ▾ ]   [ 16:9 Видео ] [ ↗ Окно ]
+            float rs2 = Math.Max(0.90f, Math.Min(1.28f, _layoutScale));
+            float topBarH = Math.Max(24f, 24f * rs2);
+            float openBtnW = Math.Max(56f, 62f * rs2);
+            float cropBtnW = Math.Max(80f, 88f * rs2);
+            _rcStreamOpenBtn = new RectangleF(rightX - openBtnW, topY, openBtnW, topBarH);
+            _rcStreamCropBtn = new RectangleF(_rcStreamOpenBtn.Left - 6f - cropBtnW, topY, cropBtnW, topBarH);
+            float srcBtnW = Math.Max(84f, _rcStreamCropBtn.Left - 6f - padX);
+            _rcStreamSourceBtn = new RectangleF(padX, topY, srcBtnW, topBarH);
 
             using (var brBar = new SolidBrush(barFill))
             using (var penBar = new Pen(barBorder, 1f))
@@ -12088,7 +13646,7 @@ namespace DynamicIslandWin
             DrawContrastText(g, "↗ Окно", _fontSmall, colMuted, _rcStreamOpenBtn, _sfCenter);
 
             // Live Video Stream Viewport (fills remaining height of expanded island)
-            float viewY = topY + 29f;
+            float viewY = _rcStreamSourceBtn.Bottom + 5f;
             float viewH = Math.Max(80f, pill.Bottom - viewY - 10f);
             _rcStreamViewport = new RectangleF(padX, viewY, innerW, viewH);
 
@@ -12139,15 +13697,19 @@ namespace DynamicIslandWin
             using (var brCard = new SolidBrush(cardFill))
             using (var penCard = new Pen(cardBorder, 1f))
             {
-                // SECTION 1: Screenshot Session Vault Gallery
-                var vaultHeaderRc = new RectangleF(padX, curY, innerW - 190f, 22f);
+                // SECTION 1: Screenshot Session Vault Gallery (Right-Anchored Priority Action Buttons)
+                float rs3 = Math.Max(0.90f, Math.Min(1.28f, _layoutScale));
+                float vBtnH = Math.Max(22f, 22f * rs3);
+                float clrW = Math.Max(72f, 80f * rs3);
+                float delW = Math.Max(98f, 110f * rs3);
+                _rcVaultClearAllBtn = new RectangleF(rightX - clrW, curY, clrW, vBtnH);
+                _rcVaultDeleteSelectedBtn = new RectangleF(_rcVaultClearAllBtn.Left - 6f - delW, curY, delW, vBtnH);
+
+                var vaultHeaderRc = new RectangleF(padX, curY, Math.Max(60f, _rcVaultDeleteSelectedBtn.Left - 8f - padX), vBtnH);
                 int selCount = _screenshotVault.SelectedCount;
                 int totalCaps = _screenshotVault.Count;
-                DrawContrastText(g, string.Format("📸 Хранилище скриншотов сессии ({0})  •  Клик: в буфер  •  Тянуть: в Discord", totalCaps),
+                DrawContrastText(g, string.Format("📸 Хранилище ({0})  •  Клик: в буфер  •  Тянуть: в Discord", totalCaps),
                     _fontSmall, colWhite, vaultHeaderRc, _sfLeft);
-
-                _rcVaultDeleteSelectedBtn = new RectangleF(rightX - 184f, curY, 106f, 22f);
-                _rcVaultClearAllBtn = new RectangleF(rightX - 72f, curY, 72f, 22f);
 
                 using (GraphicsPath pDel = CreateRoundedRectPath(_rcVaultDeleteSelectedBtn, 7f))
                 using (GraphicsPath pClr = CreateRoundedRectPath(_rcVaultClearAllBtn, 7f))
@@ -12159,11 +13721,12 @@ namespace DynamicIslandWin
                 }
                 DrawContrastText(g, selCount > 0 ? ("Удалить (" + selCount + ")") : "Удалить выбр.", _fontSmall,
                     selCount > 0 ? Color.FromArgb(alpha, 255, 110, 100) : colMuted, _rcVaultDeleteSelectedBtn, _sfCenter);
-                DrawContrastText(g, "Очистить всё", _fontSmall, totalCaps > 0 ? colWhite : colMuted, _rcVaultClearAllBtn, _sfCenter);
+                DrawContrastText(g, "Очистить", _fontSmall, totalCaps > 0 ? colWhite : colMuted, _rcVaultClearAllBtn, _sfCenter);
 
-                curY += 26f;
+                curY += vBtnH + 5f;
 
-                float galleryH = Math.Max(78f, pill.Height - 122f);
+                float reservedBottom = 36f * rs3 + 26f * rs3 + 12f;
+                float galleryH = Math.Max(62f, pill.Bottom - curY - reservedBottom);
                 var galleryRc = new RectangleF(padX, curY, innerW, galleryH);
                 using (GraphicsPath gp = CreateRoundedRectPath(galleryRc, 12f))
                 {
@@ -12369,106 +13932,158 @@ namespace DynamicIslandWin
         {
             float padX = pill.Left + 18f;
             float rightX = pill.Right - 16f;
-            float innerW = rightX - padX;
-            float availH = pill.Height - 24f;
-            float rowGap = Math.Max(5f, (availH - 166f) / 3.5f);
-            float curY = pill.Top + 12f;
+            float innerW = Math.Max(220f, rightX - padX);
+            float availH = Math.Max(140f, pill.Height - 22f);
 
             Color acc1, acc2;
             GetThemeAccentColors(alpha, out acc1, out acc2);
             bool hasCustomBg = ShouldRenderCustomBackground();
 
-            // BACKGROUND MULTI-STYLE EQUALIZER AT BOTTOM OF EXPANDED ISLAND
-            string expEqStyle = _config.eq_style ?? "Столбики";
+            // -----------------------------------------------------------------
+            // MULTI-FACETED EXPANDED ISLAND EQUALIZER (Столбики / Точки / Волна / Зеркальный / Круговой / Выкл)
+            // -----------------------------------------------------------------
+            string expEqStyle = _config.exp_eq_style ?? "Столбики";
+            Color eqC1 = acc1, eqC2 = acc2, eqC3 = acc1;
+            bool eqThreeStops = false;
+            float eqOpacityNorm = Math.Max(0.15f, Math.Min(1.0f, _config.exp_eq_opacity_pct / 100f));
+            int eqBaseAlpha = Math.Max(12, Math.Min(255, (int)Math.Round(alpha * eqOpacityNorm)));
+            bool eqGlow = _config.exp_eq_glow_enabled;
+            float eqRoundNorm = Math.Max(0f, Math.Min(1f, _config.exp_eq_roundness_pct / 100f));
+            float eqHeightNorm = Math.Max(0.35f, Math.Min(1.80f, _config.exp_eq_height_pct / 100f));
+
             if ((_mode != IslandMode.Expanded || _expandedPage != 1) && expEqStyle != "Выкл" && expEqStyle != "Off")
             {
-                float expRadius = Math.Max(12f, _config.corner_radius);
-                using (GraphicsPath clipCap = CreateRoundedRectPath(pill, expRadius))
+                GetExpandedEqualizerPalette(eqBaseAlpha, out eqC1, out eqC2, out eqC3, out eqThreeStops);
+
+                if (expEqStyle != "Круговой")
                 {
-                    Region prevClip = g.Clip;
-                    g.SetClip(clipCap);
-
-                    Color rawEq1, rawEq2;
-                    GetEqualizerColors(alpha, out rawEq1, out rawEq2);
-
-                    int barCount = Math.Max(12, Math.Min(_expEqBars.Length, _config.eq_bar_count * 3));
-                    float eqLeft = pill.Left + 18f;
-                    float eqRight = pill.Right - 18f;
-                    float eqSpan = Math.Max(100f, eqRight - eqLeft);
-                    float stepX = eqSpan / barCount;
-                    float barW = Math.Max(3.6f, stepX * 0.54f);
-                    float maxEqH = Math.Min(50f, pill.Height * 0.24f);
-
-                    if (expEqStyle == "Волна")
+                    float expRadius = Math.Max(12f, _config.corner_radius);
+                    using (GraphicsPath clipCap = CreateRoundedRectPath(pill, expRadius))
                     {
-                        int wCount = barCount + 2;
-                        PointF[] w1 = new PointF[wCount];
-                        PointF[] w2 = new PointF[wCount];
-                        float baseWaveY = pill.Bottom - maxEqH * 0.42f;
-                        for (int i = 0; i < wCount; i++)
-                        {
-                            float t = i / (float)(wCount - 1);
-                            float env = (float)Math.Sin(t * Math.PI);
-                            int sIdx = Math.Max(0, Math.Min(_expEqBars.Length - 1, (int)Math.Round(t * (_expEqBars.Length - 1))));
-                            float amp = _expEqBars[sIdx] * env;
-                            w1[i] = new PointF(eqLeft + eqSpan * t, baseWaveY + (float)Math.Sin(_eqPhase * 1.25f + i * 0.55f) * amp * (maxEqH * 0.52f));
-                            w2[i] = new PointF(eqLeft + eqSpan * t, baseWaveY + (float)Math.Cos(_eqPhase * 0.95f - i * 0.48f) * amp * (maxEqH * 0.38f));
-                        }
-                        using (var pGlow = new Pen(Color.FromArgb(Math.Min(255, (int)(alpha * 0.34f)), rawEq2.R, rawEq2.G, rawEq2.B), 3.4f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
-                        using (var pCore = new Pen(Color.FromArgb(Math.Min(255, (int)(alpha * 0.62f)), rawEq1.R, rawEq1.G, rawEq1.B), 1.9f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
-                        {
-                            g.DrawCurve(pGlow, w2, 0.46f);
-                            g.DrawCurve(pCore, w1, 0.46f);
-                        }
-                    }
-                    else
-                    {
-                        float mirrorMidY = pill.Bottom - maxEqH * 0.52f;
-                        for (int i = 0; i < barCount; i++)
-                        {
-                            float t = barCount > 1 ? (i / (float)(barCount - 1)) : 0f;
-                            int sIdx = Math.Max(0, Math.Min(_expEqBars.Length - 1, (int)Math.Round(t * (_expEqBars.Length - 1))));
-                            float lvl = Math.Max(0.07f, _expEqBars[sIdx]);
-                            Color cBlend = ColorThemeUtils.Blend(rawEq1, rawEq2, t);
-                            float bx = eqLeft + i * stepX + (stepX - barW) * 0.5f;
+                        Region prevClip = g.Clip;
+                        g.SetClip(clipCap);
 
-                            if (expEqStyle == "Точки")
+                        int barCount = Math.Max(8, Math.Min(_expEqBars.Length, _config.exp_eq_bar_count));
+                        float eqLeft = pill.Left + 16f;
+                        float eqRight = pill.Right - 16f;
+                        float eqSpan = Math.Max(100f, eqRight - eqLeft);
+                        float stepX = eqSpan / barCount;
+                        float barW = Math.Max(2.0f, Math.Min(stepX * 0.86f, (float)_config.exp_eq_thickness_px));
+                        float maxEqH = Math.Min(pill.Height * 0.44f, 44f * eqHeightNorm);
+
+                        if (expEqStyle == "Волна")
+                        {
+                            int wCount = barCount + 2;
+                            PointF[] w1 = new PointF[wCount];
+                            PointF[] w2 = new PointF[wCount];
+                            float baseWaveY = pill.Bottom - Math.Max(12f, maxEqH * 0.42f);
+                            for (int i = 0; i < wCount; i++)
                             {
-                                float dSz = Math.Min(7.5f, barW);
-                                float dy = pill.Bottom - 5f - lvl * (maxEqH - 8f);
-                                using (var dBr = new SolidBrush(Color.FromArgb(Math.Min(255, (int)(alpha * 0.58f)), cBlend.R, cBlend.G, cBlend.B)))
-                                using (var trBr = new SolidBrush(Color.FromArgb(Math.Min(255, (int)(alpha * 0.18f)), cBlend.R, cBlend.G, cBlend.B)))
-                                {
-                                    g.FillEllipse(trBr, bx, pill.Bottom - dSz - 2f, dSz, dSz);
-                                    g.FillEllipse(dBr, bx, dy, dSz, dSz);
-                                }
+                                float t = i / (float)(wCount - 1);
+                                float env = (float)Math.Sin(t * Math.PI);
+                                int sIdx = Math.Max(0, Math.Min(_expEqBars.Length - 1, (int)Math.Round(t * (barCount - 1))));
+                                float amp = _expEqBars[sIdx] * env;
+                                w1[i] = new PointF(eqLeft + eqSpan * t, baseWaveY + (float)Math.Sin(_eqPhase * 1.25f + i * 0.55f) * amp * (maxEqH * 0.50f));
+                                w2[i] = new PointF(eqLeft + eqSpan * t, baseWaveY + (float)Math.Cos(_eqPhase * 0.95f - i * 0.48f) * amp * (maxEqH * 0.36f));
                             }
-                            else if (expEqStyle == "Зеркальный")
+                            float coreStroke = Math.Max(1.6f, barW * 0.46f);
+                            if (eqGlow)
                             {
-                                float halfH = Math.Max(2.2f, lvl * maxEqH * 0.48f);
-                                using (var bUp = new SolidBrush(Color.FromArgb(Math.Min(255, (int)(alpha * 0.50f)), cBlend.R, cBlend.G, cBlend.B)))
-                                using (var bDn = new SolidBrush(Color.FromArgb(Math.Min(255, (int)(alpha * 0.26f)), cBlend.R, cBlend.G, cBlend.B)))
-                                {
-                                    g.FillRectangle(bUp, bx, mirrorMidY - halfH - 0.5f, barW, halfH);
-                                    g.FillRectangle(bDn, bx, mirrorMidY + 0.5f, barW, halfH);
-                                }
+                                using (var pOuterGlow = new Pen(Color.FromArgb(Math.Max(8, eqBaseAlpha / 3), eqC2.R, eqC2.G, eqC2.B), coreStroke + 3.8f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                                    g.DrawCurve(pOuterGlow, w1, 0.46f);
                             }
-                            else // "Столбики"
+                            using (var lgWave = new LinearGradientBrush(new PointF(eqLeft, baseWaveY), new PointF(eqRight, baseWaveY), eqC1, eqThreeStops ? eqC3 : eqC2))
                             {
-                                float bh = Math.Max(4f, lvl * maxEqH);
-                                float by = pill.Bottom - bh - 1.5f;
-                                var bRc = new RectangleF(bx, by, barW, bh);
-                                Color eqC1 = Color.FromArgb(Math.Min(255, (int)(alpha * 0.54f)), cBlend.R, cBlend.G, cBlend.B);
-                                Color eqC2 = Color.FromArgb(Math.Min(255, (int)(alpha * 0.14f)), rawEq2.R, rawEq2.G, rawEq2.B);
-                                using (GraphicsPath bp = CreateRoundedRectPath(bRc, barW * 0.48f))
-                                using (var lg = new LinearGradientBrush(new PointF(bx, by), new PointF(bx, by + bh + 1f), eqC1, eqC2))
+                                if (eqThreeStops)
                                 {
-                                    g.FillPath(lg, bp);
+                                    var cb = new ColorBlend(3)
+                                    {
+                                        Positions = new float[] { 0f, 0.5f, 1f },
+                                        Colors = new Color[] { eqC1, eqC2, eqC3 }
+                                    };
+                                    lgWave.InterpolationColors = cb;
+                                }
+                                using (var pSec = new Pen(Color.FromArgb(Math.Max(10, (int)(eqBaseAlpha * 0.52f)), eqC2.R, eqC2.G, eqC2.B), Math.Max(1.2f, coreStroke * 0.78f)) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                                using (var pCore = new Pen(lgWave, coreStroke) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                                {
+                                    g.DrawCurve(pSec, w2, 0.46f);
+                                    g.DrawCurve(pCore, w1, 0.46f);
                                 }
                             }
                         }
+                        else
+                        {
+                            float mirrorMidY = pill.Bottom - Math.Max(14f, maxEqH * 0.52f);
+                            for (int i = 0; i < barCount; i++)
+                            {
+                                float t = barCount > 1 ? (i / (float)(barCount - 1)) : 0f;
+                                float lvl = Math.Max(0.06f, _expEqBars[i]);
+                                Color cBlend = eqThreeStops
+                                    ? ColorThemeUtils.SampleGradient3(eqC1, eqC2, eqC3, t)
+                                    : ColorThemeUtils.Blend(eqC1, eqC2, t);
+                                float bx = eqLeft + i * stepX + (stepX - barW) * 0.5f;
+                                float cornerR = barW * 0.5f * eqRoundNorm;
+
+                                if (expEqStyle == "Точки")
+                                {
+                                    float dSz = Math.Max(2.5f, Math.Min(12f, barW + 1.0f));
+                                    float dy = pill.Bottom - dSz - 3f - Math.Min(maxEqH, lvl * (maxEqH - 6f));
+                                    var dRc = new RectangleF(bx, dy, dSz, dSz);
+                                    var trRc = new RectangleF(bx, pill.Bottom - dSz - 2f, dSz, dSz);
+                                    if (eqGlow)
+                                    {
+                                        using (var gBr = new SolidBrush(Color.FromArgb(Math.Max(6, eqBaseAlpha / 4), cBlend.R, cBlend.G, cBlend.B)))
+                                            g.FillEllipse(gBr, RectangleF.Inflate(dRc, 2.2f, 2.2f));
+                                    }
+                                    using (GraphicsPath dp = CreateRoundedRectPath(dRc, dSz * 0.5f * eqRoundNorm))
+                                    using (GraphicsPath tp = CreateRoundedRectPath(trRc, dSz * 0.5f * eqRoundNorm))
+                                    using (var dBr = new SolidBrush(cBlend))
+                                    using (var trBr = new SolidBrush(Color.FromArgb(Math.Max(6, eqBaseAlpha / 4), cBlend.R, cBlend.G, cBlend.B)))
+                                    {
+                                        g.FillPath(trBr, tp);
+                                        g.FillPath(dBr, dp);
+                                    }
+                                }
+                                else if (expEqStyle == "Зеркальный")
+                                {
+                                    float halfH = Math.Max(2.0f, Math.Min(maxEqH * 0.52f, lvl * maxEqH * 0.48f));
+                                    var upRc = new RectangleF(bx, mirrorMidY - halfH - 0.5f, barW, halfH);
+                                    var dnRc = new RectangleF(bx, mirrorMidY + 0.5f, barW, halfH);
+                                    if (eqGlow)
+                                    {
+                                        using (var gBr = new SolidBrush(Color.FromArgb(Math.Max(6, eqBaseAlpha / 5), cBlend.R, cBlend.G, cBlend.B)))
+                                            g.FillRectangle(gBr, bx - 1.2f, upRc.Y - 1.2f, barW + 2.4f, halfH * 2f + 3.4f);
+                                    }
+                                    using (GraphicsPath upP = CreateRoundedRectPath(upRc, cornerR))
+                                    using (GraphicsPath dnP = CreateRoundedRectPath(dnRc, cornerR))
+                                    using (var bUp = new SolidBrush(cBlend))
+                                    using (var bDn = new SolidBrush(Color.FromArgb(Math.Max(8, (int)(eqBaseAlpha * 0.48f)), cBlend.R, cBlend.G, cBlend.B)))
+                                    {
+                                        g.FillPath(bUp, upP);
+                                        g.FillPath(bDn, dnP);
+                                    }
+                                }
+                                else // "Столбики"
+                                {
+                                    float bh = Math.Max(3.5f, Math.Min(maxEqH * 1.25f, lvl * maxEqH));
+                                    float by = pill.Bottom - bh - 1.5f;
+                                    var bRc = new RectangleF(bx, by, barW, bh);
+                                    if (eqGlow)
+                                    {
+                                        using (var gBr = new SolidBrush(Color.FromArgb(Math.Max(6, eqBaseAlpha / 5), cBlend.R, cBlend.G, cBlend.B)))
+                                            g.FillRectangle(gBr, bx - 1.3f, by - 1.3f, barW + 2.6f, bh + 2.0f);
+                                    }
+                                    Color botFade = Color.FromArgb(Math.Max(8, (int)(eqBaseAlpha * 0.28f)), cBlend.R, cBlend.G, cBlend.B);
+                                    using (GraphicsPath bp = CreateRoundedRectPath(bRc, cornerR))
+                                    using (var lg = new LinearGradientBrush(new PointF(bx, by), new PointF(bx, by + bh + 1f), cBlend, botFade))
+                                    {
+                                        g.FillPath(lg, bp);
+                                    }
+                                }
+                            }
+                        }
+                        g.Clip = prevClip;
                     }
-                    g.Clip = prevClip;
                 }
             }
 
@@ -12484,6 +14099,28 @@ namespace DynamicIslandWin
                 DrawSubtleEdgePageArrows(g, pill, alpha);
                 return;
             }
+
+            // -----------------------------------------------------------------
+            // RESPONSIVE ADAPTIVE ROW HEIGHTS (Scales with _layoutScale & fits pill.Height without clipping!)
+            // -----------------------------------------------------------------
+            bool showRow4 = _config.show_dropzone || _config.show_telemetry;
+            float rs = Math.Max(0.86f, Math.Min(1.36f, _layoutScale));
+            float rawMediaH = 74f * rs;
+            float rawRow2H = 28f * rs;
+            float rawRow3H = 34f * rs;
+            float rawRow4H = showRow4 ? (24f * rs) : 0f;
+            float minGap = 4.5f;
+            int gapsCount = showRow4 ? 3 : 2;
+            float neededContentH = rawMediaH + rawRow2H + rawRow3H + rawRow4H + gapsCount * minGap;
+            float fitRatio = (neededContentH > availH) ? Math.Max(0.72f, (availH - gapsCount * minGap) / Math.Max(1f, rawMediaH + rawRow2H + rawRow3H + rawRow4H)) : 1.0f;
+
+            float mediaH = Math.Max(62f, rawMediaH * fitRatio);
+            float row2H = Math.Max(24f, rawRow2H * fitRatio);
+            float row3H = Math.Max(28f, rawRow3H * fitRatio);
+            float row4H = showRow4 ? Math.Max(20f, rawRow4H * fitRatio) : 0f;
+            float usedRowsH = mediaH + row2H + row3H + row4H;
+            float rowGap = Math.Max(minGap, Math.Min(14f, (availH - usedRowsH) / (gapsCount + 0.5f)));
+            float curY = pill.Top + Math.Max(9f, (pill.Height - (usedRowsH + gapsCount * rowGap)) * 0.5f);
 
             Color colWhite = Color.FromArgb(alpha, 252, 252, 255);
             Color colMuted = Color.FromArgb((int)(alpha * 0.90f), 232, 234, 244);
@@ -12503,8 +14140,10 @@ namespace DynamicIslandWin
             using (var brControl = new SolidBrush(ctrlFillCol))
             using (var penBento = new Pen(bentoBorderCol, 1f))
             {
-                // BENTO CARD 1: Media Player Surface
-                var mediaCardRc = new RectangleF(padX, curY, innerW, 74f);
+                // =============================================================
+                // BENTO CARD 1: Media Player Surface (Right-Anchored Transport + Circular EQ Halo)
+                // =============================================================
+                var mediaCardRc = new RectangleF(padX, curY, innerW, mediaH);
                 using (GraphicsPath mcp = CreateRoundedRectPath(mediaCardRc, 16f))
                 {
                     g.FillPath(brBento, mcp);
@@ -12513,10 +14152,53 @@ namespace DynamicIslandWin
 
                 float inX = padX + 10f;
                 float inRight = rightX - 10f;
-                float inY = curY + 8f;
+                float inY = curY + Math.Max(6f, mediaH * 0.10f);
+                float covSz = Math.Max(36f, Math.Min(54f, mediaH * 0.57f));
+                bool isCircularEq = (expEqStyle == "Круговой");
+                var coverRc = new RectangleF(inX + (isCircularEq ? 4f : 0f), inY, covSz, covSz);
 
-                var coverRc = new RectangleF(inX, inY, 42f, 42f);
-                using (GraphicsPath cp = CreateRoundedRectPath(coverRc, 10f))
+                if (isCircularEq)
+                {
+                    float cx = coverRc.X + coverRc.Width * 0.5f;
+                    float cy = coverRc.Y + coverRc.Height * 0.5f;
+                    int spokes = Math.Max(12, Math.Min(_expEqBars.Length, _config.exp_eq_bar_count));
+                    float baseR = coverRc.Width * 0.52f + 1.5f;
+                    float maxSpokeLen = Math.Min(14f, 8.5f * eqHeightNorm);
+                    float spokeW = Math.Max(1.4f, Math.Min(4.2f, _config.exp_eq_thickness_px * 0.45f));
+                    LineCap cap = eqRoundNorm > 0.35f ? LineCap.Round : LineCap.Flat;
+
+                    Region prevMediaClip = g.Clip;
+                    using (GraphicsPath mediaClip = CreateRoundedRectPath(mediaCardRc, 16f))
+                    {
+                        g.SetClip(mediaClip);
+                        for (int i = 0; i < spokes; i++)
+                        {
+                            float t = i / (float)spokes;
+                            double ang = t * Math.PI * 2.0 - Math.PI * 0.5;
+                            float lvl = Math.Max(0.10f, _expEqBars[i]);
+                            float len = Math.Max(2.0f, lvl * maxSpokeLen);
+                            Color sc = eqThreeStops
+                                ? ColorThemeUtils.SampleGradient3(eqC1, eqC2, eqC3, t)
+                                : ColorThemeUtils.Blend(eqC1, eqC2, (float)Math.Sin(t * Math.PI));
+
+                            float x1 = cx + (float)Math.Cos(ang) * baseR;
+                            float y1 = cy + (float)Math.Sin(ang) * baseR;
+                            float x2 = cx + (float)Math.Cos(ang) * (baseR + len);
+                            float y2 = cy + (float)Math.Sin(ang) * (baseR + len);
+
+                            if (eqGlow)
+                            {
+                                using (var gp = new Pen(Color.FromArgb(Math.Max(8, eqBaseAlpha / 3), sc.R, sc.G, sc.B), spokeW + 2.2f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                                    g.DrawLine(gp, x1, y1, x2, y2);
+                            }
+                            using (var sp = new Pen(sc, spokeW) { StartCap = cap, EndCap = cap })
+                                g.DrawLine(sp, x1, y1, x2, y2);
+                        }
+                        g.Clip = prevMediaClip;
+                    }
+                }
+
+                using (GraphicsPath cp = CreateRoundedRectPath(coverRc, isCircularEq ? (covSz * 0.5f) : 10f))
                 {
                     if (_currentMedia.CoverBitmap != null)
                     {
@@ -12534,32 +14216,42 @@ namespace DynamicIslandWin
                     g.DrawPath(penBento, cp);
                 }
 
+                // Anchor Transport Controls FIRST on the right so they NEVER clip or overlap
+                float btnSm = Math.Max(24f, Math.Min(32f, 26f * Math.Min(1.22f, rs * fitRatio)));
+                float btnLg = Math.Max(28f, Math.Min(38f, 32f * Math.Min(1.22f, rs * fitRatio)));
+                float btnGap = Math.Max(5f, 6f * Math.Min(1.15f, rs));
+                float transCenterY = inY + covSz * 0.48f;
+
+                _rcNextBtn = new RectangleF(inRight - btnSm, transCenterY - btnSm * 0.5f, btnSm, btnSm);
+                _rcPlayBtn = new RectangleF(_rcNextBtn.Left - btnGap - btnLg, transCenterY - btnLg * 0.5f, btnLg, btnLg);
+                _rcPrevBtn = new RectangleF(_rcPlayBtn.Left - btnGap - btnSm, transCenterY - btnSm * 0.5f, btnSm, btnSm);
+                _rcLikeBtn = new RectangleF(_rcPrevBtn.Left - btnGap - btnSm, transCenterY - btnSm * 0.5f, btnSm, btnSm);
+
+                float metaLeft = coverRc.Right + (isCircularEq ? 13f : 10f);
+                float metaW = Math.Max(52f, _rcLikeBtn.Left - metaLeft - 8f);
+                float line1H = Math.Max(13f, covSz * 0.31f);
+                float line2H = Math.Max(15f, covSz * 0.37f);
+                float line3H = Math.Max(13f, covSz * 0.32f);
+
                 string playerLabel = _currentMedia.DisplayAppName +
                     (_allPlayers.Count > 1 ? string.Format("  {0}/{1} ▾", _currentPlayerIdx + 1, _allPlayers.Count) : "  ↗");
-                float badgeW = Math.Min(165f, innerW - 190f);
-                _rcPlayerBadge = new RectangleF(inX + 52f, inY, badgeW, 14f);
+                _rcPlayerBadge = new RectangleF(metaLeft, inY, Math.Min(195f * rs, metaW), line1H);
                 DrawContrastText(g, playerLabel, _fontSmall, acc1, _rcPlayerBadge, _sfLeft);
 
-                float metaW = Math.Max(80f, innerW - 216f);
-                var titleRc = new RectangleF(inX + 52f, inY + 13f, metaW, 16f);
-                var artistRc = new RectangleF(inX + 52f, inY + 28f, metaW, 14f);
+                var titleRc = new RectangleF(metaLeft, inY + line1H - 1f, metaW, line2H);
+                var artistRc = new RectangleF(metaLeft, titleRc.Bottom - 1f, metaW, line3H);
                 DrawContrastText(g, _currentMedia.Title, _fontTitle, colWhite, titleRc, _sfLeft);
                 DrawContrastText(g, _currentMedia.Artist, _fontSub, colMuted, artistRc, _sfLeft);
 
-                _rcSongClickZone = new RectangleF(inX, inY + 13f, metaW + 52f, 30f);
-
-                _rcLikeBtn = new RectangleF(inRight - 128f, inY + 7f, 26f, 26f);
-                _rcPrevBtn = new RectangleF(inRight - 96f, inY + 7f, 26f, 26f);
-                _rcPlayBtn = new RectangleF(inRight - 64f, inY + 4f, 32f, 32f);
-                _rcNextBtn = new RectangleF(inRight - 26f, inY + 7f, 26f, 26f);
+                _rcSongClickZone = new RectangleF(inX, titleRc.Y, (_rcLikeBtn.Left - 6f) - inX, line2H + line3H);
 
                 bool likedNow = IsCurrentTrackLiked();
                 g.FillEllipse(brControl, _rcLikeBtn);
-                var adjLike = ApplyMicroInteraction(g, _rcLikeBtn, 13f, alpha, Color.FromArgb(alpha, 236, 72, 153), true);
+                var adjLike = ApplyMicroInteraction(g, _rcLikeBtn, btnSm * 0.5f, alpha, Color.FromArgb(alpha, 236, 72, 153), true);
                 DrawVectorHeartIcon(g, adjLike, likedNow, colWhite, Color.FromArgb(alpha, 236, 72, 153));
 
                 g.FillEllipse(brControl, _rcPrevBtn);
-                var adjPrev = ApplyMicroInteraction(g, _rcPrevBtn, 13f, alpha, acc1, true);
+                var adjPrev = ApplyMicroInteraction(g, _rcPrevBtn, btnSm * 0.5f, alpha, acc1, true);
                 DrawVectorTransportIcon(g, adjPrev, "prev", colWhite);
 
                 var adjPlay = _rcPlayBtn.Contains(_clientCursorPt) && _isMousePressed ? RectangleF.Inflate(_rcPlayBtn, -1.2f, -1.2f) : _rcPlayBtn;
@@ -12575,17 +14267,18 @@ namespace DynamicIslandWin
                 }
 
                 g.FillEllipse(brControl, _rcNextBtn);
-                var adjNext = ApplyMicroInteraction(g, _rcNextBtn, 13f, alpha, acc1, true);
+                var adjNext = ApplyMicroInteraction(g, _rcNextBtn, btnSm * 0.5f, alpha, acc1, true);
                 DrawVectorTransportIcon(g, adjNext, "next", colWhite);
 
-                float progY = curY + 58f;
+                float progY = mediaCardRc.Bottom - Math.Max(13f, mediaH * 0.20f);
                 double livePosSec = _currentMedia.GetLivePositionSec();
                 double totalDurSec = _currentMedia.DurationSec;
+                float timeW = Math.Max(36f, 38f * Math.Min(1.25f, rs));
 
-                DrawContrastText(g, FormatTimeMmSs(livePosSec), _fontMono, colMuted, new RectangleF(inX, progY - 5f, 36f, 14f), _sfLeft);
-                DrawContrastText(g, FormatTimeMmSs(totalDurSec), _fontMono, colMuted, new RectangleF(inRight - 36f, progY - 5f, 36f, 14f), _sfRight);
+                DrawContrastText(g, FormatTimeMmSs(livePosSec), _fontMono, colMuted, new RectangleF(inX, progY - 6f, timeW, 15f), _sfLeft);
+                DrawContrastText(g, FormatTimeMmSs(totalDurSec), _fontMono, colMuted, new RectangleF(inRight - timeW, progY - 6f, timeW, 15f), _sfRight);
 
-                _rcProgressBar = new RectangleF(inX + 38f, progY, Math.Max(70f, (inRight - inX) - 76f), 4.4f);
+                _rcProgressBar = new RectangleF(inX + timeW + 3f, progY, Math.Max(54f, (inRight - inX) - (timeW * 2f + 6f)), 4.4f);
                 using (GraphicsPath gp = CreateRoundedRectPath(_rcProgressBar, 2.2f))
                     g.FillPath(brControl, gp);
 
@@ -12603,28 +14296,43 @@ namespace DynamicIslandWin
                 if (totalDurSec > 0)
                     g.FillEllipse(brWhite, _rcProgressBar.X + fillW - 4.0f, progY - 2.0f, 8.4f, 8.4f);
 
-                curY += 74f + rowGap;
+                curY += mediaH + rowGap;
 
-                // ROW 2: TWO LABELED VOLUME SLIDERS ("Звук ПК" + "Музыка") + Timer + Settings
-                float rightControlsW = 96f;
-                float totalVolAreaW = innerW - rightControlsW - 6f;
-                float singleVolW = (totalVolAreaW - 6f) / 2f;
+                // =============================================================
+                // ROW 2: Right-Anchored [ Settings ] + [ Timer ] + Adaptive Dual Volume Cards
+                // =============================================================
+                float gearSz = Math.Max(26f, row2H);
+                float pomoW = Math.Max(58f, 62f * Math.Min(1.25f, rs));
+                _rcSettingsBtn = new RectangleF(rightX - gearSz, curY, gearSz, row2H);
+                _rcPomoBtn = new RectangleF(_rcSettingsBtn.Left - 5f - pomoW, curY, pomoW, row2H);
+
+                float totalVolAreaW = Math.Max(140f, _rcPomoBtn.Left - 6f - padX);
+                float singleVolW = (totalVolAreaW - 6f) * 0.5f;
+                bool compactVolLabels = (singleVolW < 176f * rs);
+                bool iconOnlyVolLabels = (singleVolW < 126f * rs);
+                float pctBoxW = Math.Max(34f, 36f * Math.Min(1.22f, rs));
 
                 // 1) Left Volume Capsule: "Звук ПК" (PC Master Volume)
-                _rcPcVolCard = new RectangleF(padX, curY, singleVolW, 28f);
+                _rcPcVolCard = new RectangleF(padX, curY, singleVolW, row2H);
                 using (GraphicsPath vcp1 = CreateRoundedRectPath(_rcPcVolCard, 11f))
                 {
                     g.FillPath(brBento, vcp1);
                     g.DrawPath(penBento, vcp1);
                 }
 
-                _rcMuteBtn = new RectangleF(_rcPcVolCard.X + 3f, curY + 2f, 22f, 24f);
+                _rcMuteBtn = new RectangleF(_rcPcVolCard.X + 3f, curY + (row2H - 24f) * 0.5f, 22f, 24f);
                 DrawVectorSpeakerIcon(g, _rcMuteBtn, _audio.LastMuted, _audio.LastVolume, colWhite);
 
-                var lblPcRc = new RectangleF(_rcPcVolCard.X + 25f, curY, 48f, 28f);
-                DrawContrastText(g, "Звук ПК", _fontSmall, colWhite, lblPcRc, _sfLeft);
+                float pcLblW = iconOnlyVolLabels ? 0f : (compactVolLabels ? (24f * rs) : (52f * rs));
+                if (pcLblW > 0f)
+                {
+                    var lblPcRc = new RectangleF(_rcMuteBtn.Right + 1f, curY, pcLblW, row2H);
+                    DrawContrastText(g, compactVolLabels ? "ПК" : "Звук ПК", _fontSmall, colWhite, lblPcRc, _sfLeft);
+                }
 
-                _rcVolSlider = new RectangleF(_rcPcVolCard.X + 74f, curY + 11.8f, Math.Max(32f, _rcPcVolCard.Width - 110f), 4.4f);
+                float pcSliderLeft = _rcMuteBtn.Right + pcLblW + 4f;
+                float pcSliderRight = _rcPcVolCard.Right - pctBoxW - 3f;
+                _rcVolSlider = new RectangleF(pcSliderLeft, curY + (row2H - 4.4f) * 0.5f, Math.Max(26f, pcSliderRight - pcSliderLeft), 4.4f);
                 using (GraphicsPath vp1 = CreateRoundedRectPath(_rcVolSlider, 2.2f))
                     g.FillPath(brControl, vp1);
 
@@ -12640,23 +14348,29 @@ namespace DynamicIslandWin
                 g.FillEllipse(brWhite, _rcVolSlider.X + volFillW - 4.2f, _rcVolSlider.Y - 2.1f, 8.6f, 8.6f);
 
                 DrawContrastText(g, _audio.LastMuted ? "Выкл" : (_audio.LastVolume + "%"), _fontMono, colMuted,
-                    new RectangleF(_rcVolSlider.Right + 2f, curY, 34f, 28f), _sfCenter);
+                    new RectangleF(_rcPcVolCard.Right - pctBoxW - 1f, curY, pctBoxW, row2H), _sfCenter);
 
                 // 2) Right Volume Capsule: "Музыка" (Per-App Music Volume)
-                _rcMusicVolCard = new RectangleF(_rcPcVolCard.Right + 6f, curY, singleVolW, 28f);
+                _rcMusicVolCard = new RectangleF(_rcPcVolCard.Right + 6f, curY, singleVolW, row2H);
                 using (GraphicsPath vcp2 = CreateRoundedRectPath(_rcMusicVolCard, 11f))
                 {
                     g.FillPath(brBento, vcp2);
                     g.DrawPath(penBento, vcp2);
                 }
 
-                _rcMusicMuteBtn = new RectangleF(_rcMusicVolCard.X + 3f, curY + 2f, 20f, 24f);
+                _rcMusicMuteBtn = new RectangleF(_rcMusicVolCard.X + 3f, curY + (row2H - 24f) * 0.5f, 20f, 24f);
                 DrawVectorMusicNoteIcon(g, _rcMusicMuteBtn, _audio.LastMusicMuted, acc1);
 
-                var lblMusRc = new RectangleF(_rcMusicVolCard.X + 23f, curY, 46f, 28f);
-                DrawContrastText(g, "Музыка", _fontSmall, colWhite, lblMusRc, _sfLeft);
+                float musLblW = iconOnlyVolLabels ? 0f : (compactVolLabels ? (28f * rs) : (50f * rs));
+                if (musLblW > 0f)
+                {
+                    var lblMusRc = new RectangleF(_rcMusicMuteBtn.Right + 1f, curY, musLblW, row2H);
+                    DrawContrastText(g, compactVolLabels ? "Муз" : "Музыка", _fontSmall, colWhite, lblMusRc, _sfLeft);
+                }
 
-                _rcMusicVolSlider = new RectangleF(_rcMusicVolCard.X + 70f, curY + 11.8f, Math.Max(32f, _rcMusicVolCard.Width - 106f), 4.4f);
+                float musSliderLeft = _rcMusicMuteBtn.Right + musLblW + 4f;
+                float musSliderRight = _rcMusicVolCard.Right - pctBoxW - 3f;
+                _rcMusicVolSlider = new RectangleF(musSliderLeft, curY + (row2H - 4.4f) * 0.5f, Math.Max(26f, musSliderRight - musSliderLeft), 4.4f);
                 using (GraphicsPath vp2 = CreateRoundedRectPath(_rcMusicVolSlider, 2.2f))
                     g.FillPath(brControl, vp2);
 
@@ -12672,10 +14386,9 @@ namespace DynamicIslandWin
                 g.FillEllipse(brWhite, _rcMusicVolSlider.X + musFillW - 4.2f, _rcMusicVolSlider.Y - 2.1f, 8.6f, 8.6f);
 
                 DrawContrastText(g, _audio.LastMusicMuted ? "Выкл" : (_audio.LastMusicVolume + "%"), _fontMono, colMuted,
-                    new RectangleF(_rcMusicVolSlider.Right + 2f, curY, 34f, 28f), _sfCenter);
+                    new RectangleF(_rcMusicVolCard.Right - pctBoxW - 1f, curY, pctBoxW, row2H), _sfCenter);
 
                 // 3) Focus Timer & Settings Gear
-                _rcPomoBtn = new RectangleF(rightX - 92f, curY, 60f, 28f);
                 using (GraphicsPath pp = CreateRoundedRectPath(_rcPomoBtn, 11f))
                 {
                     g.FillPath(brBento, pp);
@@ -12685,7 +14398,6 @@ namespace DynamicIslandWin
                 DrawContrastText(g, _pomoRunning ? string.Format("{0:00}:{1:00}", _pomoRemainingSec / 60, _pomoRemainingSec % 60) : "Таймер",
                     _pomoRunning ? _fontMono : _fontSmall, _pomoRunning ? acc1 : colWhite, _rcPomoBtn, _sfCenter);
 
-                _rcSettingsBtn = new RectangleF(rightX - 28f, curY, 28f, 28f);
                 using (GraphicsPath sp = CreateRoundedRectPath(_rcSettingsBtn, 11f))
                 {
                     g.FillPath(brBento, sp);
@@ -12694,29 +14406,102 @@ namespace DynamicIslandWin
                 var adjGear = ApplyMicroInteraction(g, _rcSettingsBtn, 11f, alpha, acc1);
                 DrawVectorGearIcon(g, adjGear, colWhite);
 
-                curY += 28f + rowGap;
+                curY += row2H + rowGap;
 
-                // ROW 3: Minimalist macOS Squircle App Dock (Drag-and-Drop Reorderable) + [ + ] Add Program Button Locked at End
+                // =============================================================
+                // ROW 3: PROTECTED RIGHT QUICK PILLS [ 🎙 Микр ] [ 📸 Скрины ] [ 🌙 Сон ] + FLEXIBLE DOCK + [ + ]
+                // =============================================================
+                float qPillH = Math.Max(26f, row3H - 4f);
+                float qPillY = curY + (row3H - qPillH) * 0.5f;
+                bool compactQuickPills = (innerW < 455f * rs);
+
+                float wdW = compactQuickPills ? Math.Max(42f, 44f * rs) : Math.Max(64f, 68f * Math.Min(1.20f, rs));
+                float vtW = compactQuickPills ? Math.Max(40f, 42f * rs) : Math.Max(58f, 62f * Math.Min(1.20f, rs));
+                float mcW = compactQuickPills ? Math.Max(42f, 44f * rs) : Math.Max(62f, 66f * Math.Min(1.20f, rs));
+
+                _rcExpandedWatchdogBtn = new RectangleF(rightX - wdW, qPillY, wdW, qPillH);
+                _rcExpandedVaultBtn = new RectangleF(_rcExpandedWatchdogBtn.Left - 5f - vtW, qPillY, vtW, qPillH);
+                _rcExpandedMicBtn = new RectangleF(_rcExpandedVaultBtn.Left - 5f - mcW, qPillY, mcW, qPillH);
+
+                // 1) Microphone Per-App Selector Pill (Always Visible & Protected, 3-State Synced!)
+                MicCaptureSummaryState micSt = _audio.MicSummaryState;
+                Color micC = micSt == MicCaptureSummaryState.AllMuted
+                    ? Color.FromArgb(alpha, 255, 69, 58)
+                    : (micSt == MicCaptureSummaryState.PartiallyMuted
+                        ? Color.FromArgb(alpha, 245, 158, 11)
+                        : (micSt == MicCaptureSummaryState.ActiveUnmuted
+                            ? Color.FromArgb(alpha, 48, 209, 88)
+                            : colMuted));
+                using (GraphicsPath mp = CreateRoundedRectPath(_rcExpandedMicBtn, 9f))
+                {
+                    g.FillPath(brBento, mp);
+                    g.DrawPath(penBento, mp);
+                }
+                ApplyMicroInteraction(g, _rcExpandedMicBtn, 9f, alpha, micC);
+                DrawVectorMicIcon3State(g, new RectangleF(_rcExpandedMicBtn.X + 4f, _rcExpandedMicBtn.Y + (qPillH - 20f) * 0.5f, 18f, 20f), micSt, micC);
+                string micPillTxt = compactQuickPills
+                    ? (_audio.ActiveMicAppCount > 0 ? (_audio.ActiveMicAppCount - _audio.MutedMicAppCount) + "/" + _audio.ActiveMicAppCount : "▾")
+                    : (micSt == MicCaptureSummaryState.AllMuted ? "Мьют"
+                        : (micSt == MicCaptureSummaryState.PartiallyMuted ? (_audio.MutedMicAppCount + "/" + _audio.ActiveMicAppCount)
+                        : (_audio.ActiveMicAppCount > 0 ? ("Микр·" + _audio.ActiveMicAppCount) : "Микр")));
+                DrawContrastText(g, micPillTxt, micSt == MicCaptureSummaryState.PartiallyMuted || compactQuickPills ? _fontMono : _fontSmall, micC,
+                    new RectangleF(_rcExpandedMicBtn.X + 21f, _rcExpandedMicBtn.Y, _rcExpandedMicBtn.Width - 22f, qPillH), _sfCenter);
+
+                // 2) Screenshot Vault Pill (Always Visible & Protected)
+                using (GraphicsPath vp = CreateRoundedRectPath(_rcExpandedVaultBtn, 9f))
+                {
+                    g.FillPath(brBento, vp);
+                    g.DrawPath(penBento, vp);
+                }
+                ApplyMicroInteraction(g, _rcExpandedVaultBtn, 9f, alpha, acc1);
+                Color vCol = _screenshotVault.Count > 0 ? acc1 : colWhite;
+                DrawVectorCameraIcon(g, new RectangleF(_rcExpandedVaultBtn.X + 5f, _rcExpandedVaultBtn.Y + (qPillH - 20f) * 0.5f, 18f, 20f), vCol);
+                DrawContrastText(g, _screenshotVault.Count.ToString(), _fontMono, vCol,
+                    new RectangleF(_rcExpandedVaultBtn.X + 22f, _rcExpandedVaultBtn.Y, _rcExpandedVaultBtn.Width - 23f, qPillH), _sfCenter);
+
+                // 3) Sleep-Timer / Download Watchdog Pill (Always Visible & Protected)
+                Color wdC = _watchdog.IsCountdownActive ? Color.FromArgb(alpha, 255, 69, 58) : (_watchdog.IsWatchdogArmed ? Color.FromArgb(alpha, 34, 211, 238) : colMuted);
+                using (GraphicsPath wp = CreateRoundedRectPath(_rcExpandedWatchdogBtn, 9f))
+                {
+                    g.FillPath(brBento, wp);
+                    g.DrawPath(penBento, wp);
+                }
+                ApplyMicroInteraction(g, _rcExpandedWatchdogBtn, 9f, alpha, wdC);
+                DrawVectorMoonIcon(g, new RectangleF(_rcExpandedWatchdogBtn.X + 4f, _rcExpandedWatchdogBtn.Y + (qPillH - 20f) * 0.5f, 18f, 20f), wdC);
+                string wdTxt = _watchdog.IsCountdownActive ? (_watchdog.CountdownRemainingSec + "с") : (_watchdog.IsWatchdogArmed ? "ВКЛ" : (compactQuickPills ? "•" : "Сон"));
+                DrawContrastText(g, wdTxt, _watchdog.IsCountdownActive ? _fontMono : _fontSmall, wdC,
+                    new RectangleF(_rcExpandedWatchdogBtn.X + 21f, _rcExpandedWatchdogBtn.Y, _rcExpandedWatchdogBtn.Width - 22f, qPillH), _sfCenter);
+
+                // 4) Left Side Flexible App Dock + Protected [ + ] Button
                 _dockRects.Clear();
+                float dockBtnSz = Math.Max(28f, Math.Min(36f, row3H));
+                float dockStep = dockBtnSz + 6f;
+                float dockAvailW = Math.Max(dockBtnSz + 4f, _rcExpandedMicBtn.Left - 8f - padX);
+                int maxIcons = Math.Max(0, Math.Min(_config.pinned_apps.Count, (int)Math.Floor((dockAvailW - dockBtnSz) / dockStep)));
+                _dockVisibleCount = maxIcons;
+                int maxScrollOff = Math.Max(0, _config.pinned_apps.Count - maxIcons);
+                if (_dockScrollOffset > maxScrollOff) _dockScrollOffset = maxScrollOff;
+                if (_isDraggingDockApp) _dockScrollOffset = 0;
+
                 float dockX = padX;
                 _dockRowStartX = padX;
-                int maxSlots = Math.Max(4, (int)(innerW / 40f));
-                int maxIcons = Math.Min(_config.pinned_apps.Count, maxSlots - 1);
-                _dockVisibleCount = maxIcons;
+                _rcDockRowArea = new RectangleF(padX, curY, dockAvailW, row3H);
                 bool anyDockSettling = false;
                 PinnedAppItem draggedDockObj = null;
 
-                for (int i = 0; i < maxIcons; i++)
+                for (int visI = 0; visI < maxIcons; visI++)
                 {
-                    PinnedAppItem item = _config.pinned_apps[i];
-                    float slotX = padX + i * 40f;
-                    var slotHitRc = new RectangleF(slotX, curY, 34f, 34f);
+                    int appIdx = visI + _dockScrollOffset;
+                    if (appIdx < 0 || appIdx >= _config.pinned_apps.Count) break;
+                    PinnedAppItem item = _config.pinned_apps[appIdx];
+                    float slotX = padX + visI * dockStep;
+                    var slotHitRc = new RectangleF(slotX, curY, dockBtnSz, dockBtnSz);
                     _dockRects.Add(new KeyValuePair<RectangleF, PinnedAppItem>(slotHitRc, item));
 
-                    if (_isDraggingDockApp && i == _pressedDockIndex)
+                    if (_isDraggingDockApp && visI == _pressedDockIndex)
                     {
                         draggedDockObj = item;
-                        _dockVisualX[item.target_path ?? i.ToString()] = slotX;
+                        _dockVisualX[item.target_path ?? appIdx.ToString()] = slotX;
                         using (GraphicsPath phPath = CreateRoundedRectPath(slotHitRc, 10f))
                         using (var phBr = new SolidBrush(Color.FromArgb((int)(alpha * 0.14f), acc1.R, acc1.G, acc1.B)))
                         using (var phPen = new Pen(Color.FromArgb((int)(alpha * 0.55f), acc1.R, acc1.G, acc1.B), 1.15f) { DashStyle = DashStyle.Dash })
@@ -12724,11 +14509,11 @@ namespace DynamicIslandWin
                             g.FillPath(phBr, phPath);
                             g.DrawPath(phPen, phPath);
                         }
-                        dockX += 40f;
+                        dockX += dockStep;
                         continue;
                     }
 
-                    string vKey = item.target_path ?? i.ToString();
+                    string vKey = item.target_path ?? appIdx.ToString();
                     float drawX = slotX;
                     float prevX;
                     if (_dockVisualX.TryGetValue(vKey, out prevX))
@@ -12738,14 +14523,11 @@ namespace DynamicIslandWin
                             drawX = prevX + (slotX - prevX) * 0.38f;
                             anyDockSettling = true;
                         }
-                        else
-                        {
-                            drawX = slotX;
-                        }
+                        else drawX = slotX;
                     }
                     _dockVisualX[vKey] = drawX;
 
-                    var btnRc = new RectangleF(drawX, curY, 34f, 34f);
+                    var btnRc = new RectangleF(drawX, curY, dockBtnSz, dockBtnSz);
                     using (GraphicsPath dp = CreateRoundedRectPath(btnRc, 10f))
                     {
                         g.FillPath(brBento, dp);
@@ -12755,35 +14537,43 @@ namespace DynamicIslandWin
                     if (!_isDraggingDockApp)
                         ApplyMicroInteraction(g, btnRc, 10f, alpha, acc1);
                     Bitmap icoBmp = GetAppIconBitmap(item.target_path);
+                    float icoPad = Math.Max(4f, (dockBtnSz - 22f) * 0.5f);
                     if (icoBmp != null)
-                        SafeDrawImage(g, icoBmp, btnRc.X + 6f, btnRc.Y + 6f, 22f, 22f);
+                        SafeDrawImage(g, icoBmp, btnRc.X + icoPad, btnRc.Y + icoPad, dockBtnSz - icoPad * 2f, dockBtnSz - icoPad * 2f);
                     else
                         DrawContrastText(g, item.name.Substring(0, Math.Min(2, item.name.Length)), _fontSmall, colWhite, btnRc, _sfCenter);
 
-                    dockX += 40f;
+                    dockX += dockStep;
                 }
                 _dockSettleAnimating = anyDockSettling;
 
-                _rcAddAppBtn = new RectangleF(dockX, curY, 34f, 34f);
+                _rcAddAppBtn = new RectangleF(Math.Min(_rcExpandedMicBtn.Left - dockBtnSz - 5f, dockX), curY, dockBtnSz, dockBtnSz);
                 using (GraphicsPath ap = CreateRoundedRectPath(_rcAddAppBtn, 10f))
                 using (var addPen = new Pen(Color.FromArgb((int)(alpha * 0.45f), acc1.R, acc1.G, acc1.B), 1.1f))
                 using (var plusPen = new Pen(colWhite, 1.8f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
                 {
                     g.FillPath(brBento, ap);
                     g.DrawPath(addPen, ap);
-                    float pcx = _rcAddAppBtn.X + 17f;
-                    float pcy = _rcAddAppBtn.Y + 17f;
-                    g.DrawLine(plusPen, pcx - 5.5f, pcy, pcx + 5.5f, pcy);
-                    g.DrawLine(plusPen, pcx, pcy - 5.5f, pcx, pcy + 5.5f);
+                    float pcx = _rcAddAppBtn.X + dockBtnSz * 0.5f;
+                    float pcy = _rcAddAppBtn.Y + dockBtnSz * 0.5f;
+                    g.DrawLine(plusPen, pcx - 5.2f, pcy, pcx + 5.2f, pcy);
+                    g.DrawLine(plusPen, pcx, pcy - 5.2f, pcx, pcy + 5.2f);
+                }
+
+                if (_config.pinned_apps.Count > maxIcons && maxIcons > 0)
+                {
+                    string pageHint = string.Format("{0}/{1}", _dockScrollOffset + maxIcons, _config.pinned_apps.Count);
+                    var hintRc = new RectangleF(_rcAddAppBtn.X, _rcAddAppBtn.Bottom - 10f, dockBtnSz, 10f);
+                    DrawContrastText(g, pageHint, _fontSmall, acc1, hintRc, _sfCenter);
                 }
 
                 if (_isDraggingDockApp && draggedDockObj != null)
                 {
                     float minDragX = padX - 4f;
-                    float maxDragX = padX + Math.Max(0, maxIcons - 1) * 40f + 4f;
+                    float maxDragX = padX + Math.Max(0, maxIcons - 1) * dockStep + 4f;
                     float floatX = Math.Max(minDragX, Math.Min(maxDragX, _dockDragCurrentX));
-                    var dragRc = new RectangleF(floatX - 1f, curY - 3.5f, 36f, 36f);
-                    var dragShadowRc = new RectangleF(dragRc.X + 1.5f, dragRc.Y + 3f, 36f, 36f);
+                    var dragRc = new RectangleF(floatX - 1f, curY - 3.5f, dockBtnSz + 2f, dockBtnSz + 2f);
+                    var dragShadowRc = new RectangleF(dragRc.X + 1.5f, dragRc.Y + 3f, dragRc.Width, dragRc.Height);
                     using (GraphicsPath dsp = CreateRoundedRectPath(dragShadowRc, 11f))
                     using (var dsb = new SolidBrush(Color.FromArgb((int)(alpha * 0.55f), 2, 4, 10)))
                         g.FillPath(dsb, dsp);
@@ -12802,67 +14592,19 @@ namespace DynamicIslandWin
                         DrawContrastText(g, draggedDockObj.name.Substring(0, Math.Min(2, draggedDockObj.name.Length)), _fontSmall, colWhite, dragRc, _sfCenter);
                 }
 
-                // Right-aligned Quick Pills on Row 3: [ 🎙 Микр ] [ 📸 Скрины ] [ 🌙 Сон-Таймер ]
-                float qRight = rightX;
-                _rcExpandedWatchdogBtn = new RectangleF(qRight - 68f, curY + 3f, 68f, 28f);
-                qRight -= 74f;
-                _rcExpandedVaultBtn = new RectangleF(qRight - 64f, curY + 3f, 64f, 28f);
-                qRight -= 70f;
-                _rcExpandedMicBtn = new RectangleF(qRight - 58f, curY + 3f, 58f, 28f);
+                curY += row3H + rowGap;
 
-                if (_rcExpandedMicBtn.X > _rcAddAppBtn.Right + 6f)
-                {
-                    Color micC = _audio.IsMicMuted ? Color.FromArgb(alpha, 255, 69, 58) : (_audio.IsMicActive ? Color.FromArgb(alpha, 48, 209, 88) : colMuted);
-                    using (GraphicsPath mp = CreateRoundedRectPath(_rcExpandedMicBtn, 9f))
-                    {
-                        g.FillPath(brBento, mp);
-                        g.DrawPath(penBento, mp);
-                    }
-                    ApplyMicroInteraction(g, _rcExpandedMicBtn, 9f, alpha, micC);
-                    DrawVectorMicIcon(g, new RectangleF(_rcExpandedMicBtn.X + 4f, _rcExpandedMicBtn.Y + 4f, 18f, 20f), _audio.IsMicMuted, micC);
-                    DrawContrastText(g, _audio.IsMicMuted ? "Выкл" : "Микр", _fontSmall, micC, new RectangleF(_rcExpandedMicBtn.X + 21f, _rcExpandedMicBtn.Y, _rcExpandedMicBtn.Width - 23f, 28f), _sfCenter);
-                }
-                else _rcExpandedMicBtn = RectangleF.Empty;
-
-                if (_rcExpandedVaultBtn.X > _rcAddAppBtn.Right + 6f)
-                {
-                    using (GraphicsPath vp = CreateRoundedRectPath(_rcExpandedVaultBtn, 9f))
-                    {
-                        g.FillPath(brBento, vp);
-                        g.DrawPath(penBento, vp);
-                    }
-                    ApplyMicroInteraction(g, _rcExpandedVaultBtn, 9f, alpha, acc1);
-                    Color vCol = _screenshotVault.Count > 0 ? acc1 : colWhite;
-                    DrawVectorCameraIcon(g, new RectangleF(_rcExpandedVaultBtn.X + 5f, _rcExpandedVaultBtn.Y + 4f, 18f, 20f), vCol);
-                    DrawContrastText(g, _screenshotVault.Count.ToString(), _fontMono, vCol, new RectangleF(_rcExpandedVaultBtn.X + 23f, _rcExpandedVaultBtn.Y, _rcExpandedVaultBtn.Width - 25f, 28f), _sfCenter);
-                }
-                else _rcExpandedVaultBtn = RectangleF.Empty;
-
-                if (_rcExpandedWatchdogBtn.X > _rcAddAppBtn.Right + 6f)
-                {
-                    Color wdC = _watchdog.IsCountdownActive ? Color.FromArgb(alpha, 255, 69, 58) : (_watchdog.IsWatchdogArmed ? Color.FromArgb(alpha, 34, 211, 238) : colMuted);
-                    using (GraphicsPath wp = CreateRoundedRectPath(_rcExpandedWatchdogBtn, 9f))
-                    {
-                        g.FillPath(brBento, wp);
-                        g.DrawPath(penBento, wp);
-                    }
-                    ApplyMicroInteraction(g, _rcExpandedWatchdogBtn, 9f, alpha, wdC);
-                    DrawVectorMoonIcon(g, new RectangleF(_rcExpandedWatchdogBtn.X + 4f, _rcExpandedWatchdogBtn.Y + 4f, 18f, 20f), wdC);
-                    DrawContrastText(g, _watchdog.IsCountdownActive ? (_watchdog.CountdownRemainingSec + "с") : (_watchdog.IsWatchdogArmed ? "ВКЛ" : "Сон"),
-                        _watchdog.IsCountdownActive ? _fontMono : _fontSmall, wdC, new RectangleF(_rcExpandedWatchdogBtn.X + 21f, _rcExpandedWatchdogBtn.Y, _rcExpandedWatchdogBtn.Width - 23f, 28f), _sfCenter);
-                }
-                else _rcExpandedWatchdogBtn = RectangleF.Empty;
-
-                curY += 34f + rowGap;
-
+                // =============================================================
                 // ROW 4: Minimalist Dropzone Pill + Telemetry Status Pill
-                if (_config.show_dropzone || _config.show_telemetry)
+                // =============================================================
+                if (showRow4 && curY + 16f <= pill.Bottom - 4f)
                 {
-                    float teleW = _config.show_telemetry ? (_config.show_dropzone ? Math.Min(224f, innerW * 0.48f) : innerW) : 0f;
+                    float actualRow4H = Math.Min(row4H, Math.Max(18f, pill.Bottom - 6f - curY));
+                    float teleW = _config.show_telemetry ? (_config.show_dropzone ? Math.Min(246f * rs, innerW * 0.50f) : innerW) : 0f;
                     if (_config.show_dropzone)
                     {
-                        float dzW = _config.show_telemetry ? (innerW - teleW - 8f) : innerW;
-                        _rcDropzone = new RectangleF(padX, curY, dzW, 24f);
+                        float dzW = _config.show_telemetry ? Math.Max(80f, innerW - teleW - 8f) : innerW;
+                        _rcDropzone = new RectangleF(padX, curY, dzW, actualRow4H);
                         using (GraphicsPath dzPath = CreateRoundedRectPath(_rcDropzone, 9f))
                         using (var dzBrush = new SolidBrush(_dropzoneFiles.Count > 0
                             ? Color.FromArgb((int)(alpha * 0.36f), acc1.R, acc1.G, acc1.B)
@@ -12872,7 +14614,7 @@ namespace DynamicIslandWin
                             g.DrawPath(penBento, dzPath);
                         }
                         string dzText = _dropzoneFiles.Count == 0
-                            ? "Dropzone  ·  Перетащите файлы"
+                            ? (dzW < 180f ? "Dropzone" : "Dropzone  ·  Перетащите файлы")
                             : string.Format("Полка: {0} файл(ов)  ·  ПКМ очистить", _dropzoneFiles.Count);
                         DrawContrastText(g, dzText, _fontSmall, _dropzoneFiles.Count > 0 ? colWhite : colMuted, _rcDropzone, _sfCenter);
                     }
@@ -12883,7 +14625,7 @@ namespace DynamicIslandWin
 
                     if (_config.show_telemetry)
                     {
-                        var teleRc = new RectangleF(rightX - teleW, curY, teleW, 24f);
+                        var teleRc = new RectangleF(rightX - teleW, curY, teleW, actualRow4H);
                         using (GraphicsPath tp = CreateRoundedRectPath(teleRc, 9f))
                         {
                             g.FillPath(brBento, tp);
