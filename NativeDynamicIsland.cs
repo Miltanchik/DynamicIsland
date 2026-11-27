@@ -2323,6 +2323,11 @@ namespace DynamicIslandWin
     //     Replaces legacy .NET 3.0 System.Windows.Automation (which crashes Electron/CEF)
     // =========================================================================
     [ComImport, Guid("E22AD333-B25F-460C-83D0-0581107395C9")]
+    [ComImport, Guid("6D5140C1-7436-11CE-8034-00AA006009FA"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IComServiceProvider
+    {
+        [PreserveSig] int QueryService(ref Guid guidService, ref Guid riid, out IntPtr ppvObject);
+    }
     internal class CUIAutomation8ComObject { }
 
     [ComImport, Guid("352FFBA8-0973-437C-A61F-F64CAFD81DF9"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -2531,120 +2536,84 @@ namespace DynamicIslandWin
                 var dummyYm = new MediaSessionSnapshot { AppId = "YandexMusic", DisplayAppName = "Яндекс Музыка", Title = "Probe", Artist = "Probe" };
                 string wt; IntPtr rw;
                 IntPtr top = MultiPlayerMediaController.FindPlayerWindowSafe(dummyYm, false, true, out wt, out rw);
-                sb.AppendLine(string.Format("YM Window: top={0} render={1} vis={2} iconic={3} title='{4}'",
-                    top, rw, top != IntPtr.Zero && NativeWin32.IsWindowVisible(top), top != IntPtr.Zero && NativeWin32.IsIconic(top), wt));
+                sb.AppendLine("YM top=" + top + " title='" + wt + "'");
 
                 if (top != IntPtr.Zero)
                 {
-                    IUIAutomationElement root;
-                    int hrEl = uia.ElementFromHandle(top, out root);
-                    sb.AppendLine("ElementFromHandle hr=0x" + hrEl.ToString("X8") + " rootNull=" + (root == null));
-                    if (root != null)
+                    // 1) Wake Chromium AXModeComplete via MSAA IServiceProvider::QueryService(IID_IAccessible, IID_IAccessible2)!
+                    Guid iidAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+                    Guid iidIA2 = new Guid("E89F726E-C4F4-4C19-BB19-B647D7FA8478");
+                    object accObj = null;
+                    int hrAcc = NativeWin32.AccessibleObjectFromWindow(top, 0xFFFFFFFCu, ref iidAcc, out accObj);
+                    if (accObj != null)
                     {
-                        string rName, rCls;
-                        root.get_CurrentName(out rName);
-                        root.get_CurrentClassName(out rCls);
-                        sb.AppendLine("Root name='" + rName + "' class='" + rCls + "'");
-
-                        IUIAutomationCondition cTrue, cBtn;
-                        uia.CreateTrueCondition(out cTrue);
-                        uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out cBtn);
-
-                        IUIAutomationElementArray chArr;
-                        int hrCh = root.FindAll(2 /* Children */, cTrue, out chArr);
-                        int chLen = -1;
-                        if (chArr != null) chArr.get_Length(out chLen);
-                        sb.AppendLine("Direct Children hr=0x" + hrCh.ToString("X8") + " len=" + chLen);
-                        for (int i = 0; i < Math.Min(Math.Max(0, chLen), 12); i++)
+                        try
                         {
-                            IUIAutomationElement ce;
-                            if (chArr.GetElement(i, out ce) == 0 && ce != null)
+                            var sp = accObj as IComServiceProvider;
+                            if (sp != null)
                             {
-                                string cn, cc; int cct;
-                                ce.get_CurrentName(out cn); ce.get_CurrentClassName(out cc); ce.get_CurrentControlType(out cct);
-                                sb.AppendLine(string.Format("  Child[{0}] ct={1} class='{2}' name='{3}'", i, cct, cc, cn));
-                                ReleaseCom(ce);
+                                IntPtr pIA2;
+                                int hrQS = sp.QueryService(ref iidAcc, ref iidIA2, out pIA2);
+                                sb.AppendLine("IServiceProvider.QueryService(IA2) hr=0x" + hrQS.ToString("X8") + " ptr=" + pIA2);
+                                if (pIA2 != IntPtr.Zero) Marshal.Release(pIA2);
                             }
                         }
-                        ReleaseCom(chArr);
+                        finally { ReleaseCom(accObj); }
+                    }
 
-                        IUIAutomationElementArray btnArr1;
-                        int hrB1 = root.FindAll(4 /* Descendants */, cBtn, out btnArr1);
-                        int bLen1 = -1;
-                        if (btnArr1 != null) btnArr1.get_Length(out bLen1);
-                        sb.AppendLine("Before Wake Buttons hr=0x" + hrB1.ToString("X8") + " len=" + bLen1);
-                        for (int i = 0; i < Math.Min(Math.Max(0, bLen1), 35); i++)
+                    Thread.Sleep(650);
+                    IntPtr rwAfter = MultiPlayerMediaController.FindRenderWidgetChild(top);
+                    sb.AppendLine("After QS renderHwnd=" + rwAfter);
+
+                    foreach (IntPtr hTarget in (rwAfter != IntPtr.Zero ? new IntPtr[] { rwAfter, top } : new IntPtr[] { top }))
+                    {
+                        IUIAutomationElement root;
+                        if (uia.ElementFromHandle(hTarget, out root) == 0 && root != null)
                         {
-                            IUIAutomationElement be;
-                            if (btnArr1.GetElement(i, out be) == 0 && be != null)
-                            {
-                                string bn; be.get_CurrentName(out bn);
-                                object pat; int tv = -1;
-                                if (be.GetCurrentPattern(UIA_TogglePatternId, out pat) == 0 && pat is IUIAutomationTogglePattern)
-                                { ((IUIAutomationTogglePattern)pat).get_CurrentToggleState(out tv); ReleaseCom(pat); }
-                                sb.AppendLine(string.Format("  Btn1[{0}] tog={1} name='{2}'", i, tv, bn));
-                                ReleaseCom(be);
-                            }
-                        }
-                        ReleaseCom(btnArr1);
+                            IUIAutomationCondition cTrue, cBtn;
+                            uia.CreateTrueCondition(out cTrue);
+                            uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out cBtn);
 
-                        // Safe COM AccessibleObjectFromWindow(OBJID_CLIENT) + IAccessible::get_accChildCount wakeup!
-                        Guid iidAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
-                        object accObj = null;
-                        int hrAcc = NativeWin32.AccessibleObjectFromWindow(top, 0xFFFFFFFCu, ref iidAcc, out accObj);
-                        sb.AppendLine("AccessibleObjectFromWindow(OBJID_CLIENT) hr=0x" + hrAcc.ToString("X8") + " null=" + (accObj == null));
-                        if (accObj != null)
-                        {
-                            try
-                            {
-                                IntPtr pUnk = Marshal.GetIUnknownForObject(accObj);
-                                try
-                                {
-                                    // Query IID_IAccessible2 ({E89F726E-C4F4-4C19-BB19-B647D7FA8478}) -> triggers Chromium NotifyAddAXModeFlags(kAXModeComplete)!
-                                    Guid iidIA2 = new Guid("E89F726E-C4F4-4C19-BB19-B647D7FA8478");
-                                    IntPtr pIA2;
-                                    int hrIA2 = Marshal.QueryInterface(pUnk, ref iidIA2, out pIA2);
-                                    sb.AppendLine("QueryInterface(IID_IAccessible2) hr=0x" + hrIA2.ToString("X8"));
-                                    if (pIA2 != IntPtr.Zero) Marshal.Release(pIA2);
-                                }
-                                finally { if (pUnk != IntPtr.Zero) Marshal.Release(pUnk); }
-                            }
-                            catch (Exception exAcc) { sb.AppendLine("IAcc invoke: " + exAcc.Message); }
-                            finally { ReleaseCom(accObj); }
-                        }
+                            IUIAutomationElementArray allArr;
+                            root.FindAll(4, cTrue, out allArr);
+                            int allLen = -1;
+                            if (allArr != null) allArr.get_Length(out allLen);
 
-                        Thread.Sleep(650);
-                        IntPtr rwAfter = MultiPlayerMediaController.FindRenderWidgetChild(top);
-                        sb.AppendLine("After IA2 renderHwnd=" + rwAfter);
+                            IUIAutomationElementArray btnArr;
+                            root.FindAll(4, cBtn, out btnArr);
+                            int bLen = -1;
+                            if (btnArr != null) btnArr.get_Length(out bLen);
 
-                        IUIAutomationElement root2;
-                        if (uia.ElementFromHandle(top, out root2) == 0 && root2 != null)
-                        {
-                            IUIAutomationElementArray btnArr2;
-                            int hrB2 = root2.FindAll(4 /* Descendants */, cBtn, out btnArr2);
-                            int bLen2 = -1;
-                            if (btnArr2 != null) btnArr2.get_Length(out bLen2);
-                            sb.AppendLine("After Wake Buttons hr=0x" + hrB2.ToString("X8") + " len=" + bLen2);
-                            for (int i = 0; i < Math.Min(Math.Max(0, bLen2), 45); i++)
+                            sb.AppendLine(string.Format("Target={0}: AllDescendants={1} Buttons={2}", hTarget, allLen, bLen));
+                            for (int i = 0; i < Math.Min(Math.Max(0, bLen), 50); i++)
                             {
                                 IUIAutomationElement be;
-                                if (btnArr2.GetElement(i, out be) == 0 && be != null)
+                                if (btnArr.GetElement(i, out be) == 0 && be != null)
                                 {
                                     string bn; be.get_CurrentName(out bn);
                                     object pat; int tv = -1;
                                     if (be.GetCurrentPattern(UIA_TogglePatternId, out pat) == 0 && pat is IUIAutomationTogglePattern)
                                     { ((IUIAutomationTogglePattern)pat).get_CurrentToggleState(out tv); ReleaseCom(pat); }
-                                    sb.AppendLine(string.Format("  Btn2[{0}] tog={1} name='{2}'", i, tv, bn));
+                                    sb.AppendLine(string.Format("  Btn[{0}] tog={1} name='{2}'", i, tv, bn));
                                     ReleaseCom(be);
                                 }
                             }
-                            ReleaseCom(btnArr2);
-                            ReleaseCom(root2);
+                            if (bLen <= 0 && allLen > 0)
+                            {
+                                for (int i = 0; i < Math.Min(allLen, 25); i++)
+                                {
+                                    IUIAutomationElement ae;
+                                    if (allArr.GetElement(i, out ae) == 0 && ae != null)
+                                    {
+                                        string an, ac; int act;
+                                        ae.get_CurrentName(out an); ae.get_CurrentClassName(out ac); ae.get_CurrentControlType(out act);
+                                        sb.AppendLine(string.Format("  Elem[{0}] ct={1} cls='{2}' name='{3}'", i, act, ac, an));
+                                        ReleaseCom(ae);
+                                    }
+                                }
+                            }
+                            ReleaseCom(btnArr); ReleaseCom(allArr); ReleaseCom(cBtn); ReleaseCom(cTrue); ReleaseCom(root);
                         }
-
-                        ReleaseCom(cBtn);
-                        ReleaseCom(cTrue);
-                        ReleaseCom(root);
                     }
                 }
                 ReleaseCom(uia);
