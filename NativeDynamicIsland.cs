@@ -2097,6 +2097,8 @@ namespace DynamicIslandWin
         public static List<MediaSessionSnapshot> QueryAllPlayers(bool preferDedicatedPlayers, out MediaSessionSnapshot activeSession, out int activeIndex)
         {
             var list = new List<MediaSessionSnapshot>();
+            bool foundSmtcVideoPlaying = false;
+            bool foundBrowserSmtcPlaying = false;
             try
             {
                 var mgr = WaitWinRt(GlobalSystemMediaTransportControlsSessionManager.RequestAsync(), 550);
@@ -2144,6 +2146,45 @@ namespace DynamicIslandWin
                             }
                             catch { }
 
+                            bool isPureMusic = IsPureMusicOnlyApp(appId);
+                            bool isDedVideo = IsDedicatedVideoApp(appId);
+                            bool smtcTypeVideo = false;
+                            bool smtcTypeMusic = false;
+                            try
+                            {
+                                if (pb != null && pb.PlaybackType.HasValue)
+                                {
+                                    if (pb.PlaybackType.Value == MediaPlaybackType.Video) smtcTypeVideo = true;
+                                    else if (pb.PlaybackType.Value == MediaPlaybackType.Music) smtcTypeMusic = true;
+                                }
+                                if (props != null && props.PlaybackType.HasValue)
+                                {
+                                    if (props.PlaybackType.Value == MediaPlaybackType.Video) smtcTypeVideo = true;
+                                    else if (props.PlaybackType.Value == MediaPlaybackType.Music) smtcTypeMusic = true;
+                                }
+                            }
+                            catch { }
+
+                            string appLower = appId.ToLowerInvariant();
+                            bool isBrowserSession = false;
+                            foreach (string bkw in BrowserKeywords)
+                                if (appLower.Contains(bkw)) { isBrowserSession = true; break; }
+
+                            bool titleLooksVideoExt = false;
+                            if (!smtcTypeMusic && !isPureMusic && !string.IsNullOrEmpty(title))
+                            {
+                                string tlLow = title.ToLowerInvariant();
+                                if (tlLow.EndsWith(".mp4") || tlLow.EndsWith(".mkv") || tlLow.EndsWith(".avi") ||
+                                    tlLow.EndsWith(".webm") || tlLow.EndsWith(".mov") || tlLow.EndsWith(".wmv") || tlLow.EndsWith(".m4v"))
+                                    titleLooksVideoExt = true;
+                            }
+
+                            bool isVideoSession = !isPureMusic && (smtcTypeVideo || isDedVideo || titleLooksVideoExt);
+                            if (isPlaying && isVideoSession)
+                                foundSmtcVideoPlaying = true;
+                            if (isPlaying && isBrowserSession && !smtcTypeMusic)
+                                foundBrowserSmtcPlaying = true;
+
                             var snap = new MediaSessionSnapshot
                             {
                                 AppId = appId,
@@ -2152,6 +2193,7 @@ namespace DynamicIslandWin
                                 Artist = artist,
                                 IsPlaying = isPlaying,
                                 IsDedicatedPlayer = IsDedicatedMusicApp(appId),
+                                IsVideoPlayback = isVideoSession,
                                 PositionSec = posSec,
                                 DurationSec = durSec,
                                 SampledAtUtc = DateTime.UtcNow,
@@ -2165,6 +2207,9 @@ namespace DynamicIslandWin
                 }
             }
             catch { }
+
+            SmtcVideoPlayingNow = foundSmtcVideoPlaying;
+            SmtcBrowserPlayingNow = foundBrowserSmtcPlaying;
 
             if (list.Count == 0)
             {
@@ -3696,6 +3741,63 @@ namespace DynamicIslandWin
             }
             catch { return false; }
         }
+
+        private static readonly HashSet<string> FullscreenVideoCapableStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "chrome", "msedge", "firefox", "opera", "opera_gx", "yandex", "browser", "brave", "vivaldi",
+            "arc", "zen", "waterfox", "thorium", "librewolf", "floorp",
+            "vlc", "mpv", "mpc-hc", "mpc-hc64", "mpc-be", "mpc-be64", "potplayer", "potplayermini",
+            "potplayermini64", "kmplayer", "gom", "gom64", "wmplayer", "video.ui", "zunevideo",
+            "microsoft.media.player", "applicationframehost", "telegram", "ayugram", "discord"
+        };
+
+        public static bool IsUniversalVideoPlaying(IntPtr ourHwnd, Screen activeScreen, CoreAudioBridge audio)
+        {
+            try
+            {
+                // 1) SMTC explicitly reports active video playback (YouTube, Twitch, Kinopoisk, VK, Windows Media Player, Movies & TV, VLC, etc.)
+                if (MultiPlayerMediaController.SmtcVideoPlayingNow)
+                    return true;
+
+                bool localVideoAudio = false;
+                bool browserAudio = false;
+                if (audio != null)
+                    audio.CheckActiveVideoAndBrowserAudio(out localVideoAudio, out browserAudio);
+
+                // 2) Dedicated local video player (VLC, MPV, PotPlayer, MPC-HC/BE, Movies & TV) has an active CoreAudio stream
+                if (localVideoAudio)
+                    return true;
+
+                // 3) Fullscreen video fallback (when browser/player is fullscreen & outputting audio or playing SMTC without PlaybackType.Video)
+                IntPtr fg = NativeWin32.GetForegroundWindow();
+                if (fg != IntPtr.Zero && fg != ourHwnd && !NativeWin32.IsIconic(fg) && activeScreen != null)
+                {
+                    NativeWin32.RECT rc;
+                    if (NativeWin32.GetWindowRect(fg, out rc))
+                    {
+                        Rectangle b = activeScreen.Bounds;
+                        bool covers = (rc.Left <= b.Left + 2 && rc.Top <= b.Top + 2 && rc.Right >= b.Right - 2 && rc.Bottom >= b.Bottom - 2);
+                        if (covers)
+                        {
+                            uint pid;
+                            NativeWin32.GetWindowThreadProcessId(fg, out pid);
+                            if (pid != 0)
+                            {
+                                string pName;
+                                TryQueryProcessPathFast(pid, out pName);
+                                if (!string.IsNullOrEmpty(pName) && FullscreenVideoCapableStems.Contains(pName))
+                                {
+                                    if (browserAudio || MultiPlayerMediaController.SmtcBrowserPlayingNow || localVideoAudio)
+                                        return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
     }
 
     internal static class NativeWin32
@@ -3837,6 +3939,28 @@ namespace DynamicIslandWin
         [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
         public const uint WM_KEYUP = 0x0101;
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+        public const uint SWP_NOZORDER = 0x0004;
+        public const uint SWP_NOOWNERZORDER = 0x0200;
+        public const int WM_WINDOWPOSCHANGING = 0x0046;
+        public const uint WM_APPCOMMAND = 0x0319;
+        public const int APPCOMMAND_MEDIA_PLAY_PAUSE = 14;
+        public const int APPCOMMAND_MEDIA_PLAY = 46;
+        public const int APPCOMMAND_MEDIA_NEXTTRACK = 11;
+        public const int APPCOMMAND_MEDIA_PREVIOUSTRACK = 12;
+        public const uint GW_HWNDPREV = 3;
+        [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct WINDOWPOS
+        {
+            public IntPtr hwnd;
+            public IntPtr hwndInsertAfter;
+            public int x;
+            public int y;
+            public int cx;
+            public int cy;
+            public uint flags;
+        }
         public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern uint RegisterWindowMessageW(string lpString);
