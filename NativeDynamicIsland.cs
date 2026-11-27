@@ -6582,6 +6582,10 @@ namespace DynamicIslandWin
             {
                 _activeTab = 1; _inspectorSubMode = 0;
             }
+            else if (lq.Contains("эква") || lq.Contains("спектр") || lq.Contains("волн") || lq.Contains("зерк") || lq.Contains("визуал"))
+            {
+                _activeTab = 1; _inspectorSubMode = 2;
+            }
             else if (lq.Contains("плеер") || lq.Contains("муз") || lq.Contains("облож") || lq.Contains("лайк"))
             {
                 _activeTab = 1; _inspectorSubMode = 1;
@@ -6861,7 +6865,7 @@ namespace DynamicIslandWin
 
             using (GraphicsPath path = SharpRoundRect(rc, 6f))
             using (var bgBr = new SolidBrush(ColDeckCard))
-            using (var pen = new Pen(filterHit ? ColAccent : (hovered ? Color.FromArgb(36, 255, 255, 255) : ColBorder), 1f))
+            using (var pen = new Pen(filterHit ? ColAccent : (hovered ? ColBorderHi : ColBorder), 1f))
             {
                 g.FillPath(bgBr, path);
                 g.DrawPath(pen, path);
@@ -6887,16 +6891,16 @@ namespace DynamicIslandWin
         {
             bool hov = rc.Contains(_mousePt);
             Color bg = primaryAccent
-                ? (hov ? Color.FromArgb(255, 102, 24) : ColAccent)
+                ? (hov ? ColAccentHover : ColAccent)
                 : (danger
-                    ? (hov ? Color.FromArgb(52, 22, 24) : Color.FromArgb(28, 16, 18))
+                    ? (_isLightTheme ? (hov ? Color.FromArgb(254, 215, 215) : Color.FromArgb(254, 232, 232)) : (hov ? Color.FromArgb(52, 22, 24) : Color.FromArgb(28, 16, 18)))
                     : (hov ? ColDeckHover : ColDeckCard));
             Color border = primaryAccent
-                ? Color.FromArgb(220, 255, 140, 80)
-                : (danger ? Color.FromArgb(110, 255, 70, 60) : (hov ? ColBorderHi : ColBorder));
+                ? ColAccentHover
+                : (danger ? Color.FromArgb(145, 239, 68, 68) : (hov ? ColBorderHi : ColBorder));
             Color fg = primaryAccent
-                ? Color.FromArgb(12, 12, 14)
-                : (danger ? Color.FromArgb(255, 105, 95) : ColTextMain);
+                ? ColOnAccentText
+                : (danger ? (_isLightTheme ? Color.FromArgb(185, 28, 28) : Color.FromArgb(255, 105, 95)) : ColTextMain);
 
             using (GraphicsPath p = SharpRoundRect(rc, 4f))
             using (var b = new SolidBrush(bg))
@@ -6942,7 +6946,7 @@ namespace DynamicIslandWin
                 g.DrawString(label, _fChip, lblBr, new RectangleF(cellRc.X + 8f, cellRc.Y + 4f, cellRc.Width - 84f, 19f), _sfLeft);
 
             using (GraphicsPath vp = SharpRoundRect(valBoxRc, 3f))
-            using (var vb = new SolidBrush(Color.FromArgb(10, 10, 12)))
+            using (var vb = new SolidBrush(ColWellBg))
             using (var vPen = new Pen(valHov ? ColAccent : ColBorder, 1f))
             using (var vt = new SolidBrush(ColAccent))
             {
@@ -6964,9 +6968,9 @@ namespace DynamicIslandWin
             float activeX = trackLeft + trackW * ratio;
 
             int ticks = Math.Max(6, tickCount);
-            using (var penDimTick = new Pen(Color.FromArgb(42, 255, 255, 255), 1f))
-            using (var penActTick = new Pen(Color.FromArgb(195, 255, 85, 0), 1f))
-            using (var penRail = new Pen(Color.FromArgb(35, 255, 255, 255), 1.5f))
+            using (var penDimTick = new Pen(ColInkAlpha(42), 1f))
+            using (var penActTick = new Pen(ColAccentAlpha(195), 1f))
+            using (var penRail = new Pen(ColInkAlpha(35), 1.5f))
             using (var penActiveRail = new Pen(ColAccent, 2.0f))
             {
                 g.DrawLine(penRail, trackLeft, rulerBaseY, trackRight, rulerBaseY);
@@ -7033,7 +7037,7 @@ namespace DynamicIslandWin
             var onRc = new RectangleF(segRc.X + segW / 2f, segRc.Y + 1f, segW / 2f - 1f, segH - 2f);
 
             using (GraphicsPath sp = SharpRoundRect(segRc, 3.5f))
-            using (var sb = new SolidBrush(Color.FromArgb(9, 9, 11)))
+            using (var sb = new SolidBrush(ColWellBg))
             using (var sPen = new Pen(ColBorder, 1f))
             {
                 g.FillPath(sb, sp);
@@ -7043,13 +7047,13 @@ namespace DynamicIslandWin
             if (!value)
             {
                 using (GraphicsPath op = SharpRoundRect(offRc, 2.5f))
-                using (var ob = new SolidBrush(Color.FromArgb(38, 40, 48)))
+                using (var ob = new SolidBrush(_isLightTheme ? Color.FromArgb(203, 210, 224) : Color.FromArgb(38, 40, 48)))
                     g.FillPath(ob, op);
             }
             else
             {
                 using (GraphicsPath op = SharpRoundRect(onRc, 2.5f))
-                using (var ob = new SolidBrush(Color.FromArgb(48, 255, 85, 0)))
+                using (var ob = new SolidBrush(ColAccentAlpha(48)))
                 using (var oPen = new Pen(ColAccent, 1f))
                 {
                     g.FillPath(ob, op);
@@ -7107,7 +7111,7 @@ namespace DynamicIslandWin
                 bool hov = cRc.Contains(_mousePt);
 
                 using (GraphicsPath cp = SharpRoundRect(cRc, 4f))
-                using (var cb = new SolidBrush(selected ? Color.FromArgb(36, 255, 85, 0) : (hov ? ColDeckHover : ColDeckInset)))
+                using (var cb = new SolidBrush(selected ? ColAccentAlpha(38) : (hov ? ColDeckHover : ColDeckInset)))
                 using (var cPen = new Pen(selected ? ColAccent : (hov ? ColBorderHi : ColBorder), 1f))
                 {
                     g.FillPath(cb, cp);
@@ -7156,13 +7160,13 @@ namespace DynamicIslandWin
             bool filterHit = MatchesFilter(title) || MatchesFilter(subState);
 
             Color bg = enabled
-                ? (hov ? Color.FromArgb(28, 28, 34) : Color.FromArgb(21, 21, 26))
-                : (hov ? Color.FromArgb(20, 20, 24) : ColDeckInset);
+                ? (hov ? ColDeckHover : ColDeckCard)
+                : (hov ? ColDeckHover : ColDeckInset);
             Color border = filterHit
                 ? ColAccent
                 : (inspectorActive
                     ? ColBorderHi
-                    : (enabled ? Color.FromArgb(95, 255, 85, 0) : (hov ? ColBorderHi : ColBorder)));
+                    : (enabled ? ColAccentAlpha(115) : (hov ? ColBorderHi : ColBorder)));
 
             using (GraphicsPath cp = SharpRoundRect(rc, 5f))
             using (var cb = new SolidBrush(bg))
@@ -7183,7 +7187,7 @@ namespace DynamicIslandWin
             using (var codeBr = new SolidBrush(enabled ? ColAccent : ColTextDim))
                 g.DrawString(modCode, _fMonoTiny, codeBr, new RectangleF(rc.X + 10f, rc.Y + 6f, 68f, 13f), _sfLeft);
 
-            Color ledCol = enabled ? ColLime : Color.FromArgb(55, 255, 255, 255);
+            Color ledCol = enabled ? ColLime : ColInkAlpha(55);
             float ledRightOffset = hasInspector ? 34f : 12f;
             using (var ledBr = new SolidBrush(ledCol))
                 g.FillEllipse(ledBr, rc.Right - ledRightOffset - 6f, rc.Y + 9f, 6f, 6f);
@@ -7201,9 +7205,9 @@ namespace DynamicIslandWin
                 var gearRc = new RectangleF(rc.Right - 28f, rc.Y + 6f, 22f, rc.Height - 12f);
                 bool gHov = gearRc.Contains(_mousePt);
                 using (GraphicsPath gp = SharpRoundRect(gearRc, 3.5f))
-                using (var gb = new SolidBrush(inspectorActive ? ColAccent : (gHov ? ColDeckHover : Color.FromArgb(12, 12, 15))))
+                using (var gb = new SolidBrush(inspectorActive ? ColAccent : (gHov ? ColDeckHover : ColWellBg)))
                 using (var gPen = new Pen(inspectorActive ? ColAccent : ColBorder, 1f))
-                using (var gt = new SolidBrush(inspectorActive ? Color.FromArgb(12, 12, 14) : ColTextMuted))
+                using (var gt = new SolidBrush(inspectorActive ? ColOnAccentText : ColTextMuted))
                 {
                     g.FillPath(gb, gp);
                     g.DrawPath(gPen, gp);
@@ -7223,7 +7227,7 @@ namespace DynamicIslandWin
         private void DrawLiveSpringOscilloscope(Graphics g, RectangleF scopeRc)
         {
             using (GraphicsPath sp = SharpRoundRect(scopeRc, 4f))
-            using (var sb = new SolidBrush(Color.FromArgb(10, 10, 12)))
+            using (var sb = new SolidBrush(ColWellBg))
             using (var sPen = new Pen(ColBorder, 1f))
             {
                 g.FillPath(sb, sp);
@@ -7239,8 +7243,8 @@ namespace DynamicIslandWin
             float yOne = gyTop + gh * 0.30f;
             float scaleY = yZero - yOne;
 
-            using (var gridPen = new Pen(Color.FromArgb(18, 255, 255, 255), 1f))
-            using (var targetPen = new Pen(Color.FromArgb(65, 200, 255, 0), 1f) { DashStyle = DashStyle.Dot })
+            using (var gridPen = new Pen(ColInkAlpha(22), 1f))
+            using (var targetPen = new Pen(Color.FromArgb(85, ColLime.R, ColLime.G, ColLime.B), 1f) { DashStyle = DashStyle.Dot })
             {
                 for (int i = 1; i <= 3; i++)
                 {
@@ -7289,7 +7293,7 @@ namespace DynamicIslandWin
             bool hov = padRc.Contains(_mousePt) || _draggingSpatialPad;
 
             using (GraphicsPath pp = SharpRoundRect(padRc, 5f))
-            using (var pb = new SolidBrush(Color.FromArgb(10, 10, 13)))
+            using (var pb = new SolidBrush(ColWellBg))
             using (var pPen = new Pen(hov ? ColAccent : ColBorderHi, 1f))
             {
                 g.FillPath(pb, pp);
@@ -7298,8 +7302,8 @@ namespace DynamicIslandWin
 
             // Engineering grid + Center X=0 & Top Y=0 guides
             float midX = padRc.X + padRc.Width * 0.5f;
-            using (var axisPen = new Pen(Color.FromArgb(30, 255, 255, 255), 1f) { DashStyle = DashStyle.Dot })
-            using (var bezelPen = new Pen(Color.FromArgb(90, 255, 85, 0), 1.5f))
+            using (var axisPen = new Pen(ColInkAlpha(32), 1f) { DashStyle = DashStyle.Dot })
+            using (var bezelPen = new Pen(ColAccentAlpha(110), 1.5f))
             {
                 g.DrawLine(axisPen, midX, padRc.Y + 2f, midX, padRc.Bottom - 2f);
                 g.DrawLine(axisPen, padRc.X + 2f, padRc.Y + padRc.Height * 0.5f, padRc.Right - 2f, padRc.Y + padRc.Height * 0.5f);
@@ -7318,7 +7322,7 @@ namespace DynamicIslandWin
             float iy = padRc.Y + 8f + normY * usableH;
 
             // Coordinate crosshair lines to miniature island
-            using (var guidePen = new Pen(Color.FromArgb(65, 255, 85, 0), 1f))
+            using (var guidePen = new Pen(ColAccentAlpha(80), 1f))
             {
                 g.DrawLine(guidePen, ix + pillW / 2f, padRc.Y + 6f, ix + pillW / 2f, iy);
             }
@@ -7356,7 +7360,7 @@ namespace DynamicIslandWin
             // -----------------------------------------------------------------
             // TOP CONSOLE HEADER BAR (y = 0..34)
             // -----------------------------------------------------------------
-            using (var barBr = new SolidBrush(Color.FromArgb(14, 14, 17)))
+            using (var barBr = new SolidBrush(ColHeaderBar))
             using (var barPen = new Pen(ColBorder, 1f))
             {
                 g.FillRectangle(barBr, 0, 0, Width, 34);
@@ -7431,7 +7435,7 @@ namespace DynamicIslandWin
                 g.SetClip(clipPath);
 
                 // 1) Dot-Matrix Engineering Grid (16px pitch)
-                using (var dotBr = new SolidBrush(Color.FromArgb(20, 255, 255, 255)))
+                using (var dotBr = new SolidBrush(ColInkAlpha(26)))
                 {
                     for (float gx = stageRc.X + 14f; gx < stageRc.Right - 8f; gx += 16f)
                     {
@@ -7445,8 +7449,8 @@ namespace DynamicIslandWin
                 // 2) Top Screen Bezel Axis & Vertical Center Axis
                 float bezelY = stageRc.Y + 22f;
                 float centerX = stageRc.X + stageRc.Width * 0.5f;
-                using (var axisPen = new Pen(Color.FromArgb(26, 255, 255, 255), 1f) { DashStyle = DashStyle.Dot })
-                using (var bezelPen = new Pen(Color.FromArgb(60, 255, 255, 255), 1f))
+                using (var axisPen = new Pen(ColInkAlpha(28), 1f) { DashStyle = DashStyle.Dot })
+                using (var bezelPen = new Pen(ColInkAlpha(64), 1f))
                 using (var axisLblBr = new SolidBrush(ColTextDim))
                 {
                     g.DrawLine(bezelPen, stageRc.X + 12f, bezelY, stageRc.Right - 12f, bezelY);
@@ -7476,7 +7480,7 @@ namespace DynamicIslandWin
                 GetPreviewThemeColors(255, out tc1, out tc2);
 
                 // Dimension Engineering Callouts around Capsule
-                using (var dimPen = new Pen(Color.FromArgb(55, 255, 85, 0), 1f))
+                using (var dimPen = new Pen(ColAccentAlpha(85), 1f))
                 using (var dimTxt = new SolidBrush(ColAccent))
                 {
                     float callY = Math.Min(stageRc.Bottom - 46f, pillRc.Bottom + 7f);
@@ -7547,7 +7551,7 @@ namespace DynamicIslandWin
                 bool mHov = mRc.Contains(_mousePt);
 
                 using (GraphicsPath mp = SharpRoundRect(mRc, 3.5f))
-                using (var mb = new SolidBrush(act ? Color.FromArgb(42, 255, 85, 0) : (mHov ? ColDeckHover : ColDeckCard)))
+                using (var mb = new SolidBrush(act ? ColAccentAlpha(42) : (mHov ? ColDeckHover : ColDeckCard)))
                 using (var mPen = new Pen(act ? ColAccent : ColBorder, 1f))
                 using (var mt = new SolidBrush(act ? ColTextMain : ColTextMuted))
                 {
@@ -7590,8 +7594,8 @@ namespace DynamicIslandWin
                 using (var cg = new LinearGradientBrush(covRc, tc1, tc2, 45f))
                     g.FillPath(cg, cp);
 
-                using (var wBr = new SolidBrush(ColTextMain))
-                using (var mBr = new SolidBrush(ColTextMuted))
+                using (var wBr = new SolidBrush(Color.FromArgb(245, 246, 250)))
+                using (var mBr = new SolidBrush(Color.FromArgb(165, 170, 185)))
                 {
                     g.DrawString("DYNAMIC STUDIO • LIVE", _fMonoTiny, wBr, new RectangleF(covRc.Right + 8f, mediaBox.Y + 5f, mediaBox.Width - 95f, 14f), _sfLeft);
                     g.DrawString(_cfg.theme_preset ?? "Dinasmic Neon", _fSub, mBr, new RectangleF(covRc.Right + 8f, mediaBox.Y + 19f, mediaBox.Width - 95f, 14f), _sfLeft);
@@ -7629,7 +7633,7 @@ namespace DynamicIslandWin
             if (_stageMode == StagePreviewMode.Notify)
             {
                 using (var dotBr = new SolidBrush(ColAccent))
-                using (var txtBr = new SolidBrush(ColTextMain))
+                using (var txtBr = new SolidBrush(Color.FromArgb(245, 246, 250)))
                 {
                     g.FillEllipse(dotBr, pillRc.X + 12f, pillRc.Y + (pillRc.Height - 8f) / 2f, 8f, 8f);
                     g.DrawString("🔔 ТАЙМЕР " + _cfg.pomodoro_minutes + ":00  •  LIVE ACTIVITY", _fMonoTiny, txtBr,
@@ -7642,7 +7646,7 @@ namespace DynamicIslandWin
             float leftCur = pillRc.X + 10f;
             if (_cfg.show_clock)
             {
-                using (var clkBr = new SolidBrush(ColTextMain))
+                using (var clkBr = new SolidBrush(Color.FromArgb(245, 246, 250)))
                     g.DrawString(DateTime.Now.ToString("HH:mm"), _fMonoTiny, clkBr, new RectangleF(leftCur, pillRc.Y, 38f, pillRc.Height), _sfLeft);
                 leftCur += 40f;
             }
@@ -7662,7 +7666,7 @@ namespace DynamicIslandWin
                 using (var cg = new LinearGradientBrush(cov, tc1, tc2, 45f))
                     g.FillPath(cg, cp);
 
-                using (var tBr = new SolidBrush(ColTextMain))
+                using (var tBr = new SolidBrush(Color.FromArgb(245, 246, 250)))
                     g.DrawString(_stageMode == StagePreviewMode.Media ? "KINETIC AUDIO • 60HZ" : "YANDEX / SPOTIFY",
                         _fMonoTiny, tBr, new RectangleF(cov.Right + 6f, pillRc.Y, pillRc.Width - (cov.Right - pillRc.X) - 52f, pillRc.Height), _sfLeft);
             }
@@ -7672,26 +7676,82 @@ namespace DynamicIslandWin
                     g.DrawString("98%", _fMonoTiny, batBr, new RectangleF(leftCur + 2f, pillRc.Y, 34f, pillRc.Height), _sfLeft);
             }
 
-            // Live Equalizer Bars on right of Compact Stage Capsule
+            // Live Equalizer Multi-Style Preview on right of Compact Stage Capsule
             if (_cfg.eq_style != "Выкл" && _cfg.eq_style != "Off")
             {
-                int bars = (_cfg.eq_style != null && _cfg.eq_style.Contains("7")) ? 7 : 5;
-                float bw = 2.4f, gap = 2.2f;
+                Color eq1 = tc1, eq2 = tc2;
+                if (_cfg.eq_color_mode == "Один цвет")
+                {
+                    eq1 = ColorThemeUtils.ParseHex(_cfg.eq_custom_color_hex, tc1);
+                    eq2 = eq1;
+                }
+                else if (_cfg.eq_color_mode == "Обложка трека")
+                {
+                    eq1 = Color.FromArgb(255, 244, 114, 182);
+                    eq2 = Color.FromArgb(255, 56, 189, 248);
+                }
+
+                int bars = Math.Max(4, Math.Min(12, _cfg.eq_bar_count));
+                float sens = Math.Max(0.4f, Math.Min(2.2f, _cfg.eq_sensitivity_pct / 100f));
+                float bw = bars > 8 ? 2.0f : 2.5f;
+                float gap = bars > 8 ? 1.7f : 2.2f;
                 float totalW = bars * bw + (bars - 1) * gap;
                 float sx = pillRc.Right - 11f - totalW;
                 float cy = pillRc.Y + pillRc.Height * 0.5f;
-                float maxH = Math.Min(16f, pillRc.Height - 10f);
+                float maxH = Math.Min(18f, pillRc.Height - 9f);
+                string style = _cfg.eq_style ?? "Столбики";
 
-                using (var b1 = new SolidBrush(tc1))
-                using (var b2 = new SolidBrush(tc2))
+                if (style == "Волна")
+                {
+                    PointF[] wPts = new PointF[bars + 2];
+                    for (int i = 0; i < wPts.Length; i++)
+                    {
+                        float t = i / (float)(wPts.Length - 1);
+                        float env = (float)Math.Sin(t * Math.PI);
+                        float v = (_stageMode == StagePreviewMode.Idle ? 0.12f : 0.45f * sens) * env * (float)Math.Sin(_stageWavePhase * 1.4f + i * 0.95f);
+                        wPts[i] = new PointF(sx + totalW * t, cy + Math.Max(-maxH * 0.5f, Math.Min(maxH * 0.5f, v * maxH)));
+                    }
+                    using (var wPen2 = new Pen(Color.FromArgb(115, eq2.R, eq2.G, eq2.B), 2.4f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                    using (var wPen1 = new Pen(eq1, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                    {
+                        g.DrawCurve(wPen2, wPts, 0.45f);
+                        g.DrawCurve(wPen1, wPts, 0.45f);
+                    }
+                }
+                else
                 {
                     for (int i = 0; i < bars; i++)
                     {
-                        float amp = (_stageMode == StagePreviewMode.Idle)
-                            ? 0.25f
-                            : (0.35f + 0.62f * Math.Abs((float)Math.Sin(_stageWavePhase + i * 0.85f)));
-                        float bh = Math.Max(3f, maxH * amp);
-                        g.FillRectangle((i % 2 == 0) ? b1 : b2, sx + i * (bw + gap), cy - bh * 0.5f, bw, bh);
+                        float t = bars > 1 ? (i / (float)(bars - 1)) : 0f;
+                        Color bc = ColorThemeUtils.Blend(eq1, eq2, t);
+                        float raw = (_stageMode == StagePreviewMode.Idle)
+                            ? 0.22f
+                            : Math.Min(1f, (0.22f + 0.62f * Math.Abs((float)Math.Sin(_stageWavePhase + i * 0.82f))) * sens);
+                        float bx = sx + i * (bw + gap);
+                        using (var br = new SolidBrush(bc))
+                        {
+                            if (style == "Точки")
+                            {
+                                float dSz = bw + 1.0f;
+                                float bounce = (raw - 0.35f) * (maxH * 0.42f);
+                                g.FillEllipse(br, bx - 0.5f, cy - bounce - dSz * 0.5f, dSz, dSz);
+                                using (var dimBr = new SolidBrush(Color.FromArgb(80, bc.R, bc.G, bc.B)))
+                                    g.FillEllipse(dimBr, bx - 0.2f, cy + maxH * 0.28f, bw, bw);
+                            }
+                            else if (style == "Зеркальный")
+                            {
+                                float sym = 1f - Math.Abs(t * 2f - 1f) * 0.45f;
+                                float halfH = Math.Max(1.6f, maxH * 0.5f * raw * sym);
+                                g.FillRectangle(br, bx, cy - halfH - 0.6f, bw, halfH);
+                                using (var refl = new SolidBrush(Color.FromArgb(165, bc.R, bc.G, bc.B)))
+                                    g.FillRectangle(refl, bx, cy + 0.6f, bw, halfH);
+                            }
+                            else // Столбики (Bars — bottom-anchored classic spectrum)
+                            {
+                                float bh = Math.Max(2.8f, maxH * raw);
+                                g.FillRectangle(br, bx, cy + maxH * 0.48f - bh, bw, bh);
+                            }
+                        }
                     }
                 }
             }
@@ -7719,7 +7779,7 @@ namespace DynamicIslandWin
                 bool hov = tRc.Contains(_mousePt);
 
                 using (GraphicsPath tp = SharpRoundRect(tRc, 3.5f))
-                using (var tb = new SolidBrush(active ? Color.FromArgb(34, 255, 85, 0) : (hov ? ColDeckHover : Color.Transparent)))
+                using (var tb = new SolidBrush(active ? ColAccentAlpha(36) : (hov ? ColDeckHover : Color.Transparent)))
                 {
                     g.FillPath(tb, tp);
                     if (active)
@@ -7909,7 +7969,7 @@ namespace DynamicIslandWin
                 var stRc = new RectangleF(sx + i * (stW + 4f), sy, stW, 22f);
                 bool act = (_inspectorSubMode == i);
                 using (GraphicsPath sp = SharpRoundRect(stRc, 3.5f))
-                using (var sb = new SolidBrush(act ? Color.FromArgb(38, 255, 85, 0) : ColDeckInset))
+                using (var sb = new SolidBrush(act ? ColAccentAlpha(40) : ColDeckInset))
                 using (var sPen = new Pen(act ? ColAccent : ColBorder, 1f))
                 using (var st = new SolidBrush(act ? ColTextMain : ColTextMuted))
                 {
