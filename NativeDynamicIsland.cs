@@ -2597,16 +2597,25 @@ namespace DynamicIslandWin
                         {
                             try
                             {
-                                // Invoke DISPID_ACC_CHILDCOUNT (-5001) or Type.InvokeMember to trigger Chromium OnScreenReaderDetected!
-                                object cc = accObj.GetType().InvokeMember("accChildCount", System.Reflection.BindingFlags.GetProperty, null, accObj, null);
-                                object nm = accObj.GetType().InvokeMember("accName", System.Reflection.BindingFlags.GetProperty, null, accObj, new object[] { 0 });
-                                sb.AppendLine("IAccessible accChildCount=" + cc + " accName='" + nm + "'");
+                                IntPtr pUnk = Marshal.GetIUnknownForObject(accObj);
+                                try
+                                {
+                                    // Query IID_IAccessible2 ({E89F726E-C4F4-4C19-BB19-B647D7FA8478}) -> triggers Chromium NotifyAddAXModeFlags(kAXModeComplete)!
+                                    Guid iidIA2 = new Guid("E89F726E-C4F4-4C19-BB19-B647D7FA8478");
+                                    IntPtr pIA2;
+                                    int hrIA2 = Marshal.QueryInterface(pUnk, ref iidIA2, out pIA2);
+                                    sb.AppendLine("QueryInterface(IID_IAccessible2) hr=0x" + hrIA2.ToString("X8"));
+                                    if (pIA2 != IntPtr.Zero) Marshal.Release(pIA2);
+                                }
+                                finally { if (pUnk != IntPtr.Zero) Marshal.Release(pUnk); }
                             }
                             catch (Exception exAcc) { sb.AppendLine("IAcc invoke: " + exAcc.Message); }
                             finally { ReleaseCom(accObj); }
                         }
 
-                        Thread.Sleep(450);
+                        Thread.Sleep(650);
+                        IntPtr rwAfter = MultiPlayerMediaController.FindRenderWidgetChild(top);
+                        sb.AppendLine("After IA2 renderHwnd=" + rwAfter);
 
                         IUIAutomationElement root2;
                         if (uia.ElementFromHandle(top, out root2) == 0 && root2 != null)
