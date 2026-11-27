@@ -202,6 +202,20 @@ class AutoSyncDaemon:
         if not st.stdout.strip():
             return True
 
+        # Auto-sync release/version.json & binaries if CurrentVersionStr or Setup changed
+        pub_script = self.repo_root / "tools" / "publish_release.py"
+        if pub_script.is_file():
+            try:
+                subprocess.run(
+                    [sys.executable, str(pub_script), "auto-if-changed", "--no-push"],
+                    cwd=str(self.repo_root),
+                    capture_output=True,
+                    timeout=90,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception as exc:
+                self.log("WARN", f"publish_release auto-if-changed skipped: {exc}")
+
         add_res = self.run_git(git_exe, ["add", "-A"])
         if add_res.returncode != 0:
             self.log("ERROR", f"Ошибка git add -A: {add_res.stderr.strip()}")
