@@ -4013,6 +4013,8 @@ namespace DynamicIslandWin
         private readonly IslandConfigData _cfg;
         public event Action SettingsSaved;
         public event Action ManualUpdateCheckRequested;
+        public UpdateManager Updater { get; set; }
+        private UpdateCheckState _lastShownUpdState = UpdateCheckState.Idle;
 
         // Motion Lab Palette (Strict Black Hierarchy: #000000 ONLY on Stage Island)
         private static readonly Color ColChassis = Color.FromArgb(11, 11, 13);        // #0B0B0D
@@ -4291,6 +4293,7 @@ namespace DynamicIslandWin
         {
             bool dirty = false;
             _stageWavePhase += 0.16f;
+            if (Updater != null && Updater.State != _lastShownUpdState) { _lastShownUpdState = Updater.State; dirty = true; }
 
             if (_stageAnimating)
             {
@@ -4333,7 +4336,7 @@ namespace DynamicIslandWin
                 dirty = true;
 
             if (dirty)
-                Invalidate(new Rectangle(0, 32, Width, 290));
+                Invalidate(new Rectangle(0, 0, Width, 322));
         }
 
         private void BeginInlineNumericEdit(RectangleF boxRc, int curVal, int minVal, int maxVal, Action<int> setter)
@@ -4969,10 +4972,17 @@ namespace DynamicIslandWin
             using (var dimBr = new SolidBrush(ColTextDim))
             {
                 g.FillRectangle(accBr, 14, 11, 8, 12);
-                g.DrawString("DYNAMIC ISLAND // KINETIC STAGE & DECK", _fConsoleBrand, titleBr, new RectangleF(28, 0, 330, 34), _sfLeft);
-                g.DrawString("MOTION LAB v3.0  •  CLICK VALUE = KEYBOARD  •  WHEEL = ±1", _fMonoTiny, dimBr, new RectangleF(352, 0, 275, 34), _sfLeft);
+                g.DrawString("DYNAMIC ISLAND // KINETIC STAGE & DECK", _fConsoleBrand, titleBr, new RectangleF(28, 0, 290, 34), _sfLeft);
+                g.DrawString("WHEEL ±1 • CLICK = INPUT", _fMonoTiny, dimBr, new RectangleF(318, 0, 158, 34), _sfLeft);
             }
 
+            bool updAvail = (Updater != null && Updater.IsUpdateAvailable);
+            bool updBusy = (Updater != null && (Updater.IsChecking || Updater.IsDownloading));
+            string updLabel = updAvail ? ("● ДОСТУПНО v" + Updater.LatestVersionStr) : (updBusy ? "⟳ ПРОВЕРКА..." : "↻ ОБНОВЛЕНИЯ");
+            DrawHardwareButton(g, new RectangleF(Width - 400, 6, 140, 22), updLabel, updAvail, false, () =>
+            {
+                if (ManualUpdateCheckRequested != null) ManualUpdateCheckRequested();
+            });
             DrawHardwareButton(g, new RectangleF(Width - 252, 6, 76, 22), "ВЫХОД APP", false, true, () => Application.Exit());
             DrawHardwareButton(g, new RectangleF(Width - 170, 6, 80, 22), "ПРИМЕНИТЬ", false, false, () => ApplyLive());
             DrawHardwareButton(g, new RectangleF(Width - 84, 6, 70, 22), "ГОТОВО ✕", true, false, () =>
@@ -5819,7 +5829,7 @@ namespace DynamicIslandWin
                 "АВТО-УСТАНОВКА РЕЛИЗОВ GITHUB", _cfg.auto_update_enabled, v => _cfg.auto_update_enabled = v);
 
             DrawHardwareButton(g, new RectangleF(bx, sysCell.Y + 81f, bw, 20f),
-                "↻ ПРОВЕРИТЬ ОБНОВЛЕНИЯ MILTANCHIK/DYNAMICISLAND", false, false, () =>
+                "↻ ЦЕНТР ОБНОВЛЕНИЙ — ПРОВЕРИТЬ СЕЙЧАС", true, false, () =>
                 {
                     if (ManualUpdateCheckRequested != null) ManualUpdateCheckRequested();
                 });
@@ -6537,6 +6547,9 @@ namespace DynamicIslandWin
             RectangleF pill = CurrentPillRect();
             RectangleF hitBox = RectangleF.Inflate(pill, _lctrlHeld ? 14f : 4f, _lctrlHeld ? 14f : 4f);
             bool needsRedraw = lctrlChanged || _bgStateDirty || cursorMovedInside;
+            // GAME THROTTLE: while a fullscreen game runs and the island is idle, repaint <= 4 Hz (keeps DWM Independent Flip + FPS intact)
+            bool gameThrottle = _isFullscreenAppActive && _mode == IslandMode.Idle && !_isAnimating && !_isHovered &&
+                                _expandedPage != 1 && !_isResizingWithLCtrl && !_lctrlHeld;
 
             // MODULE 1: Smooth Fullscreen Auto-Hide fade & upward slide
             bool wantAutoHideFs = _isFullscreenAppActive && (_expandedPage != 1) &&
@@ -6565,7 +6578,7 @@ namespace DynamicIslandWin
 
                 if (proxZone.Contains(localPt.X, localPt.Y))
                 {
-                    if (NativeWin32.IsModifierHeldForGhostExit())
+                    if (NativeWin32.IsModifierHeldForGhostExit() && !_isFullscreenAppActive)
                     {
                         _ghostUnlockedByUser = true;
                         _ghostModeActive = false;
@@ -6583,7 +6596,7 @@ namespace DynamicIslandWin
                                 _ghostUnlockedByUser = true;
                                 _ghostModeActive = false;
                                 _centerHoverStartTick = 0;
-                                ExpandIsland();
+                                if (!_isFullscreenAppActive) ExpandIsland();
                             }
                             else
                             {
@@ -6662,7 +6675,7 @@ namespace DynamicIslandWin
             }
             _bgStateDirty = false;
 
-            if (_bgEngine.AdvanceAnimationFrame())
+            if (!gameThrottle && _bgEngine.AdvanceAnimationFrame())
                 needsRedraw = true;
 
             if (_isAnimating && !_isResizingWithLCtrl)
@@ -6683,7 +6696,7 @@ namespace DynamicIslandWin
                 needsRedraw = true;
             }
 
-            if ((_mode != IslandMode.Expanded || _expandedPage != 1) && _config.eq_style != "Выкл" && _config.eq_style != "Off")
+            if (!gameThrottle && (_mode != IslandMode.Expanded || _expandedPage != 1) && _config.eq_style != "Выкл" && _config.eq_style != "Off")
             {
                 float masterPeak, leftPeak, rightPeak;
                 _audio.SampleAudioPeaks(out masterPeak, out leftPeak, out rightPeak);
@@ -6786,6 +6799,35 @@ namespace DynamicIslandWin
                 }
             }
 
+            if (_pendingUpdatePopup)
+            {
+                if (!_isFullscreenAppActive && _updateDialog == null && !_updater.DismissedForSession && _updater.State == UpdateCheckState.Available)
+                {
+                    _pendingUpdatePopup = false;
+                    try { ShowUpdateDialog(false, null); } catch { }
+                }
+                else if (_updater.DismissedForSession || (_updater.State != UpdateCheckState.Available && _updater.State != UpdateCheckState.Checking))
+                {
+                    _pendingUpdatePopup = false;
+                }
+            }
+
+            if (gameThrottle)
+            {
+                int tNow = Environment.TickCount;
+                if (needsRedraw) _gameRenderPending = true;
+                if (_gameRenderPending && unchecked(tNow - _lastGameRenderTick) >= 250)
+                {
+                    needsRedraw = true;
+                    _gameRenderPending = false;
+                    _lastGameRenderTick = tNow;
+                }
+                else
+                {
+                    needsRedraw = false;
+                }
+            }
+
             if (_hiddenByFullscreen && !_isAnimating)
             {
                 if (_frameTimer.Interval != 450) _frameTimer.Interval = 450;
@@ -6803,6 +6845,7 @@ namespace DynamicIslandWin
                                  _watchdog.IsActiveDownloadDetected || _watchdog.IsCountdownActive || _updater.IsDownloading;
 
             int desiredInterval = (activeVisuals || cursorNearTop) ? 14 : 220;
+            if (gameThrottle) desiredInterval = 120;
             if (_frameTimer.Interval != desiredInterval)
                 _frameTimer.Interval = desiredInterval;
         }
@@ -6847,18 +6890,39 @@ namespace DynamicIslandWin
                         if (screens.Length > 0)
                         {
                             int idx = Math.Max(0, Math.Min(_config.monitor_index, screens.Length - 1));
-                            bool fsNow = SystemSensors.IsForegroundAppFullscreen(Handle, screens[idx]);
+                            bool fsRaw = SystemSensors.IsForegroundAppFullscreen(Handle, screens[idx]);
+                            int nowFs = Environment.TickCount;
+                            bool fsNow;
+                            if (fsRaw)
+                            {
+                                _fsLastTrueTick = nowFs;
+                                fsNow = true;
+                            }
+                            else if (_isFullscreenAppActive &&
+                                     (NativeWin32.IsAltTabHeld() || SystemSensors.IsTransientShellForeground() || unchecked(nowFs - _fsLastTrueTick) < 1800))
+                            {
+                                // Alt+Tab switcher / Win-key / transient shell windows must NOT end the game state (no un-hide, no expand)
+                                fsNow = true;
+                            }
+                            else
+                            {
+                                fsNow = false;
+                            }
+                            bool fsChanged = (fsNow != _isFullscreenAppActive);
                             _isFullscreenAppActive = fsNow;
                             // Page 2 (Screen Share Viewer) ALWAYS stays visible and strictly expanded even over fullscreen games/apps!
                             _hiddenByFullscreen = (_expandedPage != 1) && _config.hide_in_fullscreen && fsNow;
-                            if ((fsNow || _expandedPage == 1) && !_hiddenByFullscreen)
+                            if ((fsNow || _expandedPage == 1) && !_hiddenByFullscreen &&
+                                (fsChanged || unchecked(nowFs - _lastTopmostAssertTick) > 4000))
                             {
+                                _lastTopmostAssertTick = nowFs;
+                                // SWP_ASYNCWINDOWPOS: never block this worker on the UI thread (cross-thread SetWindowPos is a synchronous SendMessage)
                                 NativeWin32.SetWindowPos(Handle, NativeWin32.HWND_TOPMOST, 0, 0, 0, 0,
-                                    NativeWin32.SWP_NOMOVE | NativeWin32.SWP_NOSIZE | NativeWin32.SWP_NOACTIVATE);
+                                    NativeWin32.SWP_NOMOVE | NativeWin32.SWP_NOSIZE | NativeWin32.SWP_NOACTIVATE | NativeWin32.SWP_ASYNCWINDOWPOS);
                                 if (_expandedPage == 1 && _dwmOverlay != null && _dwmOverlay.IsHandleCreated && _dwmOverlay.Visible)
                                 {
                                     NativeWin32.SetWindowPos(_dwmOverlay.Handle, NativeWin32.HWND_TOPMOST, 0, 0, 0, 0,
-                                        NativeWin32.SWP_NOMOVE | NativeWin32.SWP_NOSIZE | NativeWin32.SWP_NOACTIVATE);
+                                        NativeWin32.SWP_NOMOVE | NativeWin32.SWP_NOSIZE | NativeWin32.SWP_NOACTIVATE | NativeWin32.SWP_ASYNCWINDOWPOS);
                                 }
                             }
                         }
@@ -6943,7 +7007,7 @@ namespace DynamicIslandWin
                     }
 
                     // MODULE 1: Async Micro-Telemetry (CPU/GPU Temp & Ping every 2s)
-                    _microTelemetry.SampleAsyncIfNeeded(cpuVal);
+                    _microTelemetry.SampleAsyncIfNeeded(cpuVal, _isFullscreenAppActive);
 
                     // MODULE 2: CoreAudio Microphone Active Session & Mute detection
                     if (_config.enable_mic_indicator)
@@ -6993,25 +7057,41 @@ namespace DynamicIslandWin
                 }
                 catch { }
 
-                int waitMs = _hiddenByFullscreen ? 3500 : ((_mode == IslandMode.Idle && !_watchdog.IsWatchdogArmed && !_currentMedia.IsPlaying) ? 1800 : 1000);
+                int waitMs = _hiddenByFullscreen ? 3500 : ((_isFullscreenAppActive && _mode == IslandMode.Idle) ? 1500 : ((_mode == IslandMode.Idle && !_watchdog.IsWatchdogArmed && !_currentMedia.IsPlaying) ? 1800 : 1000));
                 _bgWakeEvent.WaitOne(waitMs);
             }
             if (cpuCounter != null) { try { cpuCounter.Dispose(); } catch { } }
         }
+
+        private static NetworkInterface[] _cachedNics = null;
+        private static int _cachedNicsTick = 0;
 
         private static void SampleNetworkTotals(out long recv, out long sent)
         {
             recv = 0; sent = 0;
             try
             {
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                int now = Environment.TickCount;
+                if (_cachedNics == null || unchecked(now - _cachedNicsTick) > 30000)
                 {
-                    if (ni.OperationalStatus == OperationalStatus.Up && ni.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+                    var list = new List<NetworkInterface>();
+                    foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                    {
+                        if (ni.OperationalStatus == OperationalStatus.Up && ni.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+                            list.Add(ni);
+                    }
+                    _cachedNics = list.ToArray();
+                    _cachedNicsTick = now;
+                }
+                foreach (NetworkInterface ni in _cachedNics)
+                {
+                    try
                     {
                         IPv4InterfaceStatistics stats = ni.GetIPv4Statistics();
                         recv += stats.BytesReceived;
                         sent += stats.BytesSent;
                     }
+                    catch { }
                 }
             }
             catch { }
@@ -8240,7 +8320,7 @@ namespace DynamicIslandWin
 
             try { g.Flush(FlushIntention.Flush); } catch { }
 
-            IntPtr screenDc = NativeWin32.GetDC(IntPtr.Zero);
+            IntPtr screenDc = IntPtr.Zero; // hdcDst = NULL: no GetDC(NULL) on the desktop DC every frame (stalls under D3D fullscreen)
             try
             {
                 var size = new NativeWin32.SIZE(CanvasW, CanvasH);
@@ -8257,7 +8337,7 @@ namespace DynamicIslandWin
             }
             finally
             {
-                NativeWin32.ReleaseDC(IntPtr.Zero, screenDc);
+                if (screenDc != IntPtr.Zero) NativeWin32.ReleaseDC(IntPtr.Zero, screenDc);
             }
 
             // Sync hardware DWM 60/144 FPS thumbnail overlay for Page 2
