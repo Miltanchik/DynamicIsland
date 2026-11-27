@@ -2524,6 +2524,8 @@ namespace DynamicIslandWin
         private static int _lastManualToggleTick = 0;
         private static string _lastLoggedPassiveSync = "";
 
+        [DllImport("oleacc.dll")] private static extern int AccessibleChildren([MarshalAs(UnmanagedType.Interface)] object paccContainer, int iChildStart, int cChildren, [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 2)] object[] rgvarChildren, out int pcObtained);
+
         private static void DumpAccTree(object acc, int depth, StringBuilder sb, ref int btnCount)
         {
             if (acc == null || depth > 18 || btnCount > 80) return;
@@ -2570,7 +2572,7 @@ namespace DynamicIslandWin
             if (childCount <= 0 || childCount > 400) return;
             object[] kids = new object[childCount];
             int got;
-            if (NativeWin32.AccessibleChildren(acc, 0, childCount, kids, out got) == 0 && got > 0)
+            if (AccessibleChildren(acc, 0, childCount, kids, out got) == 0 && got > 0)
             {
                 for (int i = 0; i < got; i++)
                 {
