@@ -2599,6 +2599,25 @@ namespace DynamicIslandWin
             return sb.ToString();
         }
 
+        private static void LogDiagnostic(string level, string msg)
+        {
+            try
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DynamicIslandWin");
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                string logPath = Path.Combine(dir, "player_sync.log");
+                FileInfo fi = new FileInfo(logPath);
+                if (fi.Exists && fi.Length > 512 * 1024)
+                {
+                    string old = logPath + ".old";
+                    if (File.Exists(old)) File.Delete(old);
+                    File.Move(logPath, old);
+                }
+                File.AppendAllText(logPath, string.Format("[{0:yyyy-MM-dd HH:mm:ss.fff}] [{1}] {2}{3}", DateTime.Now, level, msg, Environment.NewLine), Encoding.UTF8);
+            }
+            catch { }
+        }
+
         private static void EnsureStaWorkerStarted()
         {
             if (_staThread != null) return;
