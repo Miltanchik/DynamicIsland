@@ -9744,9 +9744,20 @@ namespace DynamicIslandWin
                 if (_rcPomoBtn.Contains(pt)) { TogglePomodoro(); return; }
                 if (_rcSettingsBtn.Contains(pt)) { OpenSettingsDialog(); return; }
 
-                foreach (var kv in _dockRects)
+                for (int di = 0; di < _dockRects.Count; di++)
                 {
-                    if (kv.Key.Contains(pt)) { LaunchPinnedApp(kv.Value); return; }
+                    if (_dockRects[di].Key.Contains(pt))
+                    {
+                        _pressedDockIndex = di;
+                        _pressedDockItem = _dockRects[di].Value;
+                        _dockMouseDownPt = e.Location;
+                        _dockGrabOffsetX = pt.X - _dockRects[di].Key.X;
+                        _dockDragCurrentX = _dockRects[di].Key.X;
+                        _isDraggingDockApp = false;
+                        _collapseTimer.Stop();
+                        RenderLayeredFrame();
+                        return;
+                    }
                 }
                 if (_rcAddAppBtn.Contains(pt))
                 {
@@ -9854,6 +9865,34 @@ namespace DynamicIslandWin
                 UpdateMusicVolumeFromCursor(e.X);
                 return;
             }
+            if (_pressedDockIndex >= 0 && (e.Button & MouseButtons.Left) == MouseButtons.Left)
+            {
+                int dx = Math.Abs(e.X - _dockMouseDownPt.X);
+                int dy = Math.Abs(e.Y - _dockMouseDownPt.Y);
+                if (!_isDraggingDockApp && (dx >= 6 || dy >= 6))
+                {
+                    _isDraggingDockApp = true;
+                }
+                if (_isDraggingDockApp)
+                {
+                    _dockDragCurrentX = e.X - _dockGrabOffsetX;
+                    int visCount = Math.Min(_dockVisibleCount, _config.pinned_apps.Count);
+                    if (visCount > 1 && _pressedDockIndex >= 0 && _pressedDockIndex < visCount)
+                    {
+                        int targetSlot = Math.Max(0, Math.Min(visCount - 1, (int)Math.Round((_dockDragCurrentX - _dockRowStartX) / 40f)));
+                        if (targetSlot != _pressedDockIndex)
+                        {
+                            PinnedAppItem moving = _config.pinned_apps[_pressedDockIndex];
+                            _config.pinned_apps.RemoveAt(_pressedDockIndex);
+                            _config.pinned_apps.Insert(targetSlot, moving);
+                            _pressedDockIndex = targetSlot;
+                        }
+                    }
+                    WakeRenderLoop();
+                    RenderLayeredFrame();
+                    return;
+                }
+            }
             if (_pendingDragVaultItem != null && (e.Button & MouseButtons.Left) == MouseButtons.Left)
             {
                 int dx = Math.Abs(e.X - _vaultDragStartPt.X);
@@ -9894,6 +9933,32 @@ namespace DynamicIslandWin
             _draggingVolume = false;
             _draggingMusicVolume = false;
             _pendingDragVaultItem = null;
+
+            if (_pressedDockIndex >= 0)
+            {
+                bool wasDraggingDock = _isDraggingDockApp;
+                PinnedAppItem clickedApp = _pressedDockItem;
+                _isDraggingDockApp = false;
+                _pressedDockIndex = -1;
+                _pressedDockItem = null;
+
+                if (wasDraggingDock)
+                {
+                    ConfigManager.Save(_config);
+                    WakeRenderLoop();
+                    RenderLayeredFrame();
+                    return;
+                }
+                else if (e.Button == MouseButtons.Left && clickedApp != null)
+                {
+                    if (Math.Abs(e.X - _dockMouseDownPt.X) < 6 && Math.Abs(e.Y - _dockMouseDownPt.Y) < 6)
+                    {
+                        LaunchPinnedApp(clickedApp);
+                    }
+                    RenderLayeredFrame();
+                    return;
+                }
+            }
         }
 
         private void UpdateMusicVolumeFromCursor(float x)
@@ -9972,7 +10037,7 @@ namespace DynamicIslandWin
             });
             menu.Items.Add("← Вернуться на страницу плеера (Страница 1)", null, (s, e) => CycleExpandedPage(-1));
             menu.Items.Add("Открыть пульт Kinetic Stage & Deck...", null, (s, e) => OpenSettingsDialog());
-            menu.Show(screenPt);
+            ShowTrackedContextMenu(menu, screenPt);
         }
 
         private void ShowTrackedContextMenu(ContextMenuStrip menu, Point screenPt)
@@ -10267,20 +10332,30 @@ namespace DynamicIslandWin
 
         private void PromptAddAppViaExplorer()
         {
-            using (var ofd = new OpenFileDialog())
+            Interlocked.Increment(ref _ownDialogOrMenuDepth);
+            try
             {
-                ofd.Title = "Выберите программу (.exe / .lnk) для добавления в Dynamic Island";
-                ofd.Filter = "Программы и ярлыки (*.exe;*.lnk;*.bat;*.cmd;*.url)|*.exe;*.lnk;*.bat;*.cmd;*.url|Все файлы (*.*)|*.*";
-                ofd.Multiselect = true;
-                if (ofd.ShowDialog(this) == DialogResult.OK)
+                using (var ofd = new OpenFileDialog())
                 {
-                    foreach (string file in ofd.FileNames)
+                    ofd.Title = "Выберите программу (.exe / .lnk) для добавления в Dynamic Island";
+                    ofd.Filter = "Программы и ярлыки (*.exe;*.lnk;*.bat;*.cmd;*.url)|*.exe;*.lnk;*.bat;*.cmd;*.url|Все файлы (*.*)|*.*";
+                    ofd.Multiselect = true;
+                    if (ofd.ShowDialog(this) == DialogResult.OK)
                     {
-                        if (!string.IsNullOrWhiteSpace(file) && File.Exists(file))
-                            PinTargetToDock(file);
+                        foreach (string file in ofd.FileNames)
+                        {
+                            if (!string.IsNullOrWhiteSpace(file) && File.Exists(file))
+                                PinTargetToDock(file);
+                        }
+                        RenderLayeredFrame();
                     }
-                    RenderLayeredFrame();
                 }
+            }
+            finally
+            {
+                if (Interlocked.Decrement(ref _ownDialogOrMenuDepth) < 0)
+                    Interlocked.Exchange(ref _ownDialogOrMenuDepth, 0);
+                AssertIslandTopMostSafe(true, false);
             }
         }
 
@@ -10303,51 +10378,114 @@ namespace DynamicIslandWin
         {
             var menu = new ContextMenuStrip();
             menu.Items.Add("Запустить " + item.name, null, (s, e) => LaunchPinnedApp(item));
+            int idx = _config.pinned_apps.FindIndex(x => string.Equals(x.target_path, item.target_path, StringComparison.OrdinalIgnoreCase));
+            if (idx > 0)
+            {
+                menu.Items.Add("← Переместить левее", null, (s, e) =>
+                {
+                    int cur = _config.pinned_apps.FindIndex(x => string.Equals(x.target_path, item.target_path, StringComparison.OrdinalIgnoreCase));
+                    if (cur > 0)
+                    {
+                        var mv = _config.pinned_apps[cur];
+                        _config.pinned_apps.RemoveAt(cur);
+                        _config.pinned_apps.Insert(cur - 1, mv);
+                        ConfigManager.Save(_config);
+                        RenderLayeredFrame();
+                    }
+                });
+            }
+            if (idx >= 0 && idx < _config.pinned_apps.Count - 1)
+            {
+                menu.Items.Add("→ Переместить правее", null, (s, e) =>
+                {
+                    int cur = _config.pinned_apps.FindIndex(x => string.Equals(x.target_path, item.target_path, StringComparison.OrdinalIgnoreCase));
+                    if (cur >= 0 && cur < _config.pinned_apps.Count - 1)
+                    {
+                        var mv = _config.pinned_apps[cur];
+                        _config.pinned_apps.RemoveAt(cur);
+                        _config.pinned_apps.Insert(cur + 1, mv);
+                        ConfigManager.Save(_config);
+                        RenderLayeredFrame();
+                    }
+                });
+            }
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Открепить из дока", null, (s, e) =>
             {
                 _config.pinned_apps.RemoveAll(x => string.Equals(x.target_path, item.target_path, StringComparison.OrdinalIgnoreCase));
                 ConfigManager.Save(_config);
                 RenderLayeredFrame();
             });
-            menu.Show(screenPt);
+            ShowTrackedContextMenu(menu, screenPt);
         }
 
         public void ShowUpdateDialog(bool manual, IWin32Window owner)
         {
             if (_updateDialog != null && !_updateDialog.IsDisposed)
             {
+                if (manual && !_updater.IsDownloading && !_updater.IsChecking)
+                    _updater.CheckForUpdatesAsync(_config, true);
                 try { _updateDialog.Activate(); } catch { }
                 return;
             }
-            if (manual && !_updater.IsUpdateAvailable && !_updater.IsDownloading)
+            if (manual && !_updater.IsDownloading && !_updater.IsChecking)
                 _updater.CheckForUpdatesAsync(_config, true);
 
             var dlg = new UpdateDialogForm(_updater, _config, !manual);
             _updateDialog = dlg;
-            dlg.FormClosed += delegate { _updateDialog = null; };
-            if (manual) dlg.ShowDialog(owner ?? this);
-            else dlg.Show();
+            dlg.FormClosed += delegate
+            {
+                _updateDialog = null;
+                AssertIslandTopMostSafe(true, false);
+            };
+            if (manual)
+            {
+                Interlocked.Increment(ref _ownDialogOrMenuDepth);
+                try { dlg.ShowDialog(owner ?? this); }
+                finally
+                {
+                    if (Interlocked.Decrement(ref _ownDialogOrMenuDepth) < 0)
+                        Interlocked.Exchange(ref _ownDialogOrMenuDepth, 0);
+                    AssertIslandTopMostSafe(true, false);
+                }
+            }
+            else
+            {
+                dlg.Show();
+            }
         }
 
         public void OpenSettingsDialog()
         {
-            using (var dlg = new SettingsForm(_config))
+            Interlocked.Increment(ref _ownDialogOrMenuDepth);
+            try
             {
-                dlg.SettingsSaved += () =>
+                using (var dlg = new SettingsForm(_config))
                 {
-                    _bgEngine.EnsureLoaded(_config.custom_bg_path);
-                    EnsureCachedFonts();
-                    _collapseTimer.Interval = Math.Max(100, _config.collapse_delay_ms);
-                    _curW = (_mode == IslandMode.Expanded) ? _config.expanded_width : _config.idle_width;
-                    _curH = (_mode == IslandMode.Expanded) ? _config.expanded_height : _config.idle_height;
-                    _targetW = _curW;
-                    _targetH = _curH;
-                    PositionOnMonitor(_config.monitor_index);
-                    RenderLayeredFrame();
-                };
-                dlg.Updater = _updater;
-                dlg.ManualUpdateCheckRequested += () => ShowUpdateDialog(true, dlg);
-                dlg.ShowDialog(this);
+                    dlg.SettingsSaved += () =>
+                    {
+                        _bgEngine.EnsureLoaded(_config.custom_bg_path);
+                        EnsureCachedFonts();
+                        _collapseTimer.Interval = Math.Max(100, _config.collapse_delay_ms);
+                        _curW = (_mode == IslandMode.Expanded) ? _config.expanded_width : _config.idle_width;
+                        _curH = (_mode == IslandMode.Expanded) ? _config.expanded_height : _config.idle_height;
+                        _targetW = _curW;
+                        _targetH = _curH;
+                        PositionOnMonitor(_config.monitor_index);
+                        _bgWakeEvent.Set();
+                        WakeRenderLoop();
+                        RenderLayeredFrame();
+                    };
+                    dlg.Updater = _updater;
+                    dlg.ManualUpdateCheckRequested += () => ShowUpdateDialog(true, dlg);
+                    dlg.ShowDialog(this);
+                }
+            }
+            finally
+            {
+                if (Interlocked.Decrement(ref _ownDialogOrMenuDepth) < 0)
+                    Interlocked.Exchange(ref _ownDialogOrMenuDepth, 0);
+                AssertIslandTopMostSafe(true, false);
             }
         }
 
@@ -11708,23 +11846,64 @@ namespace DynamicIslandWin
 
                 curY += 28f + rowGap;
 
-                // ROW 3: Minimalist macOS Squircle App Dock + [ + ] Add Program Button
+                // ROW 3: Minimalist macOS Squircle App Dock (Drag-and-Drop Reorderable) + [ + ] Add Program Button Locked at End
                 _dockRects.Clear();
                 float dockX = padX;
+                _dockRowStartX = padX;
                 int maxSlots = Math.Max(4, (int)(innerW / 40f));
                 int maxIcons = Math.Min(_config.pinned_apps.Count, maxSlots - 1);
+                _dockVisibleCount = maxIcons;
+                bool anyDockSettling = false;
+                PinnedAppItem draggedDockObj = null;
+
                 for (int i = 0; i < maxIcons; i++)
                 {
                     PinnedAppItem item = _config.pinned_apps[i];
-                    var btnRc = new RectangleF(dockX, curY, 34f, 34f);
-                    _dockRects.Add(new KeyValuePair<RectangleF, PinnedAppItem>(btnRc, item));
+                    float slotX = padX + i * 40f;
+                    var slotHitRc = new RectangleF(slotX, curY, 34f, 34f);
+                    _dockRects.Add(new KeyValuePair<RectangleF, PinnedAppItem>(slotHitRc, item));
+
+                    if (_isDraggingDockApp && i == _pressedDockIndex)
+                    {
+                        draggedDockObj = item;
+                        _dockVisualX[item.target_path ?? i.ToString()] = slotX;
+                        using (GraphicsPath phPath = CreateRoundedRectPath(slotHitRc, 10f))
+                        using (var phBr = new SolidBrush(Color.FromArgb((int)(alpha * 0.14f), acc1.R, acc1.G, acc1.B)))
+                        using (var phPen = new Pen(Color.FromArgb((int)(alpha * 0.55f), acc1.R, acc1.G, acc1.B), 1.15f) { DashStyle = DashStyle.Dash })
+                        {
+                            g.FillPath(phBr, phPath);
+                            g.DrawPath(phPen, phPath);
+                        }
+                        dockX += 40f;
+                        continue;
+                    }
+
+                    string vKey = item.target_path ?? i.ToString();
+                    float drawX = slotX;
+                    float prevX;
+                    if (_dockVisualX.TryGetValue(vKey, out prevX))
+                    {
+                        if (Math.Abs(prevX - slotX) > 0.45f)
+                        {
+                            drawX = prevX + (slotX - prevX) * 0.38f;
+                            anyDockSettling = true;
+                        }
+                        else
+                        {
+                            drawX = slotX;
+                        }
+                    }
+                    _dockVisualX[vKey] = drawX;
+
+                    var btnRc = new RectangleF(drawX, curY, 34f, 34f);
                     using (GraphicsPath dp = CreateRoundedRectPath(btnRc, 10f))
                     {
                         g.FillPath(brBento, dp);
                         g.DrawPath(penBento, dp);
                     }
 
-                    ApplyMicroInteraction(g, btnRc, 10f, alpha, acc1);
+                    if (!_isDraggingDockApp)
+                        ApplyMicroInteraction(g, btnRc, 10f, alpha, acc1);
                     Bitmap icoBmp = GetAppIconBitmap(item.target_path);
                     if (icoBmp != null)
                         SafeDrawImage(g, icoBmp, btnRc.X + 6f, btnRc.Y + 6f, 22f, 22f);
@@ -11733,6 +11912,7 @@ namespace DynamicIslandWin
 
                     dockX += 40f;
                 }
+                _dockSettleAnimating = anyDockSettling;
 
                 _rcAddAppBtn = new RectangleF(dockX, curY, 34f, 34f);
                 using (GraphicsPath ap = CreateRoundedRectPath(_rcAddAppBtn, 10f))
@@ -11745,6 +11925,31 @@ namespace DynamicIslandWin
                     float pcy = _rcAddAppBtn.Y + 17f;
                     g.DrawLine(plusPen, pcx - 5.5f, pcy, pcx + 5.5f, pcy);
                     g.DrawLine(plusPen, pcx, pcy - 5.5f, pcx, pcy + 5.5f);
+                }
+
+                if (_isDraggingDockApp && draggedDockObj != null)
+                {
+                    float minDragX = padX - 4f;
+                    float maxDragX = padX + Math.Max(0, maxIcons - 1) * 40f + 4f;
+                    float floatX = Math.Max(minDragX, Math.Min(maxDragX, _dockDragCurrentX));
+                    var dragRc = new RectangleF(floatX - 1f, curY - 3.5f, 36f, 36f);
+                    var dragShadowRc = new RectangleF(dragRc.X + 1.5f, dragRc.Y + 3f, 36f, 36f);
+                    using (GraphicsPath dsp = CreateRoundedRectPath(dragShadowRc, 11f))
+                    using (var dsb = new SolidBrush(Color.FromArgb((int)(alpha * 0.55f), 2, 4, 10)))
+                        g.FillPath(dsb, dsp);
+
+                    using (GraphicsPath dgp = CreateRoundedRectPath(dragRc, 11f))
+                    using (var dgb = new SolidBrush(Color.FromArgb(Math.Min(255, (int)(alpha * 0.94f)), 24, 28, 40)))
+                    using (var dgPen = new Pen(acc1, 1.5f))
+                    {
+                        g.FillPath(dgb, dgp);
+                        g.DrawPath(dgPen, dgp);
+                    }
+                    Bitmap dragIco = GetAppIconBitmap(draggedDockObj.target_path);
+                    if (dragIco != null)
+                        SafeDrawImage(g, dragIco, dragRc.X + 7f, dragRc.Y + 7f, 22f, 22f);
+                    else
+                        DrawContrastText(g, draggedDockObj.name.Substring(0, Math.Min(2, draggedDockObj.name.Length)), _fontSmall, colWhite, dragRc, _sfCenter);
                 }
 
                 // Right-aligned Quick Pills on Row 3: [ 🎙 Микр ] [ 📸 Скрины ] [ 🌙 Сон-Таймер ]
@@ -12024,7 +12229,7 @@ namespace DynamicIslandWin
                 var trayMenu = new ContextMenuStrip();
                 trayMenu.Items.Add("Раскрыть островок", null, (s, e) => mainForm.ExpandIsland());
                 trayMenu.Items.Add("Пульт настроек (Kinetic Stage & Deck)...", null, (s, e) => mainForm.OpenSettingsDialog());
-                trayMenu.Items.Add("Проверить обновления...", null, (s, e) => mainForm.ShowUpdateDialog(true, null));
+                trayMenu.Items.Add("Обновить программу (проверить обновления)...", null, (s, e) => mainForm.ShowUpdateDialog(true, null));
                 trayMenu.Items.Add("Сбросить позицию по центру", null, (s, e) =>
                 {
                     var cfg = ConfigManager.Load();
