@@ -159,7 +159,7 @@ def compile_release_binaries(repo_root: Path) -> Tuple[Path, Path]:
         f"/r:{os.path.join(fw_dir, 'System.Drawing.dll')}",
         str(repo_root / "NativeDynamicIsland.cs"),
     ]
-    res1 = subprocess.run(app_cmd, cwd=str(repo_root), capture_output=True, text=True, errors="replace")
+    res1 = subprocess.run(app_cmd, cwd=str(repo_root), stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if res1.returncode != 0:
         raise RuntimeError(f"DynamicIslandWin.exe build failed:\n{res1.stdout}\n{res1.stderr}")
 
@@ -177,7 +177,7 @@ def compile_release_binaries(repo_root: Path) -> Tuple[Path, Path]:
         f"/r:{os.path.join(fw_dir, 'System.Drawing.dll')}",
         str(repo_root / "NativeInstaller.cs"),
     ]
-    res2 = subprocess.run(setup_cmd, cwd=str(repo_root), capture_output=True, text=True, errors="replace")
+    res2 = subprocess.run(setup_cmd, cwd=str(repo_root), stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if res2.returncode != 0:
         raise RuntimeError(f"DynamicIslandWin_Setup.exe build failed:\n{res2.stdout}\n{res2.stderr}")
 
@@ -201,6 +201,8 @@ def collect_auto_changelog(repo_root: Path, version_str: str, existing_changelog
         git = find_git()
         res = subprocess.run(
             [git, "log", "-n", "25", "--pretty=%s"],
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             cwd=str(repo_root),
             capture_output=True,
             text=True,
@@ -345,8 +347,16 @@ def main() -> int:
         actual_sha = sha256_file(setup_p) if setup_p.is_file() else ""
         if old_json_ver == cur_ver and actual_sha and old_json_sha == actual_sha:
             return 0
-
-    next_ver = compute_next_version(cur_ver, args.target)
+        # Bidirectional version pick: whether user bumped CurrentVersionStr in C# OR "version" in release/version.json, take the higher version!
+        try:
+            ver_cs_tuple = parse_semver(cur_ver)
+            ver_js_tuple = parse_semver(old_json_ver) if old_json_ver else (0, 0, 0)
+            chosen_tuple = max(ver_cs_tuple, ver_js_tuple)
+            next_ver = f"{chosen_tuple[0]}.{chosen_tuple[1]}.{chosen_tuple[2]}"
+        except Exception:
+            next_ver = compute_next_version(cur_ver, args.target)
+    else:
+        next_ver = compute_next_version(cur_ver, args.target)
     version_changed = (next_ver != old_json_ver) or (next_ver != cur_ver)
 
     update_source_versions(repo_root, next_ver)
@@ -370,7 +380,8 @@ def main() -> int:
         else:
             final_notes = manual_notes
     else:
-        final_notes = collect_auto_changelog(repo_root, next_ver, str(old_manifest.get("changelog", "")), version_changed)
+        json_bumped_directly = (old_json_ver == next_ver and cur_ver != next_ver and bool(str(old_manifest.get("changelog", "")).strip()))
+        final_notes = str(old_manifest.get("changelog", "")).strip() if json_bumped_directly else collect_auto_changelog(repo_root, next_ver, str(old_manifest.get("changelog", "")), version_changed)
 
     manifest = write_manifest_and_sums(repo_root, args.repo, next_ver, final_notes, out_app, out_setup)
     print(f"[Release] Updated release/version.json -> v{manifest['version']} (sha256={manifest['sha256'][:16]}...)")

@@ -202,17 +202,31 @@ class AutoSyncDaemon:
         if not st.stdout.strip():
             return True
 
-        # Auto-sync release/version.json & binaries if CurrentVersionStr or Setup changed
+        # Auto-sync release/version.json & binaries if CurrentVersionStr, version.json, or Setup changed
         pub_script = self.repo_root / "tools" / "publish_release.py"
         if pub_script.is_file():
             try:
-                subprocess.run(
-                    [sys.executable, str(pub_script), "auto-if-changed", "--no-push"],
+                py_bin = sys.executable
+                if py_bin.lower().endswith("pythonw.exe"):
+                    cand_py = py_bin[:-5] + ".exe"
+                    if os.path.isfile(cand_py):
+                        py_bin = cand_py
+                pr_res = subprocess.run(
+                    [py_bin, str(pub_script), "auto-if-changed", "--no-push"],
                     cwd=str(self.repo_root),
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
-                    timeout=90,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=120,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
+                if pr_res.stdout and pr_res.stdout.strip():
+                    for ln in pr_res.stdout.strip().splitlines():
+                        self.log("INFO", ln)
+                if pr_res.returncode != 0 and pr_res.stderr:
+                    self.log("ERROR", f"publish_release error: {pr_res.stderr.strip()}")
             except Exception as exc:
                 self.log("WARN", f"publish_release auto-if-changed skipped: {exc}")
 
