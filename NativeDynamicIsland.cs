@@ -34,8 +34,8 @@ using System.Reflection;
 [assembly: AssemblyProduct("Dynamic Island Studio")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("3.0.0.0")]
-[assembly: AssemblyFileVersion("3.0.0.0")]
+[assembly: AssemblyVersion("3.1.0.0")]
+[assembly: AssemblyFileVersion("3.1.0.0")]
 namespace DynamicIslandWin
 {
     // =========================================================================
@@ -212,7 +212,8 @@ namespace DynamicIslandWin
                 if (string.IsNullOrEmpty(cfg.watchdog_action)) cfg.watchdog_action = "Сон";
                 if (cfg.download_threshold_mbps < 1) cfg.download_threshold_mbps = 2;
                 if (cfg.skipped_version == null) cfg.skipped_version = "";
-                if (string.IsNullOrEmpty(cfg.github_repo)) cfg.github_repo = "Miltanchik/DynamicIsland";
+                if (string.IsNullOrWhiteSpace(cfg.github_repo) || cfg.github_repo.IndexOf("DynamicIslandWin/DynamicIslandWin", StringComparison.OrdinalIgnoreCase) >= 0 || cfg.github_repo.IndexOf("/") < 1)
+                    cfg.github_repo = "Miltanchik/DynamicIsland";
                 return cfg;
             }
             catch { return new IslandConfigData(); }
@@ -2449,6 +2450,40 @@ namespace DynamicIslandWin
 
     public static class SystemSensors
     {
+        private static readonly string[] TransientShellClasses = new string[]
+        {
+            "MultitaskingViewFrame", "XamlExplorerHostIslandWindow", "TaskSwitcherWnd", "TaskSwitcherOverlayWnd",
+            "ForegroundStaging", "TaskListThumbnailWnd", "TaskListOverlayWnd", "Shell_InputSwitchTopLevelWindow"
+        };
+
+        private static bool IsTransientShellClass(string cls, IntPtr hwnd)
+        {
+            foreach (string t in TransientShellClasses)
+                if (string.Equals(cls, t, StringComparison.Ordinal)) return true;
+            if (cls == "ApplicationFrameWindow" || cls == "Windows.UI.Core.CoreWindow")
+            {
+                var title = new StringBuilder(96);
+                NativeWin32.GetWindowText(hwnd, title, 96);
+                string tl = title.ToString().ToLowerInvariant();
+                if (tl.Contains("task switching") || tl.Contains("task view") || tl.Contains("переключение задач") || tl.Contains("представление задач"))
+                    return true;
+            }
+            return false;
+        }
+
+        public static bool IsTransientShellForeground()
+        {
+            try
+            {
+                IntPtr fg = NativeWin32.GetForegroundWindow();
+                if (fg == IntPtr.Zero) return true;
+                var cls = new StringBuilder(128);
+                NativeWin32.GetClassName(fg, cls, 128);
+                return IsTransientShellClass(cls.ToString(), fg);
+            }
+            catch { return false; }
+        }
+
         public static bool IsForegroundAppFullscreen(IntPtr ourHwnd, Screen activeScreen)
         {
             try
@@ -2462,7 +2497,7 @@ namespace DynamicIslandWin
                 var cls = new StringBuilder(128);
                 NativeWin32.GetClassName(fg, cls, 128);
                 string c = cls.ToString();
-                if (c == "Progman" || c == "WorkerW" || c == "Shell_TrayWnd" || c == "Windows.UI.Core.CoreWindow") return false;
+                if (c == "Progman" || c == "WorkerW" || c == "Shell_TrayWnd" || c == "Shell_SecondaryTrayWnd" || c == "Windows.UI.Core.CoreWindow" || IsTransientShellClass(c, fg)) return false;
                 NativeWin32.RECT rc;
                 if (!NativeWin32.GetWindowRect(fg, out rc)) return false;
                 Rectangle b = activeScreen.Bounds;
@@ -2612,6 +2647,14 @@ namespace DynamicIslandWin
         public const uint SWP_NOMOVE = 0x0002;
         public const uint SWP_NOSIZE = 0x0001;
         public const uint SWP_NOACTIVATE = 0x0010;
+        public const uint SWP_ASYNCWINDOWPOS = 0x4000;
+        public const int WM_MOUSEACTIVATE = 0x0021;
+        public const int MA_NOACTIVATE = 3;
+        public const int VK_TAB = 0x09;
+        public static bool IsAltTabHeld()
+        {
+            return ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0) || ((GetAsyncKeyState(VK_TAB) & 0x8000) != 0);
+        }
         [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
