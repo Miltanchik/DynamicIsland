@@ -34,8 +34,8 @@ using System.Reflection;
 [assembly: AssemblyProduct("Dynamic Island Studio")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("3.2.0.0")]
-[assembly: AssemblyFileVersion("3.2.0.0")]
+[assembly: AssemblyVersion("3.2.1.0")]
+[assembly: AssemblyFileVersion("3.2.1.0")]
 namespace DynamicIslandWin
 {
     // =========================================================================
@@ -4568,6 +4568,32 @@ namespace DynamicIslandWin
         public const int APPCOMMAND_MEDIA_PREVIOUSTRACK = 12;
         public const uint GW_HWNDPREV = 3;
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")] public static extern IntPtr GetThreadDesktop(uint dwThreadId);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool GetUserObjectInformationW(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
+
+        public static string GetCurrentDesktopNameSafe()
+        {
+            try
+            {
+                IntPtr hDesk = GetThreadDesktop(GetCurrentThreadId());
+                if (hDesk != IntPtr.Zero)
+                {
+                    var sb = new StringBuilder(128);
+                    int needed;
+                    if (GetUserObjectInformationW(hDesk, 2 /* UOI_NAME */, sb, sb.Capacity * 2, out needed) && sb.Length > 0)
+                    {
+                        var clean = new StringBuilder();
+                        foreach (char ch in sb.ToString())
+                            clean.Append(char.IsLetterOrDigit(ch) || ch == '_' || ch == '-' ? ch : '_');
+                        return clean.ToString();
+                    }
+                }
+            }
+            catch { }
+            return "Default";
+        }
         [StructLayout(LayoutKind.Sequential)]
         public struct WINDOWPOS
         {
@@ -5252,7 +5278,7 @@ namespace DynamicIslandWin
 
     public sealed class UpdateManager
     {
-        public const string CurrentVersionStr = "3.2.0";
+        public const string CurrentVersionStr = "3.2.1";
         public const string DefaultRepo = "Miltanchik/DynamicIsland";
 
         public string LatestVersionStr { get; private set; }
@@ -8482,18 +8508,20 @@ namespace DynamicIslandWin
             }
             if (NativeWin32.WM_DI_ACTIVATE != 0 && (uint)m.Msg == NativeWin32.WM_DI_ACTIVATE)
             {
-                m.Result = new IntPtr(1);
-                if (!_isFullscreenAppActive)
-                {
-                    _ghostModeActive = false;
-                    _ghostUnlockedByUser = true;
-                    _ghostOpacityFactor = 1.0f;
-                    _ghostLiftOffsetY = 0.0f;
-                    ExpandIsland();
-                    _collapseTimer.Interval = 2600;
-                    _collapseTimer.Start();
-                    RenderLayeredFrame();
-                }
+                m.Result = new IntPtr(0x4449);
+                _ghostModeActive = false;
+                _ghostUnlockedByUser = true;
+                _ghostOpacityFactor = 1.0f;
+                _ghostLiftOffsetY = 0.0f;
+                _hiddenByFullscreen = false;
+                _hiddenByVideo = false;
+                _fullscreenAutoHideFactor = 1.0f;
+                _fullscreenLiftOffsetY = 0.0f;
+                ExpandIsland();
+                AssertIslandTopMostSafe(true, false);
+                _collapseTimer.Interval = 3200;
+                _collapseTimer.Start();
+                RenderLayeredFrame();
                 return;
             }
             if (m.Msg == NativeWin32.WM_MOUSEACTIVATE)
@@ -12173,11 +12201,12 @@ namespace DynamicIslandWin
                 RequestGracefulShutdownOfOtherInstances(1800);
             }
 
-            // Strict Single-Instance Enforcement: NEVER create duplicate processes or duplicate tray icons!
+            // Strict Desktop-Scoped Single-Instance Enforcement with Live Window Handshake (self-heals headless/other-desktop ghosts!)
+            string desktopMutexName = SingleInstanceMutexName + "_" + NativeWin32.GetCurrentDesktopNameSafe();
             bool ownsMutex = false;
             try
             {
-                _singleInstanceMutex = new Mutex(false, SingleInstanceMutexName);
+                _singleInstanceMutex = new Mutex(false, desktopMutexName);
                 try
                 {
                     ownsMutex = _singleInstanceMutex.WaitOne(hasReplace ? 1500 : 0, false);
@@ -12191,13 +12220,51 @@ namespace DynamicIslandWin
 
             if (!ownsMutex)
             {
-                // Another instance is already running: politely ask it to expand its Island and exit BEFORE creating NotifyIcon!
+                bool activatedLiveWindow = false;
                 if (NativeWin32.WM_DI_ACTIVATE != 0)
                 {
-                    IntPtr res;
-                    NativeWin32.SendMessageTimeout(NativeWin32.HWND_BROADCAST, NativeWin32.WM_DI_ACTIVATE, IntPtr.Zero, IntPtr.Zero, 0x0002, 300, out res);
+                    int selfPid = Process.GetCurrentProcess().Id;
+                    var otherPids = new HashSet<uint>();
+                    try
+                    {
+                        foreach (Process p in Process.GetProcessesByName("DynamicIslandWin"))
+                            if (p.Id != selfPid) otherPids.Add((uint)p.Id);
+                    }
+                    catch { }
+
+                    if (otherPids.Count > 0)
+                    {
+                        NativeWin32.EnumWindows((hWnd, lParam) =>
+                        {
+                            uint wPid;
+                            NativeWin32.GetWindowThreadProcessId(hWnd, out wPid);
+                            if (otherPids.Contains(wPid) && NativeWin32.IsWindowVisible(hWnd))
+                            {
+                                IntPtr ack;
+                                if (NativeWin32.SendMessageTimeout(hWnd, NativeWin32.WM_DI_ACTIVATE, IntPtr.Zero, IntPtr.Zero, 0x0002, 450, out ack) != IntPtr.Zero &&
+                                    ack.ToInt64() == 0x4449)
+                                {
+                                    activatedLiveWindow = true;
+                                    return false;
+                                }
+                            }
+                            return true;
+                        }, IntPtr.Zero);
+                    }
                 }
-                return;
+
+                if (activatedLiveWindow)
+                    return;
+
+                // Stale/zombie/other-desktop process held the mutex without a live window on this desktop -> self-heal!
+                RequestGracefulShutdownOfOtherInstances(1500);
+                try
+                {
+                    ownsMutex = _singleInstanceMutex.WaitOne(1200, false);
+                }
+                catch (AbandonedMutexException) { ownsMutex = true; }
+                catch { ownsMutex = true; }
+                if (!ownsMutex) return;
             }
 
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);

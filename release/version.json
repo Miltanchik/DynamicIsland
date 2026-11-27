@@ -1,8 +1,8 @@
 {
-  "version": "3.2.0",
+  "version": "3.2.1",
   "download_url": "https://raw.githubusercontent.com/Miltanchik/DynamicIsland/main/release/DynamicIslandWin_Setup.exe",
-  "sha256": "bc9cb0ee779af1d609110ab45838abf7382f5f1c75e01fcedb4eb5514140bcd9",
+  "sha256": "f1c027065cee17fea55af57cb1874e06c9e1160dfe296871fdfbb61b9a9583fb",
   "release_url": "https://github.com/Miltanchik/DynamicIsland/tree/main/release",
-  "published_at": "2026-11-28T01:42:31+03:00",
+  "published_at": "2026-11-28T01:48:56+03:00",
   "changelog": "Dynamic Island v3.2.0:\n- Строгий режим Z-order «Поверх всех окон» без перехвата фокуса с соблюдением исключений (игры, Alt+Tab, видео)\n- Проверка и прямая загрузка обновлений из ветки main/release (version.json)\n- Настройка «Скрывать остров при воспроизведении видео» (SMTC Video + локальные плееры + полноэкранные браузеры)\n- Автоопределение установленных и веб-плееров с запуском и автостартом Play из острова\n- Drag-and-Drop сортировка ярлыков быстрого доступа с защитой от случайного запуска"
 }
