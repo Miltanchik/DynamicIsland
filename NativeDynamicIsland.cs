@@ -2507,7 +2507,8 @@ namespace DynamicIslandWin
 
         private sealed class CandidateMeta
         {
-            public IUIAutomationElement Element;
+            public object ComNode;
+            public bool IsAccNode;
             public string NameLower;
             public string HelpLower;
             public string AriaProps;
@@ -2519,135 +2520,18 @@ namespace DynamicIslandWin
             public bool HasBounds;
         }
 
+        [DllImport("oleacc.dll")]
+        private static extern int AccessibleChildren(
+            [MarshalAs(UnmanagedType.Interface)] object paccContainer,
+            int iChildStart,
+            int cChildren,
+            [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 2)] object[] rgvarChildren,
+            out int pcObtained);
+
         private static FavWorkItem _pendingToggle = null;
         private static FavWorkItem _pendingSync = null;
         private static int _lastManualToggleTick = 0;
         private static string _lastLoggedPassiveSync = "";
-
-        [DllImport("oleacc.dll")] private static extern int AccessibleChildren([MarshalAs(UnmanagedType.Interface)] object paccContainer, int iChildStart, int cChildren, [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 2)] object[] rgvarChildren, out int pcObtained);
-
-        private static object FindLikeAccRecursive(object acc, int depth, List<string> recentNames, ref object bestBtn, ref int bestScore, ref bool bestLiked, ref string bestDbg)
-        {
-            if (acc == null || depth > 22) return null;
-            object vSelf = 0;
-            int role = 0, state = 0, childCount = 0;
-            string name = "";
-            try
-            {
-                if (depth <= 8)
-                {
-                    var sp = acc as IComServiceProvider;
-                    if (sp != null)
-                    {
-                        Guid gAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
-                        Guid gIA2 = new Guid("E89F726E-C4F4-4C19-BB19-B647D7FA8478");
-                        IntPtr p2;
-                        if (sp.QueryService(ref gAcc, ref gIA2, out p2) == 0 && p2 != IntPtr.Zero)
-                            Marshal.Release(p2);
-                    }
-                }
-                Type t = acc.GetType();
-                object rObj = t.InvokeMember("accRole", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
-                if (rObj is int) role = (int)rObj;
-                object sObj = t.InvokeMember("accState", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
-                if (sObj is int) state = (int)sObj;
-                object cObj = t.InvokeMember("accChildCount", System.Reflection.BindingFlags.GetProperty, null, acc, null);
-                if (cObj is int) childCount = (int)cObj;
-                if (role == 43 || role == 44 || role == 62)
-                {
-                    object nObj = t.InvokeMember("accName", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
-                    name = Norm(nObj as string ?? "");
-                    recentNames.Add(name);
-                    if ((state & 0x01) == 0 && !string.IsNullOrEmpty(name))
-                    {
-                        var cm = new CandidateMeta
-                        {
-                            NameLower = name,
-                            HelpLower = "",
-                            ControlType = (role == 44) ? UIA_CheckBoxControlTypeId : UIA_ButtonControlTypeId,
-                            HasToggle = true,
-                            ToggleVal = ((state & 0x08) != 0 || (state & 0x10) != 0) ? 1 : 0,
-                            Enabled = 1
-                        };
-                        bool candLiked;
-                        if (EvaluateSemantics(cm, true, out candLiked))
-                        {
-                            // Score higher when right next to Dislike / Prev / Next in PlayerBar
-                            int sc = 1000 + recentNames.Count * 2;
-                            for (int back = Math.Max(0, recentNames.Count - 8); back < recentNames.Count - 1; back++)
-                            {
-                                if (IsStrongAnchor(recentNames[back]) || IsPlayAnchor(recentNames[back]))
-                                    sc += 3000;
-                            }
-                            if (sc >= bestScore)
-                            {
-                                if (bestBtn != null) ReleaseCom(bestBtn);
-                                bestBtn = acc;
-                                bestScore = sc;
-                                bestLiked = candLiked;
-                                bestDbg = string.Format("name='{0}' state=0x{1:X} liked={2} sc={3}", name, state, candLiked, sc);
-                                return bestBtn; // caller must NOT release bestBtn!
-                            }
-                        }
-                    }
-                }
-            }
-            catch { return null; }
-
-            if (childCount <= 0 || childCount > 500) return null;
-            object[] kids = new object[childCount];
-            int got;
-            if (AccessibleChildren(acc, 0, childCount, kids, out got) == 0 && got > 0)
-            {
-                for (int i = 0; i < got; i++)
-                {
-                    object k = kids[i];
-                    if (k != null && !(k is int))
-                    {
-                        FindLikeAccRecursive(k, depth + 1, recentNames, ref bestBtn, ref bestScore, ref bestLiked, ref bestDbg);
-                        if (!ReferenceEquals(k, bestBtn))
-                            ReleaseCom(k);
-                    }
-                }
-            }
-            return bestBtn;
-        }
-
-        public static string RunDiagnosticProbe()
-        {
-            var sb = new StringBuilder();
-            try
-            {
-                IntPtr fgBefore = NativeWin32.GetForegroundWindow();
-                var dummyYm = new MediaSessionSnapshot { AppId = "YandexMusic", DisplayAppName = "Яндекс Музыка", Title = "Probe", Artist = "Probe" };
-                string wt; IntPtr rw;
-                IntPtr top = MultiPlayerMediaController.FindPlayerWindowSafe(dummyYm, false, true, out wt, out rw);
-                Guid iidAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
-
-                for (int step = 0; step < 3; step++)
-                {
-                    object accRoot = null;
-                    if (NativeWin32.AccessibleObjectFromWindow(top, 0xFFFFFFFCu, ref iidAcc, out accRoot) == 0 && accRoot != null)
-                    {
-                        object best = null; int sc = int.MinValue; bool liked = false; string dbg = "";
-                        FindLikeAccRecursive(accRoot, 0, new List<string>(), ref best, ref sc, ref liked, ref dbg);
-                        if (!ReferenceEquals(accRoot, best)) ReleaseCom(accRoot);
-
-                        sb.AppendLine(string.Format("Step {0}: found={1} liked={2} [{3}] fg={4}", step, best != null, liked, dbg, NativeWin32.GetForegroundWindow()));
-                        if (best != null && step < 2)
-                        {
-                            best.GetType().InvokeMember("accDoDefaultAction", System.Reflection.BindingFlags.InvokeMethod, null, best, new object[] { 0 });
-                            ReleaseCom(best);
-                            Thread.Sleep(350);
-                        }
-                        else if (best != null) ReleaseCom(best);
-                    }
-                }
-                sb.AppendLine("FG unchanged: " + (fgBefore == NativeWin32.GetForegroundWindow()));
-            }
-            catch (Exception ex) { sb.AppendLine("ERR: " + ex); }
-            return sb.ToString();
-        }
 
         private static void LogDiagnostic(string level, string msg)
         {
@@ -2708,7 +2592,7 @@ namespace DynamicIslandWin
         public static void RequestSyncStateAsync(MediaSessionSnapshot snap, int generation, Action<PlayerFavoriteSyncResult> onCompleted, bool forceImmediate = false)
         {
             if (snap == null || string.IsNullOrEmpty(BuildTrackKey(snap))) return;
-            if (!forceImmediate && _lastManualToggleTick != 0 && unchecked(Environment.TickCount - _lastManualToggleTick) < 1100) return;
+            if (!forceImmediate && _lastManualToggleTick != 0 && unchecked(Environment.TickCount - _lastManualToggleTick) < 2200) return;
             EnsureStaWorkerStarted();
             lock (_queueLock)
             {
@@ -2810,7 +2694,176 @@ namespace DynamicIslandWin
             return true;
         }
 
-        private static IUIAutomationElement ScanRoot(
+        private static CandidateMeta SelectBestCandidate(List<CandidateMeta> items, List<int> strongAnchors, List<int> playAnchors, NativeWin32.RECT topWinRc, bool topIconic, out bool resolvedLiked, out string dbg)
+        {
+            resolvedLiked = false; dbg = "";
+            if (items == null || items.Count == 0) return null;
+
+            int winW = topWinRc.Right - topWinRc.Left, winH = topWinRc.Bottom - topWinRc.Top;
+            bool validWin = !topIconic && winW >= 200 && winH >= 120;
+            int bestIdx = -1, bestScore = int.MinValue;
+            bool bestLiked = false;
+
+            for (int k = 0; k < items.Count; k++)
+            {
+                var m = items[k];
+                if (m.Enabled == 0) continue;
+
+                int minStrong = int.MaxValue, minPlay = int.MaxValue;
+                for (int s = 0; s < strongAnchors.Count; s++) { int d = Math.Abs(k - strongAnchors[s]); if (d < minStrong) minStrong = d; }
+                for (int p = 0; p < playAnchors.Count; p++) { int d = Math.Abs(k - playAnchors[p]); if (d < minPlay) minPlay = d; }
+
+                bool nearStrong = minStrong <= 14;
+                bool nearPlay = minPlay <= 10;
+                bool candLiked;
+                if (!EvaluateSemantics(m, nearStrong, out candLiked)) continue;
+
+                int score = 0;
+                if (nearStrong) score += 3600 - minStrong * 60;
+                else if (nearPlay) score += 1200 - minPlay * 40;
+
+                int bw = m.Bounds.Right - m.Bounds.Left, bh = m.Bounds.Bottom - m.Bounds.Top;
+                bool validBtn = m.HasBounds && bw >= 8 && bw <= 180 && bh >= 8 && bh <= 110;
+
+                if (validWin && validBtn)
+                {
+                    float cy = (m.Bounds.Top + m.Bounds.Bottom) * 0.5f;
+                    float relY = (cy - topWinRc.Top) / Math.Max(1f, (float)winH);
+                    if (cy >= topWinRc.Bottom - Math.Max(148, (int)(winH * 0.25f)) && cy <= topWinRc.Bottom + 16)
+                        score += 1400 + (int)(relY * 200f);
+                    else if (relY >= 0.70f) score += 750 + (int)(relY * 100f);
+                    else if (relY <= 0.15f) score += 480;
+                    else if (!nearStrong) continue;
+                }
+                else
+                {
+                    if (!nearStrong && !nearPlay && k < items.Count - 24) continue;
+                    if (k >= items.Count - 24) score += 400 + (k - (items.Count - 24)) * 10;
+                }
+
+                if (m.HasToggle) score += 120;
+                if (score >= bestScore) { bestScore = score; bestIdx = k; bestLiked = candLiked; }
+            }
+
+            CandidateMeta winner = null;
+            for (int k = 0; k < items.Count; k++)
+            {
+                if (k == bestIdx)
+                {
+                    winner = items[k];
+                    dbg = string.Format("mode={0}, name='{1}', tog={2}:{3}, score={4}, btns={5}",
+                        winner.IsAccNode ? "IA2" : "UIA", winner.NameLower, winner.HasToggle ? 1 : 0, winner.ToggleVal, bestScore, items.Count);
+                }
+                else { ReleaseCom(items[k].ComNode); items[k].ComNode = null; }
+            }
+            resolvedLiked = bestLiked;
+            return winner;
+        }
+
+        private static void CollectAccButtonsRecursive(
+            object acc, int depth, ref int visitedNodes,
+            List<CandidateMeta> items, List<int> strongAnchors, List<int> playAnchors)
+        {
+            if (acc == null || depth > 24 || visitedNodes > 1800) return;
+            visitedNodes++;
+
+            object vSelf = 0;
+            int role = 0, state = 0, childCount = 0;
+            try
+            {
+                if (depth <= 8)
+                {
+                    var sp = acc as IComServiceProvider;
+                    if (sp != null)
+                    {
+                        Guid gAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+                        Guid gIA2 = new Guid("E89F726E-C4F4-4C19-BB19-B647D7FA8478");
+                        IntPtr p2;
+                        if (sp.QueryService(ref gAcc, ref gIA2, out p2) == 0 && p2 != IntPtr.Zero)
+                            Marshal.Release(p2);
+                    }
+                }
+
+                Type t = acc.GetType();
+                object rObj = t.InvokeMember("accRole", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
+                if (rObj is int) role = (int)rObj;
+                object sObj = t.InvokeMember("accState", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
+                if (sObj is int) state = (int)sObj;
+                object cObj = t.InvokeMember("accChildCount", System.Reflection.BindingFlags.GetProperty, null, acc, null);
+                if (cObj is int) childCount = (int)cObj;
+
+                if (role == 43 || role == 44 || role == 62)
+                {
+                    string rawNm = t.InvokeMember("accName", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string;
+                    string nmNorm = Norm(rawNm);
+                    if (IsStrongAnchor(nmNorm)) strongAnchors.Add(items.Count);
+                    else if (IsPlayAnchor(nmNorm)) playAnchors.Add(items.Count);
+
+                    int enabled = ((state & 0x01) == 0) ? 1 : 0;
+                    int pressed = (((state & 0x08) != 0) || ((state & 0x10) != 0)) ? 1 : 0;
+
+                    items.Add(new CandidateMeta
+                    {
+                        ComNode = acc, IsAccNode = true, NameLower = nmNorm, HelpLower = "", AriaProps = null,
+                        ControlType = (role == 44) ? UIA_CheckBoxControlTypeId : UIA_ButtonControlTypeId,
+                        HasToggle = true, ToggleVal = pressed, Enabled = enabled, HasBounds = false
+                    });
+                    return;
+                }
+            }
+            catch { return; }
+
+            if (childCount <= 0 || childCount > 450) return;
+            object[] kids = new object[childCount];
+            int got;
+            if (AccessibleChildren(acc, 0, childCount, kids, out got) == 0 && got > 0)
+            {
+                for (int i = 0; i < got; i++)
+                {
+                    object k = kids[i];
+                    if (k != null && !(k is int))
+                    {
+                        int beforeCount = items.Count;
+                        CollectAccButtonsRecursive(k, depth + 1, ref visitedNodes, items, strongAnchors, playAnchors);
+                        bool retained = (items.Count > beforeCount && ReferenceEquals(items[items.Count - 1].ComNode, k));
+                        if (!retained) ReleaseCom(k);
+                    }
+                }
+            }
+        }
+        private static CandidateMeta ScanAccWindow(IntPtr hwnd, NativeWin32.RECT topWinRc, bool topIconic, out bool resolvedLiked, out int totalBtns, out string dbg)
+        {
+            resolvedLiked = false; totalBtns = 0; dbg = "";
+            if (hwnd == IntPtr.Zero || !IsWindowResponsive(hwnd)) return null;
+
+            Guid iidAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+            object accRoot = null;
+            var items = new List<CandidateMeta>();
+            var strongAnchors = new List<int>();
+            var playAnchors = new List<int>();
+            try
+            {
+                if (NativeWin32.AccessibleObjectFromWindow(hwnd, 0xFFFFFFFCu, ref iidAcc, out accRoot) != 0 || accRoot == null)
+                    return null;
+
+                int visited = 0;
+                CollectAccButtonsRecursive(accRoot, 0, ref visited, items, strongAnchors, playAnchors);
+                bool rootRetained = (items.Count > 0 && ReferenceEquals(items[0].ComNode, accRoot));
+                if (!rootRetained) { ReleaseCom(accRoot); accRoot = null; }
+
+                totalBtns = items.Count;
+                return SelectBestCandidate(items, strongAnchors, playAnchors, topWinRc, topIconic, out resolvedLiked, out dbg);
+            }
+            catch (Exception ex)
+            {
+                for (int i = 0; i < items.Count; i++) { ReleaseCom(items[i].ComNode); items[i].ComNode = null; }
+                ReleaseCom(accRoot);
+                LogDiagnostic("WARN", "IA2 scan skipped safely: " + ex.Message);
+                return null;
+            }
+        }
+
+        private static CandidateMeta ScanUiaWindow(
             IUIAutomation2 uia, IntPtr hwnd, NativeWin32.RECT topWinRc, bool topIconic,
             IUIAutomationCondition condInteractive, out bool resolvedLiked, out int totalBtns, out string dbg)
         {
@@ -2820,6 +2873,8 @@ namespace DynamicIslandWin
             IUIAutomationElement root = null;
             IUIAutomationElementArray arr = null;
             var items = new List<CandidateMeta>();
+            var strongAnchors = new List<int>();
+            var playAnchors = new List<int>();
             try
             {
                 if (uia.ElementFromHandle(hwnd, out root) != 0 || root == null) return null;
@@ -2828,18 +2883,11 @@ namespace DynamicIslandWin
                 if (arr.get_Length(out len) != 0 || len <= 0) return null;
                 totalBtns = len;
 
-                int limit = Math.Min(len, 650);
-                int skipStart = (len > limit) ? 80 : len;
-                int resumeAt = (len > limit) ? (len - (limit - 80)) : len;
-                var strongAnchors = new List<int>();
-                var playAnchors = new List<int>();
-
-                for (int i = 0; i < len; i++)
+                int limit = Math.Min(len, 500);
+                for (int i = Math.Max(0, len - limit); i < len; i++)
                 {
-                    if (i >= skipStart && i < resumeAt) continue;
                     IUIAutomationElement el = null;
                     if (arr.GetElement(i, out el) != 0 || el == null) continue;
-
                     string rawNm = null, rawHelp = null, rawAria = null;
                     int en = 1, ct = UIA_ButtonControlTypeId;
                     el.get_CurrentIsEnabled(out en);
@@ -2861,90 +2909,25 @@ namespace DynamicIslandWin
                     }
                     NativeWin32.RECT brc;
                     bool hasBounds = (el.get_CurrentBoundingRectangle(out brc) == 0);
-                    items.Add(new CandidateMeta { Element = el, NameLower = nmNorm, HelpLower = helpNorm, AriaProps = rawAria, ControlType = ct, HasToggle = hasTog, ToggleVal = togVal, Enabled = en, Bounds = brc, HasBounds = hasBounds });
+                    items.Add(new CandidateMeta { ComNode = el, IsAccNode = false, NameLower = nmNorm, HelpLower = helpNorm, AriaProps = rawAria, ControlType = ct, HasToggle = hasTog, ToggleVal = togVal, Enabled = en, Bounds = brc, HasBounds = hasBounds });
                 }
 
-                int winW = topWinRc.Right - topWinRc.Left, winH = topWinRc.Bottom - topWinRc.Top;
-                bool validWin = !topIconic && winW >= 200 && winH >= 120;
-                int bestIdx = -1, bestScore = int.MinValue;
-                bool bestLiked = false;
-
-                for (int k = 0; k < items.Count; k++)
-                {
-                    var m = items[k];
-                    if (m.Enabled == 0) continue;
-
-                    int minStrong = int.MaxValue, minPlay = int.MaxValue;
-                    for (int s = 0; s < strongAnchors.Count; s++) { int d = Math.Abs(k - strongAnchors[s]); if (d < minStrong) minStrong = d; }
-                    for (int p = 0; p < playAnchors.Count; p++) { int d = Math.Abs(k - playAnchors[p]); if (d < minPlay) minPlay = d; }
-
-                    bool nearStrong = minStrong <= 14;
-                    bool nearPlay = minPlay <= 10;
-                    bool candLiked;
-                    if (!EvaluateSemantics(m, nearStrong, out candLiked)) continue;
-
-                    int score = 0;
-                    if (nearStrong) score += 3200 - minStrong * 50;
-                    else if (nearPlay) score += 1100 - minPlay * 35;
-
-                    int bw = m.Bounds.Right - m.Bounds.Left, bh = m.Bounds.Bottom - m.Bounds.Top;
-                    bool validBtn = m.HasBounds && bw >= 8 && bw <= 180 && bh >= 8 && bh <= 110;
-
-                    if (validWin && validBtn)
-                    {
-                        float cy = (m.Bounds.Top + m.Bounds.Bottom) * 0.5f;
-                        float relY = (cy - topWinRc.Top) / Math.Max(1f, (float)winH);
-                        if (cy >= topWinRc.Bottom - Math.Max(148, (int)(winH * 0.25f)) && cy <= topWinRc.Bottom + 16)
-                            score += 1400 + (int)(relY * 200f);
-                        else if (relY >= 0.70f) score += 750 + (int)(relY * 100f);
-                        else if (relY <= 0.15f) score += 480;
-                        else if (!nearStrong) continue;
-                    }
-                    else
-                    {
-                        if (!nearStrong && !nearPlay && k < items.Count - 24) continue;
-                        if (k >= items.Count - 24) score += 400 + (k - (items.Count - 24)) * 10;
-                    }
-
-                    if (m.HasToggle) score += 120;
-                    if (score > bestScore) { bestScore = score; bestIdx = k; bestLiked = candLiked; }
-                }
-
-                IUIAutomationElement winner = null;
-                for (int k = 0; k < items.Count; k++)
-                {
-                    if (k == bestIdx)
-                    {
-                        winner = items[k].Element;
-                        dbg = string.Format("name='{0}', tog={1}:{2}, score={3}, btns={4}", items[k].NameLower, items[k].HasToggle ? 1 : 0, items[k].ToggleVal, bestScore, len);
-                    }
-                    else ReleaseCom(items[k].Element);
-                    items[k].Element = null;
-                }
-                if (winner == null)
-                {
-                    var sbSample = new StringBuilder();
-                    for (int k = 0; k < Math.Min(items.Count, 20); k++)
-                        sbSample.AppendFormat("[{0}:'{1}'/t={2}:{3}]", k, items[k].NameLower, items[k].HasToggle ? 1 : 0, items[k].ToggleVal);
-                    dbg = string.Format("miss len={0} anchors={1}/{2} sample={3}", len, strongAnchors.Count, playAnchors.Count, sbSample.ToString());
-                }
-                resolvedLiked = bestLiked;
-                return winner;
+                return SelectBestCandidate(items, strongAnchors, playAnchors, topWinRc, topIconic, out resolvedLiked, out dbg);
             }
-            catch (Exception ex)
+            catch
             {
-                for (int k = 0; k < items.Count; k++) if (items[k].Element != null) { ReleaseCom(items[k].Element); items[k].Element = null; }
-                LogDiagnostic("WARN", "CUIAutomation8 scan skipped safely: " + ex.Message);
+                for (int i = 0; i < items.Count; i++) { ReleaseCom(items[i].ComNode); items[i].ComNode = null; }
                 return null;
             }
             finally { ReleaseCom(arr); ReleaseCom(root); }
         }
-        private static IUIAutomationElement FindPlayerBarLikeElement(
+
+        private static CandidateMeta FindPlayerBarLikeControl(
             IUIAutomation2 uia, IntPtr topHwnd, IntPtr renderHwnd, bool isBrowser, string windowTitle,
             bool allowColdWakeRetry, out bool isCurrentlyLiked, out string debugSummary)
         {
             isCurrentlyLiked = false; debugSummary = "";
-            if (uia == null || topHwnd == IntPtr.Zero) return null;
+            if (topHwnd == IntPtr.Zero) return null;
 
             if (isBrowser)
             {
@@ -2957,41 +2940,68 @@ namespace DynamicIslandWin
             if (!NativeWin32.GetWindowRect(topHwnd, out winRc)) winRc = new NativeWin32.RECT();
             bool isIconic = NativeWin32.IsIconic(topHwnd);
 
-            IUIAutomationCondition condBtn = null, condChk = null, condInteractive = null;
-            try
+            int maxAttempts = allowColdWakeRetry ? 3 : 1;
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
-                uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out condBtn);
-                uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_CheckBoxControlTypeId, out condChk);
-                uia.CreateOrCondition(condBtn, condChk, out condInteractive);
-                if (condInteractive == null) return null;
-
-                int maxAttempts = allowColdWakeRetry ? 3 : 1;
-                for (int attempt = 0; attempt < maxAttempts; attempt++)
+                int accBtns = 0;
+                if (renderHwnd != IntPtr.Zero)
                 {
-                    int rBtns = 0, tBtns = 0;
-                    if (renderHwnd != IntPtr.Zero)
-                    {
-                        var hitR = ScanRoot(uia, renderHwnd, winRc, isIconic, condInteractive, out isCurrentlyLiked, out rBtns, out debugSummary);
-                        if (hitR != null) return hitR;
-                    }
-                    var hitT = ScanRoot(uia, topHwnd, winRc, isIconic, condInteractive, out isCurrentlyLiked, out tBtns, out debugSummary);
-                    if (hitT != null) return hitT;
-
-                    if (attempt + 1 < maxAttempts && Math.Max(rBtns, tBtns) <= 5)
-                    {
-                        Thread.Sleep(185);
-                        if (renderHwnd == IntPtr.Zero) renderHwnd = MultiPlayerMediaController.FindRenderWidgetChild(topHwnd);
-                        continue;
-                    }
-                    break;
+                    var hitAccR = ScanAccWindow(renderHwnd, winRc, isIconic, out isCurrentlyLiked, out accBtns, out debugSummary);
+                    if (hitAccR != null) return hitAccR;
                 }
+                var hitAccTop = ScanAccWindow(topHwnd, winRc, isIconic, out isCurrentlyLiked, out accBtns, out debugSummary);
+                if (hitAccTop != null) return hitAccTop;
+
+                int uiaBtns = 0;
+                if (uia != null)
+                {
+                    IUIAutomationCondition cBtn = null, cChk = null, cInter = null;
+                    try
+                    {
+                        uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out cBtn);
+                        uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_CheckBoxControlTypeId, out cChk);
+                        uia.CreateOrCondition(cBtn, cChk, out cInter);
+                        if (cInter != null)
+                        {
+                            var hitUia = ScanUiaWindow(uia, topHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out debugSummary);
+                            if (hitUia != null) return hitUia;
+                        }
+                    }
+                    finally { ReleaseCom(cInter); ReleaseCom(cChk); ReleaseCom(cBtn); }
+                }
+
+                if (attempt + 1 < maxAttempts && Math.Max(accBtns, uiaBtns) <= 5)
+                {
+                    Thread.Sleep(220);
+                    continue;
+                }
+                break;
             }
-            finally { ReleaseCom(condInteractive); ReleaseCom(condChk); ReleaseCom(condBtn); }
             return null;
         }
-
-        private static bool InvokeUiaButtonSafe(IUIAutomationElement btn)
+        private static bool InvokeLikeControlSafe(CandidateMeta ctrl)
         {
+            if (ctrl == null || ctrl.ComNode == null) return false;
+            if (ctrl.IsAccNode)
+            {
+                try
+                {
+                    ctrl.ComNode.GetType().InvokeMember(
+                        "accDoDefaultAction",
+                        System.Reflection.BindingFlags.InvokeMethod,
+                        null,
+                        ctrl.ComNode,
+                        new object[] { 0 });
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    LogDiagnostic("WARN", "IA2 accDoDefaultAction failed safely: " + ex.Message);
+                    return false;
+                }
+            }
+
+            var btn = ctrl.ComNode as IUIAutomationElement;
             if (btn == null) return false;
             object patObj = null;
             try
@@ -3035,6 +3045,31 @@ namespace DynamicIslandWin
                 return true;
             }
             catch (Exception ex) { LogDiagnostic("WARN", "Silent background key failed: " + ex.Message); return false; }
+        }
+
+        public static string RunDiagnosticProbe()
+        {
+            var sb = new StringBuilder();
+            try
+            {
+                IntPtr fg0 = NativeWin32.GetForegroundWindow();
+                var uia = (IUIAutomation2)(new CUIAutomation8ComObject());
+                uia.put_AutoSetFocus(0);
+                var dummyYm = new MediaSessionSnapshot { AppId = "YandexMusic", DisplayAppName = "Яндекс Музыка", Title = "Probe", Artist = "Probe" };
+                string wt; IntPtr rw;
+                IntPtr top = MultiPlayerMediaController.FindPlayerWindowSafe(dummyYm, false, true, out wt, out rw);
+                if (top != IntPtr.Zero)
+                {
+                    bool liked; string dbg;
+                    var ctrl = FindPlayerBarLikeControl(uia, top, rw, false, wt, true, out liked, out dbg);
+                    sb.AppendLine(string.Format("Before: found={0} isLiked={1} [{2}]", ctrl != null, liked, dbg));
+                    if (ctrl != null) ReleaseCom(ctrl.ComNode);
+                }
+                sb.AppendLine("FG_UNCHANGED=" + (fg0 == NativeWin32.GetForegroundWindow()));
+                ReleaseCom(uia);
+            }
+            catch (Exception ex) { sb.AppendLine("ERR: " + ex.Message); }
+            return sb.ToString();
         }
 
         private static void StaWorkerLoop()
@@ -3085,11 +3120,12 @@ namespace DynamicIslandWin
             {
                 if (topHwnd == IntPtr.Zero) return;
                 bool playerLiked; string dbg;
-                var btn = FindPlayerBarLikeElement(uia, topHwnd, renderHwnd, isBrowser, winTitle, true, out playerLiked, out dbg);
-                if (btn != null)
+                var ctrl = FindPlayerBarLikeControl(uia, topHwnd, renderHwnd, isBrowser, winTitle, true, out playerLiked, out dbg);
+                if (ctrl != null)
                 {
-                    ReleaseCom(btn);
-                    res.SyncedFromPlayer = true; res.IsLiked = playerLiked;
+                    ReleaseCom(ctrl.ComNode);
+                    res.SyncedFromPlayer = true;
+                    res.IsLiked = playerLiked;
                     string sigLog = job.TrackKey + "|" + playerLiked;
                     if (!string.Equals(_lastLoggedPassiveSync, sigLog, StringComparison.Ordinal))
                     {
@@ -3110,43 +3146,45 @@ namespace DynamicIslandWin
             }
 
             bool curLikedBefore; string beforeDbg;
-            var likeBtn = FindPlayerBarLikeElement(uia, topHwnd, renderHwnd, isBrowser, winTitle, true, out curLikedBefore, out beforeDbg);
-            if (likeBtn != null)
+            var likeCtrl = FindPlayerBarLikeControl(uia, topHwnd, renderHwnd, isBrowser, winTitle, true, out curLikedBefore, out beforeDbg);
+            if (likeCtrl != null)
             {
                 bool alreadyMatched = (curLikedBefore == job.ExpectedTargetLiked);
                 bool invoked = false;
-                try { invoked = alreadyMatched ? true : InvokeUiaButtonSafe(likeBtn); }
-                finally { ReleaseCom(likeBtn); }
+                try { invoked = alreadyMatched ? true : InvokeLikeControlSafe(likeCtrl); }
+                finally { ReleaseCom(likeCtrl.ComNode); }
 
                 if (invoked)
                 {
                     if (alreadyMatched)
                     {
-                        res.SyncedFromPlayer = true; res.IsLiked = curLikedBefore;
+                        res.SyncedFromPlayer = true;
+                        res.IsLiked = curLikedBefore;
                         LogDiagnostic("INFO", "Aligned phase without redundant toggle for '" + job.TrackKey + "' -> IsLiked=" + res.IsLiked + " [" + beforeDbg + "]");
                         if (job.Callback != null) job.Callback(res);
                         return;
                     }
 
                     bool verifiedLiked = job.ExpectedTargetLiked;
-                    bool gotVerify = false;
-                    int[] waits = new int[] { 90, 140, 220 };
+                    bool settled = false;
+                    int[] waits = new int[] { 180, 260, 360, 450 };
                     for (int w = 0; w < waits.Length; w++)
                     {
                         Thread.Sleep(waits[w]);
                         bool vLiked; string vDbg;
-                        var checkBtn = FindPlayerBarLikeElement(uia, topHwnd, renderHwnd, isBrowser, winTitle, false, out vLiked, out vDbg);
-                        if (checkBtn != null)
+                        var checkCtrl = FindPlayerBarLikeControl(uia, topHwnd, renderHwnd, isBrowser, winTitle, false, out vLiked, out vDbg);
+                        if (checkCtrl != null)
                         {
-                            ReleaseCom(checkBtn);
-                            verifiedLiked = vLiked; gotVerify = true;
-                            if (vLiked == job.ExpectedTargetLiked) break;
+                            ReleaseCom(checkCtrl.ComNode);
+                            verifiedLiked = vLiked;
+                            if (vLiked == job.ExpectedTargetLiked) { settled = true; break; }
                         }
                     }
 
                     res.SyncedFromPlayer = true;
-                    res.IsLiked = gotVerify ? verifiedLiked : job.ExpectedTargetLiked;
-                    LogDiagnostic("INFO", "Toggled favorite in background via CUIAutomation8 for '" + job.TrackKey + "' (" + curLikedBefore + " -> " + res.IsLiked + ") [" + beforeDbg + "]");
+                    res.IsLiked = settled ? verifiedLiked : job.ExpectedTargetLiked;
+                    _lastManualToggleTick = Environment.TickCount;
+                    LogDiagnostic("INFO", "Toggled favorite silently in background for '" + job.TrackKey + "' (" + curLikedBefore + " -> " + res.IsLiked + ", settled=" + settled + ") [" + beforeDbg + "]");
                     if (job.Callback != null) job.Callback(res);
                     return;
                 }
@@ -3154,10 +3192,10 @@ namespace DynamicIslandWin
 
             if (sup == PlayerFavoriteSupport.SupportedUiaAndBgKey && SendSilentBackgroundKeyYandex(topHwnd, renderHwnd))
             {
-                Thread.Sleep(180);
+                Thread.Sleep(450);
                 bool afterLiked; string afterDbg;
-                var verifyBtn = FindPlayerBarLikeElement(uia, topHwnd, renderHwnd, isBrowser, winTitle, false, out afterLiked, out afterDbg);
-                if (verifyBtn != null) { ReleaseCom(verifyBtn); res.SyncedFromPlayer = true; res.IsLiked = afterLiked; }
+                var verifyCtrl = FindPlayerBarLikeControl(uia, topHwnd, renderHwnd, isBrowser, winTitle, false, out afterLiked, out afterDbg);
+                if (verifyCtrl != null) { ReleaseCom(verifyCtrl.ComNode); res.SyncedFromPlayer = true; res.IsLiked = afterLiked; }
                 else { res.SyncedFromPlayer = false; res.IsLiked = job.ExpectedTargetLiked; }
                 LogDiagnostic("INFO", "Sent silent background KeyF for hidden '" + job.Snapshot.DisplayAppName + "' -> IsLiked=" + res.IsLiked);
                 if (job.Callback != null) job.Callback(res);
