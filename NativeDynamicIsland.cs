@@ -9929,8 +9929,8 @@ namespace DynamicIslandWin
                 {
                     g.FillPath(eb, ep);
                     g.DrawPath(ePen, ep);
-                    g.DrawString("Сейчас ни одна программа или игра
-не использует ваш микрофон.", _fSub, et, viewRc, _sfC);
+                    g.DrawString("Сейчас ни одна программа или игра", _fSub, et, new RectangleF(viewRc.X, viewRc.Y + 11f, viewRc.Width, 16f), _sfC);
+                    g.DrawString("не использует ваш микрофон.", _fSub, et, new RectangleF(viewRc.X, viewRc.Y + 28f, viewRc.Width, 16f), _sfC);
                 }
             }
             else
