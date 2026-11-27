@@ -2419,7 +2419,7 @@ namespace DynamicIslandWin
         void _Slot18_ControlViewCondition();
         void _Slot19_ContentViewCondition();
         void _Slot20_CreateCacheRequest();
-        void _Slot21_CreateTrueCondition();
+        [PreserveSig] int CreateTrueCondition(out IUIAutomationCondition newCondition);
         void _Slot22_CreateFalseCondition();
         [PreserveSig] int CreatePropertyCondition(int propertyId, [In, MarshalAs(UnmanagedType.Struct)] object value, out IUIAutomationCondition newCondition);
         void _Slot24_CreatePropertyConditionEx();
@@ -2525,44 +2525,78 @@ namespace DynamicIslandWin
             {
                 var uia = (IUIAutomation2)(new CUIAutomation8ComObject());
                 uia.put_AutoSetFocus(0);
-                uia.put_ConnectionTimeout(750);
-                uia.put_TransactionTimeout(1100);
+                uia.put_ConnectionTimeout(1500);
+                uia.put_TransactionTimeout(2000);
 
                 var dummyYm = new MediaSessionSnapshot { AppId = "YandexMusic", DisplayAppName = "Яндекс Музыка", Title = "Probe", Artist = "Probe" };
                 string wt; IntPtr rw;
                 IntPtr top = MultiPlayerMediaController.FindPlayerWindowSafe(dummyYm, false, true, out wt, out rw);
                 sb.AppendLine(string.Format("YM Window: top={0} render={1} vis={2} iconic={3} title='{4}'",
                     top, rw, top != IntPtr.Zero && NativeWin32.IsWindowVisible(top), top != IntPtr.Zero && NativeWin32.IsIconic(top), wt));
+
                 if (top != IntPtr.Zero)
                 {
-                    bool liked; string dbg;
-                    var btn = FindPlayerBarLikeElement(uia, top, rw, false, wt, true, out liked, out dbg);
-                    sb.AppendLine(string.Format("YM UIA Like Button: found={0} isLiked={1} [{2}]", btn != null, liked, dbg));
-                    ReleaseCom(btn);
+                    IUIAutomationElement root;
+                    int hrEl = uia.ElementFromHandle(top, out root);
+                    sb.AppendLine("ElementFromHandle hr=0x" + hrEl.ToString("X8") + " rootNull=" + (root == null));
+                    if (root != null)
+                    {
+                        string rName, rCls;
+                        root.get_CurrentName(out rName);
+                        root.get_CurrentClassName(out rCls);
+                        sb.AppendLine("Root name='" + rName + "' class='" + rCls + "'");
+
+                        IUIAutomationCondition cTrue, cBtn;
+                        uia.CreateTrueCondition(out cTrue);
+                        uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out cBtn);
+
+                        IUIAutomationElementArray chArr;
+                        int hrCh = root.FindAll(2 /* Children */, cTrue, out chArr);
+                        int chLen = -1;
+                        if (chArr != null) chArr.get_Length(out chLen);
+                        sb.AppendLine("Direct Children hr=0x" + hrCh.ToString("X8") + " len=" + chLen);
+                        for (int i = 0; i < Math.Min(Math.Max(0, chLen), 12); i++)
+                        {
+                            IUIAutomationElement ce;
+                            if (chArr.GetElement(i, out ce) == 0 && ce != null)
+                            {
+                                string cn, cc; int cct;
+                                ce.get_CurrentName(out cn); ce.get_CurrentClassName(out cc); ce.get_CurrentControlType(out cct);
+                                sb.AppendLine(string.Format("  Child[{0}] ct={1} class='{2}' name='{3}'", i, cct, cc, cn));
+                                ReleaseCom(ce);
+                            }
+                        }
+                        ReleaseCom(chArr);
+
+                        IUIAutomationElementArray btnArr1;
+                        int hrB1 = root.FindAll(4 /* Descendants */, cBtn, out btnArr1);
+                        int bLen1 = -1;
+                        if (btnArr1 != null) btnArr1.get_Length(out bLen1);
+                        sb.AppendLine("Before Wake Buttons hr=0x" + hrB1.ToString("X8") + " len=" + bLen1);
+                        for (int i = 0; i < Math.Min(Math.Max(0, bLen1), 35); i++)
+                        {
+                            IUIAutomationElement be;
+                            if (btnArr1.GetElement(i, out be) == 0 && be != null)
+                            {
+                                string bn; be.get_CurrentName(out bn);
+                                object pat; int tv = -1;
+                                if (be.GetCurrentPattern(UIA_TogglePatternId, out pat) == 0 && pat is IUIAutomationTogglePattern)
+                                { ((IUIAutomationTogglePattern)pat).get_CurrentToggleState(out tv); ReleaseCom(pat); }
+                                sb.AppendLine(string.Format("  Btn1[{0}] tog={1} name='{2}'", i, tv, bn));
+                                ReleaseCom(be);
+                            }
+                        }
+                        ReleaseCom(btnArr1);
+
+                        ReleaseCom(cBtn);
+                        ReleaseCom(cTrue);
+                        ReleaseCom(root);
+                    }
                 }
                 ReleaseCom(uia);
             }
-            catch (Exception ex) { sb.AppendLine("Probe error: " + ex.Message); }
+            catch (Exception ex) { sb.AppendLine("Probe error: " + ex); }
             return sb.ToString();
-        }
-
-        private static void LogDiagnostic(string level, string msg)
-        {
-            try
-            {
-                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DynamicIslandWin");
-                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                string logPath = Path.Combine(dir, "player_sync.log");
-                FileInfo fi = new FileInfo(logPath);
-                if (fi.Exists && fi.Length > 512 * 1024)
-                {
-                    string old = logPath + ".old";
-                    if (File.Exists(old)) File.Delete(old);
-                    File.Move(logPath, old);
-                }
-                File.AppendAllText(logPath, string.Format("[{0:yyyy-MM-dd HH:mm:ss.fff}] [{1}] {2}{3}", DateTime.Now, level, msg, Environment.NewLine), Encoding.UTF8);
-            }
-            catch { }
         }
 
         private static void EnsureStaWorkerStarted()
@@ -3191,6 +3225,7 @@ namespace DynamicIslandWin
         [DllImport("user32.dll")] public static extern bool SetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
         [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+        [DllImport("oleacc.dll")] public static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint dwId, ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object ppvObject);
 
         public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
