@@ -3281,20 +3281,43 @@ namespace DynamicIslandWin
     // =========================================================================
     // 4E. MODULE 6: UNOBTRUSIVE GITHUB RELEASES UPDATE MANAGER (USER-CHOICE)
     // =========================================================================
+    public enum UpdateCheckState { Idle, Checking, UpToDate, Available, NoReleases, Error, Downloading, Installing }
+
     public sealed class UpdateManager
     {
-        public const string CurrentVersionStr = "3.0.0";
+        public const string CurrentVersionStr = "3.1.0";
+        public const string DefaultRepo = "Miltanchik/DynamicIsland";
+
         public string LatestVersionStr { get; private set; }
         public string ReleaseNotes { get; private set; }
         public string DownloadUrl { get; private set; }
         public string ExpectedSha256 { get; private set; }
+        public string ReleasePageUrl { get; private set; }
+        public string RepoSlug { get; private set; }
         public string StatusText { get; private set; }
-        public bool IsUpdateAvailable { get; private set; }
-        public bool IsDownloading { get; private set; }
+        public string ErrorText { get; private set; }
         public float DownloadProgress { get; private set; }
         public bool DismissedForSession { get; set; }
 
+        private int _state;
+        private volatile bool _hasUpdate;
+        private int _checkingFlag;
+
+        public UpdateCheckState State
+        {
+            get { return (UpdateCheckState)Volatile.Read(ref _state); }
+            private set { Volatile.Write(ref _state, (int)value); }
+        }
+        public bool IsUpdateAvailable { get { return _hasUpdate; } }
+        public bool IsDownloading
+        {
+            get { UpdateCheckState s = State; return s == UpdateCheckState.Downloading || s == UpdateCheckState.Installing; }
+        }
+        public bool IsChecking { get { return State == UpdateCheckState.Checking; } }
+
         public event Action OnStateChanged;
+        public event Action UpdateAvailableDetected;
+        public event Action RestartRequested;
 
         public UpdateManager()
         {
@@ -3302,176 +3325,688 @@ namespace DynamicIslandWin
             ReleaseNotes = "";
             DownloadUrl = "";
             ExpectedSha256 = "";
+            ReleasePageUrl = "https://github.com/" + DefaultRepo + "/releases";
+            RepoSlug = DefaultRepo;
+            ErrorText = "";
+            State = UpdateCheckState.Idle;
             StatusText = "v" + CurrentVersionStr + " (Актуальная)";
+        }
+
+        private void Raise()
+        {
+            Action h = OnStateChanged;
+            if (h != null) { try { h(); } catch { } }
+        }
+
+        private void SetError(string message)
+        {
+            ErrorText = message;
+            StatusText = message;
+            State = UpdateCheckState.Error;
+            Raise();
+        }
+
+        private static void EnsureTls()
+        {
+            try { ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11; } catch { }
+        }
+
+        private static string NormalizeRepo(string cfgRepo)
+        {
+            string r = (cfgRepo ?? "").Trim().Trim('/');
+            if (r.StartsWith("https://github.com/", StringComparison.OrdinalIgnoreCase)) r = r.Substring(19).Trim('/');
+            if (r.EndsWith(".git", StringComparison.OrdinalIgnoreCase)) r = r.Substring(0, r.Length - 4);
+            if (r.Length == 0 || r.IndexOf('/') < 1 || r.IndexOf("DynamicIslandWin/DynamicIslandWin", StringComparison.OrdinalIgnoreCase) >= 0)
+                return DefaultRepo;
+            return r;
+        }
+
+        public static Version ParseVersion(string s)
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(s ?? "", @"(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?");
+            if (!m.Success) return null;
+            try
+            {
+                int a = int.Parse(m.Groups[1].Value);
+                int b = int.Parse(m.Groups[2].Value);
+                int c = m.Groups[3].Success ? int.Parse(m.Groups[3].Value) : 0;
+                int d = m.Groups[4].Success ? int.Parse(m.Groups[4].Value) : 0;
+                return new Version(a, b, c, d);
+            }
+            catch { return null; }
+        }
+
+        private static string HttpGetString(string url, int timeoutMs)
+        {
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.UserAgent = "DynamicIslandWin-Updater/" + CurrentVersionStr;
+            req.Accept = "application/vnd.github+json, text/plain, */*";
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            req.AllowAutoRedirect = true;
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                return sr.ReadToEnd();
+        }
+
+        private static string ExtractSha(string sums, string fileName)
+        {
+            if (string.IsNullOrEmpty(sums) || string.IsNullOrEmpty(fileName)) return "";
+            foreach (string raw in sums.Replace("\r", "").Split('\n'))
+            {
+                string line = raw.Trim().TrimStart('\uFEFF');
+                if (line.Length < 66 || line.IndexOf(fileName, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                string[] parts = line.Split(new char[] { ' ', '\t', '*' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 2 && parts[0].Length == 64) return parts[0].ToLowerInvariant();
+            }
+            return "";
         }
 
         public void CheckForUpdatesAsync(IslandConfigData cfg, bool isManualCheck)
         {
             if (IsDownloading) return;
+            if (Interlocked.CompareExchange(ref _checkingFlag, 1, 0) != 0) return;
+
+            State = UpdateCheckState.Checking;
             StatusText = "Проверка обновлений...";
-            if (OnStateChanged != null) OnStateChanged();
+            ErrorText = "";
+            Raise();
+
+            string repoCfg = cfg != null ? cfg.github_repo : "";
+            string skipped = cfg != null ? (cfg.skipped_version ?? "") : "";
+            bool autoInstall = cfg != null && cfg.auto_update_enabled;
 
             ThreadPool.QueueUserWorkItem(_ =>
             {
-                try
-                {
-                    ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-                    string repo = (cfg != null && !string.IsNullOrEmpty(cfg.github_repo))
-                        ? cfg.github_repo
-                        : "Miltanchik/DynamicIsland";
-                    string apiUrl = "https://api.github.com/repos/" + repo + "/releases/latest";
-
-                    var req = (HttpWebRequest)WebRequest.Create(apiUrl);
-                    req.UserAgent = "DynamicIslandWin-Updater/" + CurrentVersionStr;
-                    req.Timeout = 6500;
-                    req.Accept = "application/vnd.github.v3+json";
-
-                    using (var resp = (HttpWebResponse)req.GetResponse())
-                    using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-                    {
-                        string json = sr.ReadToEnd();
-                        var ser = new JavaScriptSerializer();
-                        var dict = ser.Deserialize<Dictionary<string, object>>(json);
-                        if (dict != null && dict.ContainsKey("tag_name"))
-                        {
-                            string tag = (dict["tag_name"] as string ?? "").Trim().TrimStart('v', 'V');
-                            string body = (dict.ContainsKey("body") ? (dict["body"] as string ?? "") : "").Trim();
-                            string exeUrl = "";
-                            string sha256 = "";
-
-                            if (dict.ContainsKey("assets") && dict["assets"] is System.Collections.ArrayList)
-                            {
-                                var assets = (System.Collections.ArrayList)dict["assets"];
-                                foreach (object aObj in assets)
-                                {
-                                    var a = aObj as Dictionary<string, object>;
-                                    if (a == null) continue;
-                                    string nm = (a.ContainsKey("name") ? (a["name"] as string ?? "") : "").ToLowerInvariant();
-                                    string dl = a.ContainsKey("browser_download_url") ? (a["browser_download_url"] as string ?? "") : "";
-                                    if (nm.EndsWith(".exe") && (nm.Contains("setup") || nm.Contains("dynamicisland")))
-                                        exeUrl = dl;
-                                }
-                            }
-
-                            Version vCur, vNew;
-                            if (Version.TryParse(CurrentVersionStr, out vCur) && Version.TryParse(tag, out vNew) && vNew > vCur)
-                            {
-                                if (!isManualCheck && cfg != null && string.Equals(cfg.skipped_version, tag, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    StatusText = "v" + CurrentVersionStr + " (Пропущена v" + tag + ")";
-                                    if (OnStateChanged != null) OnStateChanged();
-                                    return;
-                                }
-
-                                LatestVersionStr = tag;
-                                ReleaseNotes = string.IsNullOrEmpty(body) ? "Улучшения стабильности и новые функции Studio Pro." : body;
-                                DownloadUrl = exeUrl;
-                                ExpectedSha256 = sha256;
-                                IsUpdateAvailable = true;
-                                DismissedForSession = false;
-                                StatusText = "Доступна v" + tag + "!";
-                                if (OnStateChanged != null) OnStateChanged();
-
-                                if (cfg != null && cfg.auto_update_enabled && !string.IsNullOrEmpty(DownloadUrl))
-                                {
-                                    StartDownloadAndApplyAsync();
-                                }
-                                return;
-                            }
-                        }
-                    }
-
-                    IsUpdateAvailable = false;
-                    StatusText = "Установлена последняя версия v" + CurrentVersionStr;
-                }
-                catch
-                {
-                    StatusText = "Установлена последняя версия v" + CurrentVersionStr;
-                }
-                if (OnStateChanged != null) OnStateChanged();
+                try { CheckCore(repoCfg, skipped, isManualCheck, autoInstall); }
+                catch (Exception ex) { SetError("Не удалось проверить обновления: " + ex.Message); }
+                finally { Interlocked.Exchange(ref _checkingFlag, 0); Raise(); }
             });
+        }
+
+        private void CheckCore(string repoCfg, string skipped, bool manual, bool autoInstall)
+        {
+            EnsureTls();
+            string repo = NormalizeRepo(repoCfg);
+            RepoSlug = repo;
+            ReleasePageUrl = "https://github.com/" + repo + "/releases";
+
+            string json;
+            try
+            {
+                json = HttpGetString("https://api.github.com/repos/" + repo + "/releases/latest", 9000);
+            }
+            catch (WebException wex)
+            {
+                HttpWebResponse r = wex.Response as HttpWebResponse;
+                if (r != null && r.StatusCode == HttpStatusCode.NotFound)
+                {
+                    _hasUpdate = false;
+                    ErrorText = "В репозитории " + repo + " пока нет опубликованных релизов.";
+                    StatusText = "Релизы на GitHub ещё не опубликованы";
+                    State = UpdateCheckState.NoReleases;
+                    return;
+                }
+                if (r != null && (int)r.StatusCode == 403)
+                {
+                    SetError("Достигнут лимит запросов GitHub API. Повторите проверку через несколько минут.");
+                    return;
+                }
+                SetError(r != null
+                    ? ("GitHub вернул ошибку " + (int)r.StatusCode + " " + r.StatusDescription)
+                    : "Нет соединения с GitHub. Проверьте подключение к интернету.");
+                return;
+            }
+
+            var ser = new JavaScriptSerializer();
+            ser.MaxJsonLength = int.MaxValue;
+            var dict = ser.Deserialize<Dictionary<string, object>>(json);
+            if (dict == null || !dict.ContainsKey("tag_name"))
+            {
+                SetError("Некорректный ответ GitHub (отсутствует tag_name).");
+                return;
+            }
+
+            string tagRaw = Convert.ToString(dict["tag_name"]) ?? "";
+            string tag = tagRaw.Trim().TrimStart('v', 'V');
+            Version vNew = ParseVersion(tagRaw);
+            Version vCur = ParseVersion(CurrentVersionStr);
+            if (vNew == null || vCur == null)
+            {
+                SetError("Не удалось разобрать номер версии релиза: " + tagRaw);
+                return;
+            }
+
+            string body = dict.ContainsKey("body") ? (Convert.ToString(dict["body"]) ?? "") : "";
+            string htmlUrl = dict.ContainsKey("html_url") ? (Convert.ToString(dict["html_url"]) ?? "") : "";
+            if (string.IsNullOrEmpty(htmlUrl)) htmlUrl = ReleasePageUrl;
+
+            string setupUrl = "", setupName = "", sumsUrl = "";
+            int bestPriority = 0;
+            System.Collections.IEnumerable assets = dict.ContainsKey("assets") ? dict["assets"] as System.Collections.IEnumerable : null;
+            if (assets != null)
+            {
+                foreach (object o in assets)
+                {
+                    var a = o as Dictionary<string, object>;
+                    if (a == null) continue;
+                    string nm = Convert.ToString(a.ContainsKey("name") ? a["name"] : "") ?? "";
+                    string dl = Convert.ToString(a.ContainsKey("browser_download_url") ? a["browser_download_url"] : "") ?? "";
+                    string low = nm.ToLowerInvariant();
+                    if (low == "sha256sums.txt") { sumsUrl = dl; continue; }
+                    if (!low.EndsWith(".exe")) continue;
+                    int pri = low == "dynamicislandwin_setup.exe" ? 3 : (low == "dinamicisland-setup.exe" ? 2 : (low.Contains("setup") ? 1 : 0));
+                    if (pri > bestPriority) { bestPriority = pri; setupUrl = dl; setupName = nm; }
+                }
+            }
+
+            if (vNew > vCur)
+            {
+                if (!manual && string.Equals(skipped, tag, StringComparison.OrdinalIgnoreCase))
+                {
+                    _hasUpdate = false;
+                    StatusText = "v" + CurrentVersionStr + " (Пропущена v" + tag + ")";
+                    State = UpdateCheckState.UpToDate;
+                    return;
+                }
+
+                string sha = "";
+                if (!string.IsNullOrEmpty(sumsUrl) && !string.IsNullOrEmpty(setupName))
+                {
+                    try { sha = ExtractSha(HttpGetString(sumsUrl, 7000), setupName); } catch { sha = ""; }
+                }
+
+                string previous = LatestVersionStr;
+                LatestVersionStr = tag;
+                ReleaseNotes = body;
+                DownloadUrl = setupUrl;
+                ExpectedSha256 = sha;
+                ReleasePageUrl = htmlUrl;
+                _hasUpdate = true;
+                if (manual || !string.Equals(previous, tag, StringComparison.OrdinalIgnoreCase)) DismissedForSession = false;
+                StatusText = "Доступна v" + tag + "!";
+                State = UpdateCheckState.Available;
+                Raise();
+
+                Action ev = UpdateAvailableDetected;
+                if (ev != null) { try { ev(); } catch { } }
+
+                if (autoInstall && !string.IsNullOrEmpty(setupUrl))
+                    StartDownloadAndApplyAsync();
+                return;
+            }
+
+            _hasUpdate = false;
+            LatestVersionStr = tag;
+            StatusText = "Установлена последняя версия v" + CurrentVersionStr;
+            State = UpdateCheckState.UpToDate;
         }
 
         public void StartDownloadAndApplyAsync()
         {
-            if (IsDownloading || string.IsNullOrEmpty(DownloadUrl)) return;
-            IsDownloading = true;
+            if (IsDownloading) return;
+            if (string.IsNullOrEmpty(DownloadUrl))
+            {
+                try { Process.Start(new ProcessStartInfo(string.IsNullOrEmpty(ReleasePageUrl) ? ("https://github.com/" + DefaultRepo + "/releases") : ReleasePageUrl) { UseShellExecute = true }); } catch { }
+                return;
+            }
+
+            State = UpdateCheckState.Downloading;
             DownloadProgress = 0.02f;
             StatusText = "Загрузка v" + LatestVersionStr + "...";
-            if (OnStateChanged != null) OnStateChanged();
+            ErrorText = "";
+            Raise();
+
+            string url = DownloadUrl;
+            string expectedSha = ExpectedSha256;
+            string versionLabel = LatestVersionStr;
 
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 try
                 {
+                    EnsureTls();
                     string updDir = Path.Combine(Path.GetTempPath(), @"DinamicIsland\Update");
                     if (!Directory.Exists(updDir)) Directory.CreateDirectory(updDir);
-                    string targetFile = Path.Combine(updDir, "DynamicIslandWin_Setup.exe");
-                    if (File.Exists(targetFile)) File.Delete(targetFile);
+                    string finalFile = Path.Combine(updDir, "DynamicIslandWin_Setup.exe");
+                    string partFile = finalFile + ".part";
+                    try { if (File.Exists(partFile)) File.Delete(partFile); } catch { }
 
-                    ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-                    var req = (HttpWebRequest)WebRequest.Create(DownloadUrl);
+                    var req = (HttpWebRequest)WebRequest.Create(url);
                     req.UserAgent = "DynamicIslandWin-Updater/" + CurrentVersionStr;
-                    req.Timeout = 15000;
+                    req.Accept = "application/octet-stream";
+                    req.Timeout = 30000;
+                    req.ReadWriteTimeout = 30000;
+                    req.AllowAutoRedirect = true;
 
                     using (var resp = (HttpWebResponse)req.GetResponse())
                     using (var rs = resp.GetResponseStream())
-                    using (var fs = new FileStream(targetFile, FileMode.Create, FileAccess.Write, FileShare.None))
+                    using (var fs = new FileStream(partFile, FileMode.Create, FileAccess.Write, FileShare.None))
                     {
-                        long total = Math.Max(1, resp.ContentLength);
-                        byte[] buf = new byte[16384];
+                        long total = resp.ContentLength;
+                        byte[] buf = new byte[32768];
                         long readTotal = 0;
-                        int r;
-                        while ((r = rs.Read(buf, 0, buf.Length)) > 0)
+                        int lastRaise = Environment.TickCount;
+                        int n;
+                        while ((n = rs.Read(buf, 0, buf.Length)) > 0)
                         {
-                            fs.Write(buf, 0, r);
-                            readTotal += r;
-                            DownloadProgress = Math.Max(0.05f, Math.Min(0.99f, readTotal / (float)total));
-                            if (OnStateChanged != null) OnStateChanged();
+                            fs.Write(buf, 0, n);
+                            readTotal += n;
+                            if (total > 0) DownloadProgress = Math.Max(0.03f, Math.Min(0.97f, readTotal / (float)total));
+                            if (unchecked(Environment.TickCount - lastRaise) > 80) { lastRaise = Environment.TickCount; Raise(); }
                         }
                     }
 
-                    if (!string.IsNullOrEmpty(ExpectedSha256))
+                    var fi = new FileInfo(partFile);
+                    if (fi.Length < 200 * 1024) throw new IOException("Загруженный файл повреждён (слишком маленький размер).");
+                    using (var chk = File.OpenRead(partFile))
                     {
+                        int b0 = chk.ReadByte(), b1 = chk.ReadByte();
+                        if (b0 != 'M' || b1 != 'Z') throw new IOException("Загруженный файл не является установщиком Windows.");
+                    }
+
+                    if (!string.IsNullOrEmpty(expectedSha))
+                    {
+                        string actual;
                         using (var sha = SHA256.Create())
-                        using (var fs = File.OpenRead(targetFile))
+                        using (var fsr = File.OpenRead(partFile))
                         {
-                            byte[] hashBytes = sha.ComputeHash(fs);
                             var sb = new StringBuilder();
-                            foreach (byte b in hashBytes) sb.Append(b.ToString("x2"));
-                            if (!string.Equals(sb.ToString(), ExpectedSha256, StringComparison.OrdinalIgnoreCase))
-                            {
-                                IsDownloading = false;
-                                StatusText = "Ошибка SHA-256 (Повторить)";
-                                if (OnStateChanged != null) OnStateChanged();
-                                return;
-                            }
+                            foreach (byte b in sha.ComputeHash(fsr)) sb.Append(b.ToString("x2"));
+                            actual = sb.ToString();
+                        }
+                        if (!string.Equals(actual, expectedSha, StringComparison.OrdinalIgnoreCase))
+                        {
+                            try { File.Delete(partFile); } catch { }
+                            throw new IOException("Контрольная сумма SHA-256 не совпала — обновление отменено ради безопасности.");
                         }
                     }
+
+                    if (File.Exists(finalFile)) File.Delete(finalFile);
+                    File.Move(partFile, finalFile);
 
                     DownloadProgress = 1.0f;
-                    StatusText = "Перезапуск и обновление...";
-                    if (OnStateChanged != null) OnStateChanged();
+                    StatusText = "Запуск установщика v" + versionLabel + "...";
+                    State = UpdateCheckState.Installing;
+                    Raise();
 
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = targetFile,
-                        Arguments = "--silent",
-                        UseShellExecute = false
-                    });
-                    Thread.Sleep(250);
-                    Application.Exit();
+                    Process.Start(new ProcessStartInfo { FileName = finalFile, Arguments = "--silent", UseShellExecute = false });
+                    Thread.Sleep(400);
+                    Action rh = RestartRequested;
+                    if (rh != null) rh();
                 }
-                catch
+                catch (Exception ex)
                 {
-                    IsDownloading = false;
-                    StatusText = "Ошибка загрузки (Повторить)";
-                    if (OnStateChanged != null) OnStateChanged();
+                    SetError("Ошибка загрузки обновления: " + ex.Message);
                 }
             });
         }
     }
 
+    public sealed class UpdateDialogForm : Form
+    {
+        private static readonly Color ColChassis = Color.FromArgb(11, 11, 13);
+        private static readonly Color ColCard = Color.FromArgb(18, 18, 21);
+        private static readonly Color ColInset = Color.FromArgb(13, 13, 16);
+        private static readonly Color ColHover = Color.FromArgb(26, 26, 31);
+        private static readonly Color ColBorder = Color.FromArgb(21, 255, 255, 255);
+        private static readonly Color ColBorderHi = Color.FromArgb(56, 255, 255, 255);
+        private static readonly Color ColAccent = Color.FromArgb(255, 85, 0);
+        private static readonly Color ColLime = Color.FromArgb(200, 255, 0);
+        private static readonly Color ColText = Color.FromArgb(242, 243, 247);
+        private static readonly Color ColMuted = Color.FromArgb(138, 142, 154);
+        private static readonly Color ColDim = Color.FromArgb(92, 96, 108);
+
+        private readonly UpdateManager _um;
+        private readonly IslandConfigData _cfg;
+        private readonly bool _noActivate;
+        private readonly System.Windows.Forms.Timer _animTimer;
+        private readonly Action _stateHandler;
+
+        private sealed class Hit { public RectangleF Rect; public Action Click; }
+        private readonly List<Hit> _hits = new List<Hit>();
+        private PointF _mouse = new PointF(-99, -99);
+        private float _scroll = 0f;
+        private float _maxScroll = 0f;
+        private bool _dragging = false;
+        private Point _dragOff;
+
+        private readonly Font _fTitle = new Font("Consolas", 8.8f, FontStyle.Bold);
+        private readonly Font _fHuge = new Font("Consolas", 19f, FontStyle.Bold);
+        private readonly Font _fMono = new Font("Consolas", 9.4f, FontStyle.Bold);
+        private readonly Font _fTiny = new Font("Consolas", 7.8f, FontStyle.Bold);
+        private readonly Font _fBody = new Font("Segoe UI", 9.0f, FontStyle.Regular);
+        private readonly Font _fBtn = new Font("Consolas", 8.2f, FontStyle.Bold);
+        private readonly StringFormat _sfC = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+        private readonly StringFormat _sfL = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+
+        public UpdateDialogForm(UpdateManager um, IslandConfigData cfg, bool noActivate)
+        {
+            _um = um;
+            _cfg = cfg;
+            _noActivate = noActivate;
+            Text = "Dynamic Island — Обновление";
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.CenterScreen;
+            TopMost = true;
+            ShowInTaskbar = false;
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+            ClientSize = new Size(560, 392);
+            BackColor = ColChassis;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+            Region = Region.FromHrgn(NativeWin32.CreateRoundRectRgn(0, 0, Width + 1, Height + 1, 10, 10));
+
+            _stateHandler = delegate
+            {
+                try
+                {
+                    if (IsDisposed || !IsHandleCreated) return;
+                    BeginInvoke((MethodInvoker)delegate { if (!IsDisposed) Invalidate(); });
+                }
+                catch { }
+            };
+            _um.OnStateChanged += _stateHandler;
+
+            _animTimer = new System.Windows.Forms.Timer { Interval = 40 };
+            _animTimer.Tick += delegate
+            {
+                UpdateCheckState s = _um.State;
+                if (s == UpdateCheckState.Checking || s == UpdateCheckState.Downloading || s == UpdateCheckState.Installing)
+                    Invalidate();
+            };
+            _animTimer.Start();
+        }
+
+        protected override bool ShowWithoutActivation { get { return _noActivate; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= NativeWin32.WS_EX_TOOLWINDOW; // never listed in Alt+Tab
+                return cp;
+            }
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            try { _um.OnStateChanged -= _stateHandler; } catch { }
+            try { _animTimer.Stop(); _animTimer.Dispose(); } catch { }
+            base.OnFormClosed(e);
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (_um.State == UpdateCheckState.Available) _um.DismissedForSession = true;
+            base.OnFormClosing(e);
+        }
+
+        private static GraphicsPath RR(RectangleF r, float rad)
+        {
+            float d = Math.Min(rad * 2f, Math.Min(r.Width, r.Height));
+            var p = new GraphicsPath();
+            if (d <= 1f) { p.AddRectangle(r); return p; }
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        private void Btn(Graphics g, RectangleF rc, string label, int kind, Action click)
+        {
+            bool hov = rc.Contains(_mouse);
+            Color bg = kind == 1 ? (hov ? Color.FromArgb(255, 102, 24) : ColAccent)
+                     : (kind == 2 ? (hov ? Color.FromArgb(52, 22, 24) : Color.FromArgb(28, 16, 18))
+                     : (hov ? ColHover : ColCard));
+            Color bd = kind == 1 ? Color.FromArgb(220, 255, 140, 80)
+                     : (kind == 2 ? Color.FromArgb(110, 255, 70, 60) : (hov ? ColBorderHi : ColBorder));
+            Color fg = kind == 1 ? Color.FromArgb(12, 12, 14) : (kind == 2 ? Color.FromArgb(255, 105, 95) : ColText);
+            using (GraphicsPath p = RR(rc, 4f))
+            using (var b = new SolidBrush(bg))
+            using (var pen = new Pen(bd, 1f))
+            using (var tb = new SolidBrush(fg))
+            {
+                g.FillPath(b, p);
+                g.DrawPath(pen, p);
+                g.DrawString(label, _fBtn, tb, rc, _sfC);
+            }
+            if (click != null) _hits.Add(new Hit { Rect = rc, Click = click });
+        }
+
+        private static string PlainNotes(string md)
+        {
+            string t = (md ?? "").Replace("\r\n", "\n").Replace("\r", "\n");
+            t = System.Text.RegularExpressions.Regex.Replace(t, @"\[([^\]]+)\]\([^\)]+\)", "$1");
+            t = System.Text.RegularExpressions.Regex.Replace(t, @"(?m)^\s{0,3}#{1,6}\s*", "");
+            t = System.Text.RegularExpressions.Regex.Replace(t, @"(?m)^\s*[\*\-]\s+", "•  ");
+            t = t.Replace("**", "").Replace("__", "").Replace("`", "");
+            t = System.Text.RegularExpressions.Regex.Replace(t, @"\n{3,}", "\n\n").Trim();
+            if (t.Length == 0) t = "Улучшения стабильности и новые функции Studio Pro.";
+            return t;
+        }
+
+        private void DoCheck() { _scroll = 0f; _um.CheckForUpdatesAsync(_cfg, true); Invalidate(); }
+
+        private void DoOpenReleases()
+        {
+            try { Process.Start(new ProcessStartInfo(_um.ReleasePageUrl) { UseShellExecute = true }); } catch { }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            _hits.Clear();
+
+            using (var bg = new SolidBrush(ColChassis)) g.FillRectangle(bg, ClientRectangle);
+
+            using (var bar = new SolidBrush(Color.FromArgb(14, 14, 17)))
+            using (var pen = new Pen(ColBorder, 1f))
+            using (var ac = new SolidBrush(ColAccent))
+            using (var tb = new SolidBrush(ColText))
+            using (var db = new SolidBrush(ColDim))
+            {
+                g.FillRectangle(bar, 0, 0, Width, 34);
+                g.DrawLine(pen, 0, 34, Width, 34);
+                g.FillRectangle(ac, 14, 11, 8, 12);
+                g.DrawString("UPDATE CENTER // DYNAMIC ISLAND", _fTitle, tb, new RectangleF(28, 0, 330, 34), _sfL);
+                g.DrawString("ТЕКУЩАЯ v" + UpdateManager.CurrentVersionStr, _fTiny, db, new RectangleF(Width - 230, 0, 150, 34), _sfL);
+            }
+            Btn(g, new RectangleF(Width - 70, 6, 56, 22), "ЗАКРЫТЬ", 0, delegate { Close(); });
+
+            UpdateCheckState st = _um.State;
+            float W = Width;
+            float H = Height;
+            var body = new RectangleF(16f, 46f, W - 32f, H - 62f);
+            float btnY = H - 52f;
+
+            if (st == UpdateCheckState.Available)
+            {
+                using (var latest = new SolidBrush(ColAccent))
+                using (var cur = new SolidBrush(ColMuted))
+                using (var mut = new SolidBrush(ColMuted))
+                {
+                    g.DrawString("v" + UpdateManager.CurrentVersionStr, _fHuge, cur, new RectangleF(body.X, body.Y + 2, 120, 38), _sfL);
+                    g.DrawString("→", _fHuge, mut, new RectangleF(body.X + 110, body.Y + 2, 40, 38), _sfC);
+                    g.DrawString("v" + _um.LatestVersionStr, _fHuge, latest, new RectangleF(body.X + 150, body.Y + 2, 200, 38), _sfL);
+                    g.DrawString("ДОСТУПНО ОБНОВЛЕНИЕ  •  " + _um.RepoSlug, _fTiny, mut, new RectangleF(body.X, body.Y + 42, body.Width, 16), _sfL);
+                }
+                using (var led = new SolidBrush(ColLime)) g.FillEllipse(led, body.Right - 14, body.Y + 14, 8, 8);
+
+                var box = new RectangleF(body.X, body.Y + 66, body.Width, btnY - body.Y - 78f);
+                using (GraphicsPath bp = RR(box, 5f))
+                using (var bb = new SolidBrush(ColInset))
+                using (var bpn = new Pen(ColBorder, 1f))
+                {
+                    g.FillPath(bb, bp);
+                    g.DrawPath(bpn, bp);
+                }
+                using (var hb = new SolidBrush(ColAccent))
+                    g.DrawString("[CHANGELOG]", _fTiny, hb, new RectangleF(box.X + 10, box.Y + 4, 140, 16), _sfL);
+
+                var view = new RectangleF(box.X + 8, box.Y + 24, box.Width - 22, box.Height - 30);
+                string notes = PlainNotes(_um.ReleaseNotes);
+                SizeF sz = g.MeasureString(notes, _fBody, (int)view.Width);
+                _maxScroll = Math.Max(0f, sz.Height - view.Height + 6f);
+                _scroll = Math.Max(0f, Math.Min(_maxScroll, _scroll));
+
+                Region prev = g.Clip;
+                g.SetClip(view);
+                using (var nb = new SolidBrush(Color.FromArgb(226, 228, 236)))
+                    g.DrawString(notes, _fBody, nb, new RectangleF(view.X, view.Y - _scroll, view.Width, sz.Height + 4f));
+                g.Clip = prev;
+
+                if (_maxScroll > 1f)
+                {
+                    var track = new RectangleF(box.Right - 9, view.Y, 3, view.Height);
+                    float th = Math.Max(18f, view.Height * (view.Height / (view.Height + _maxScroll)));
+                    float ty = track.Y + (track.Height - th) * (_scroll / _maxScroll);
+                    using (var tr = new SolidBrush(Color.FromArgb(24, 255, 255, 255)))
+                    using (var th2 = new SolidBrush(ColAccent))
+                    {
+                        g.FillRectangle(tr, track);
+                        g.FillRectangle(th2, track.X, ty, track.Width, th);
+                    }
+                }
+
+                string sha = _um.ExpectedSha256;
+                using (var sb = new SolidBrush(ColDim))
+                    g.DrawString(string.IsNullOrEmpty(sha) ? "SHA-256: НЕ ОПУБЛИКОВАН В РЕЛИЗЕ" : ("SHA-256: " + sha.Substring(0, 16) + "…  ПРОВЕРКА ВКЛЮЧЕНА"),
+                        _fTiny, sb, new RectangleF(body.X, btnY - 14, body.Width, 12), _sfL);
+
+                Btn(g, new RectangleF(body.X, btnY + 2, 214, 30), "ОБНОВИТЬ СЕЙЧАС", 1, delegate { _um.StartDownloadAndApplyAsync(); Invalidate(); });
+                Btn(g, new RectangleF(body.X + 222, btnY + 2, 110, 30), "ПОЗЖЕ", 0, delegate { _um.DismissedForSession = true; Close(); });
+                Btn(g, new RectangleF(body.X + 340, btnY + 2, body.Width - 340, 30), "ПРОПУСТИТЬ ЭТУ ВЕРСИЮ", 2, delegate
+                {
+                    _cfg.skipped_version = _um.LatestVersionStr;
+                    ConfigManager.Save(_cfg);
+                    _um.DismissedForSession = true;
+                    Close();
+                });
+                return;
+            }
+
+            if (st == UpdateCheckState.Downloading || st == UpdateCheckState.Installing)
+            {
+                using (var tb = new SolidBrush(ColText))
+                using (var mb = new SolidBrush(ColMuted))
+                {
+                    g.DrawString(st == UpdateCheckState.Installing ? "УСТАНОВКА ОБНОВЛЕНИЯ" : "ЗАГРУЗКА ОБНОВЛЕНИЯ", _fMono, tb, new RectangleF(body.X, body.Y + 60, body.Width, 24), _sfC);
+                    g.DrawString("v" + UpdateManager.CurrentVersionStr + "  →  v" + _um.LatestVersionStr, _fHuge, new SolidBrush(ColAccent), new RectangleF(body.X, body.Y + 90, body.Width, 40), _sfC);
+                    g.DrawString(_um.StatusText, _fTiny, mb, new RectangleF(body.X, body.Y + 138, body.Width, 18), _sfC);
+                }
+                var track = new RectangleF(body.X + 20, body.Y + 168, body.Width - 40, 10);
+                using (GraphicsPath tp = RR(track, 3f))
+                using (var tbk = new SolidBrush(Color.FromArgb(30, 255, 255, 255)))
+                    g.FillPath(tbk, tp);
+                float prog = Math.Max(0.02f, Math.Min(1f, _um.DownloadProgress));
+                var fill = new RectangleF(track.X, track.Y, track.Width * prog, track.Height);
+                using (GraphicsPath fp = RR(fill, 3f))
+                using (var fb = new SolidBrush(ColAccent))
+                    g.FillPath(fb, fp);
+                using (var pb = new SolidBrush(ColText))
+                    g.DrawString(((int)Math.Round(prog * 100f)) + "%", _fMono, pb, new RectangleF(body.X, body.Y + 184, body.Width, 22), _sfC);
+                using (var nb = new SolidBrush(ColDim))
+                    g.DrawString("После загрузки Dynamic Island перезапустится автоматически.", _fTiny, nb, new RectangleF(body.X, body.Y + 214, body.Width, 18), _sfC);
+                return;
+            }
+
+            string head = "";
+            string sub = "";
+            Color headCol = ColText;
+            if (st == UpdateCheckState.Checking) { head = "ПРОВЕРКА ОБНОВЛЕНИЙ…"; sub = "Запрос к GitHub Releases: " + _um.RepoSlug; }
+            else if (st == UpdateCheckState.UpToDate) { head = "✓ ВЫ НА АКТУАЛЬНОЙ ВЕРСИИ"; sub = "Установлена v" + UpdateManager.CurrentVersionStr + "  •  " + _um.RepoSlug; headCol = ColLime; }
+            else if (st == UpdateCheckState.NoReleases) { head = "РЕЛИЗОВ ПОКА НЕТ"; sub = _um.ErrorText; headCol = Color.FromArgb(255, 189, 46); }
+            else if (st == UpdateCheckState.Error) { head = "ОШИБКА ПРОВЕРКИ"; sub = _um.ErrorText; headCol = Color.FromArgb(255, 105, 95); }
+            else { head = "ЦЕНТР ОБНОВЛЕНИЙ"; sub = "Нажмите «ПРОВЕРИТЬ» для запроса к GitHub Releases."; }
+
+            using (var hb = new SolidBrush(headCol))
+                g.DrawString(head, new Font("Consolas", 14f, FontStyle.Bold), hb, new RectangleF(body.X, body.Y + 58, body.Width, 34), _sfC);
+            using (var sb = new SolidBrush(ColMuted))
+            {
+                var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Near };
+                g.DrawString(sub, _fBody, sb, new RectangleF(body.X + 24, body.Y + 104, body.Width - 48, 90), sf);
+            }
+            if (st == UpdateCheckState.Checking)
+            {
+                var track = new RectangleF(body.X + 60, body.Y + 190, body.Width - 120, 6);
+                using (var tbk = new SolidBrush(Color.FromArgb(30, 255, 255, 255))) g.FillRectangle(tbk, track);
+                float ph = (Environment.TickCount % 1100) / 1100f;
+                float w = track.Width * 0.30f;
+                float x = track.X + (track.Width + w) * ph - w;
+                Region prev = g.Clip;
+                g.SetClip(track);
+                using (var ab = new SolidBrush(ColAccent)) g.FillRectangle(ab, x, track.Y, w, track.Height);
+                g.Clip = prev;
+                return;
+            }
+
+            if (st == UpdateCheckState.NoReleases)
+            {
+                Btn(g, new RectangleF(body.X, btnY, 250, 32), "ОТКРЫТЬ РЕЛИЗЫ НА GITHUB", 1, delegate { DoOpenReleases(); });
+                Btn(g, new RectangleF(body.X + 258, btnY, body.Width - 258, 32), "ПРОВЕРИТЬ СНОВА", 0, delegate { DoCheck(); });
+            }
+            else if (st == UpdateCheckState.Error)
+            {
+                Btn(g, new RectangleF(body.X, btnY, 250, 32), "ПОВТОРИТЬ", 1, delegate
+                {
+                    if (_um.IsUpdateAvailable && !string.IsNullOrEmpty(_um.DownloadUrl)) _um.StartDownloadAndApplyAsync(); else DoCheck();
+                    Invalidate();
+                });
+                Btn(g, new RectangleF(body.X + 258, btnY, body.Width - 258, 32), "ОТКРЫТЬ РЕЛИЗЫ НА GITHUB", 0, delegate { DoOpenReleases(); });
+            }
+            else
+            {
+                Btn(g, new RectangleF(body.X, btnY, 250, 32), "ПРОВЕРИТЬ СНОВА", 1, delegate { DoCheck(); });
+                Btn(g, new RectangleF(body.X + 258, btnY, body.Width - 258, 32), "ЗАКРЫТЬ", 0, delegate { Close(); });
+            }
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            if (_maxScroll <= 0f) return;
+            _scroll = Math.Max(0f, Math.Min(_maxScroll, _scroll - Math.Sign(e.Delta) * 36f));
+            Invalidate();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            var pt = new PointF(e.X, e.Y);
+            foreach (Hit h in _hits)
+            {
+                if (h.Rect.Contains(pt)) { h.Click(); return; }
+            }
+            if (e.Y <= 34) { _dragging = true; _dragOff = e.Location; }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            _mouse = new PointF(e.X, e.Y);
+            if (_dragging && e.Button == MouseButtons.Left)
+            {
+                Point sp = PointToScreen(e.Location);
+                Location = new Point(sp.X - _dragOff.X, sp.Y - _dragOff.Y);
+                return;
+            }
+            Invalidate();
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            _dragging = false;
+        }
+    }
     public sealed class SettingsForm : Form
     {
         private readonly IslandConfigData _cfg;
