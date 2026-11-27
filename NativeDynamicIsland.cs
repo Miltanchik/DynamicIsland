@@ -9656,9 +9656,15 @@ namespace DynamicIslandWin
                     return;
                 }
 
+                bool hasLiveSession = (_allPlayers != null && _allPlayers.Count > 0 && _currentMedia != null && _currentMedia.NativeSession != null);
+
                 if (_rcPlayerBadge.Contains(pt))
                 {
-                    if (_allPlayers.Count > 1)
+                    if (!hasLiveSession)
+                    {
+                        HandleInactiveMediaButtonOrPrompt("play", PointToScreen(new Point((int)_rcPlayerBadge.X, (int)_rcPlayerBadge.Bottom + 4)), true);
+                    }
+                    else if (_allPlayers.Count > 1)
                     {
                         MultiPlayerMediaController.CycleNextPlayer(_allPlayers);
                         _bgStateDirty = true;
@@ -9672,6 +9678,11 @@ namespace DynamicIslandWin
 
                 if (_rcSongClickZone.Contains(pt))
                 {
+                    if (!hasLiveSession)
+                    {
+                        HandleInactiveMediaButtonOrPrompt("play", PointToScreen(new Point((int)_rcSongClickZone.X + 20, (int)_rcSongClickZone.Bottom + 4)), true);
+                        return;
+                    }
                     MultiPlayerMediaController.ActivatePlayerWindowAsync(_currentMedia);
                     _isHovered = false;
                     CollapseToIdle();
@@ -9679,9 +9690,23 @@ namespace DynamicIslandWin
                 }
 
                 if (_rcLikeBtn.Contains(pt)) { ToggleCurrentTrackFavorite(); return; }
-                if (_rcPrevBtn.Contains(pt)) { MultiPlayerMediaController.ExecuteTransportCommandAsync(_currentMedia, "prev"); return; }
+                if (_rcPrevBtn.Contains(pt))
+                {
+                    if (!hasLiveSession)
+                    {
+                        HandleInactiveMediaButtonOrPrompt("prev", PointToScreen(new Point((int)_rcPrevBtn.X, (int)_rcPrevBtn.Bottom + 6)), false);
+                        return;
+                    }
+                    MultiPlayerMediaController.ExecuteTransportCommandAsync(_currentMedia, "prev");
+                    return;
+                }
                 if (_rcPlayBtn.Contains(pt))
                 {
+                    if (!hasLiveSession)
+                    {
+                        HandleInactiveMediaButtonOrPrompt("play", PointToScreen(new Point((int)_rcPlayBtn.X - 40, (int)_rcPlayBtn.Bottom + 6)), false);
+                        return;
+                    }
                     MultiPlayerMediaController.ExecuteTransportCommandAsync(_currentMedia, "play_pause");
                     _currentMedia.IsPlaying = !_currentMedia.IsPlaying;
                     _currentMedia.PositionSec = _currentMedia.GetLivePositionSec();
@@ -9689,7 +9714,16 @@ namespace DynamicIslandWin
                     RenderLayeredFrame();
                     return;
                 }
-                if (_rcNextBtn.Contains(pt)) { MultiPlayerMediaController.ExecuteTransportCommandAsync(_currentMedia, "next"); return; }
+                if (_rcNextBtn.Contains(pt))
+                {
+                    if (!hasLiveSession)
+                    {
+                        HandleInactiveMediaButtonOrPrompt("next", PointToScreen(new Point((int)_rcNextBtn.X - 80, (int)_rcNextBtn.Bottom + 6)), false);
+                        return;
+                    }
+                    MultiPlayerMediaController.ExecuteTransportCommandAsync(_currentMedia, "next");
+                    return;
+                }
 
                 RectangleF seekHit = RectangleF.Inflate(_rcProgressBar, 2f, 6f);
                 if (seekHit.Contains(pt) && _rcProgressBar.Width > 0)
@@ -9941,8 +9975,120 @@ namespace DynamicIslandWin
             menu.Show(screenPt);
         }
 
+        private void ShowTrackedContextMenu(ContextMenuStrip menu, Point screenPt)
+        {
+            if (menu == null) return;
+            Interlocked.Increment(ref _ownDialogOrMenuDepth);
+            _collapseTimer.Stop();
+            menu.Closed += (s, e) =>
+            {
+                if (Interlocked.Decrement(ref _ownDialogOrMenuDepth) < 0)
+                    Interlocked.Exchange(ref _ownDialogOrMenuDepth, 0);
+                if (!_isHovered && _mode == IslandMode.Expanded && _expandedPage != 1)
+                {
+                    _collapseTimer.Interval = Math.Max(180, _config.collapse_delay_ms);
+                    _collapseTimer.Start();
+                }
+                AssertIslandTopMostSafe(false, false);
+            };
+            menu.Show(screenPt);
+        }
+
+        private void LaunchDiscoveredPlayerWithFeedback(DiscoveredMusicPlayer p, string cmd)
+        {
+            if (p == null) return;
+            _currentMedia.DisplayAppName = p.DisplayName;
+            _currentMedia.Title = "Запуск " + p.DisplayName + "...";
+            _currentMedia.Artist = "Автостарт воспроизведения";
+            RenderLayeredFrame();
+            InstalledMusicPlayerDiscovery.LaunchPlayerAndAutoPlayAsync(p, _config, _audio, cmd, () =>
+            {
+                _bgStateDirty = true;
+                _bgWakeEvent.Set();
+                WakeRenderLoop();
+            });
+        }
+
+        private void HandleInactiveMediaButtonOrPrompt(string cmd, Point screenPt, bool forceShowMenu)
+        {
+            if (!forceShowMenu)
+            {
+                var defP = InstalledMusicPlayerDiscovery.ResolveDefaultPlayer(_config);
+                if (defP != null)
+                {
+                    LaunchDiscoveredPlayerWithFeedback(defP, cmd);
+                    return;
+                }
+            }
+
+            var discovered = InstalledMusicPlayerDiscovery.DiscoverPlayers(_config, false);
+            var menu = new ContextMenuStrip
+            {
+                BackColor = Color.FromArgb(19, 21, 28),
+                ForeColor = Color.FromArgb(244, 245, 250),
+                ShowImageMargin = true
+            };
+
+            var hdr = menu.Items.Add("♫ Нет активной сессии — открыть плеер:");
+            hdr.Enabled = false;
+            menu.Items.Add(new ToolStripSeparator());
+
+            bool addedLocal = false;
+            bool addedWebSep = false;
+            foreach (var dp in discovered)
+            {
+                var cap = dp;
+                if (cap.IsWebFallback && addedLocal && !addedWebSep)
+                {
+                    addedWebSep = true;
+                    menu.Items.Add(new ToolStripSeparator());
+                }
+                if (!cap.IsWebFallback) addedLocal = true;
+
+                string title = (cap.IsLastUsed ? "★ " : "▶ ") + cap.DisplayName + (cap.IsLastUsed ? " (Недавний)" : "");
+                Bitmap ico = !string.IsNullOrEmpty(cap.IconSourcePath) ? GetAppIconBitmap(cap.IconSourcePath) : null;
+                var mi = menu.Items.Add(title, ico, (s, e) => LaunchDiscoveredPlayerWithFeedback(cap, cmd));
+                if (cap.IsLastUsed) mi.Font = new Font(menu.Font, FontStyle.Bold);
+            }
+
+            menu.Items.Add(new ToolStripSeparator());
+            var defSub = new ToolStripMenuItem("⚙ Запускать по умолчанию без вопроса");
+            defSub.DropDown.BackColor = Color.FromArgb(19, 21, 28);
+            defSub.DropDown.ForeColor = Color.FromArgb(244, 245, 250);
+            var askOpt = defSub.DropDownItems.Add("Всегда показывать это меню", null, (s, e) =>
+            {
+                _config.default_music_player_id = "";
+                ConfigManager.Save(_config);
+            });
+            if (string.IsNullOrEmpty(_config.default_music_player_id))
+                askOpt.Font = new Font(menu.Font, FontStyle.Bold);
+            defSub.DropDownItems.Add(new ToolStripSeparator());
+
+            foreach (var dp in discovered)
+            {
+                var cap = dp;
+                var dmi = defSub.DropDownItems.Add(cap.DisplayName + " (запустить сейчас)", null, (s, e) =>
+                {
+                    _config.default_music_player_id = cap.Id;
+                    ConfigManager.Save(_config);
+                    LaunchDiscoveredPlayerWithFeedback(cap, cmd);
+                });
+                if (string.Equals(_config.default_music_player_id, cap.Id, StringComparison.OrdinalIgnoreCase))
+                    dmi.Font = new Font(menu.Font, FontStyle.Bold);
+            }
+            menu.Items.Add(defSub);
+
+            ShowTrackedContextMenu(menu, screenPt);
+        }
+
         private void ShowPlayerSelectionMenu(Point screenPt)
         {
+            if (_allPlayers == null || _allPlayers.Count == 0 || _currentMedia == null || _currentMedia.NativeSession == null)
+            {
+                HandleInactiveMediaButtonOrPrompt("play", screenPt, true);
+                return;
+            }
+
             var menu = new ContextMenuStrip();
             menu.Items.Add("↗ Открыть окно текущего плеера (" + _currentMedia.DisplayAppName + ")", null, (s, e) =>
             {
@@ -9950,27 +10096,21 @@ namespace DynamicIslandWin
             });
             menu.Items.Add(new ToolStripSeparator());
 
-            if (_allPlayers.Count == 0)
+            foreach (var p in _allPlayers)
             {
-                var emptyItem = menu.Items.Add("Нет активных медиа-плееров");
-                emptyItem.Enabled = false;
-            }
-            else
-            {
-                foreach (var p in _allPlayers)
+                var playerSnap = p;
+                string prefix = playerSnap.IsPlaying ? "▶ " : "⏸ ";
+                string label = prefix + playerSnap.DisplayAppName + " — " + playerSnap.Title;
+                var item = menu.Items.Add(label, null, (s, e) =>
                 {
-                    var playerSnap = p;
-                    string prefix = playerSnap.IsPlaying ? "▶ " : "⏸ ";
-                    string label = prefix + playerSnap.DisplayAppName + " — " + playerSnap.Title;
-                    var item = menu.Items.Add(label, null, (s, e) =>
-                    {
-                        MultiPlayerMediaController.SelectPlayerByAppId(playerSnap.AppId);
-                    });
-                    if (string.Equals(playerSnap.AppId, _currentMedia.AppId, StringComparison.OrdinalIgnoreCase))
-                        item.Font = new Font(menu.Font, FontStyle.Bold);
-                }
+                    MultiPlayerMediaController.SelectPlayerByAppId(playerSnap.AppId);
+                });
+                if (string.Equals(playerSnap.AppId, _currentMedia.AppId, StringComparison.OrdinalIgnoreCase))
+                    item.Font = new Font(menu.Font, FontStyle.Bold);
             }
-            menu.Show(screenPt);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("♫ Запустить другой плеер...", null, (s, e) => HandleInactiveMediaButtonOrPrompt("play", screenPt, true));
+            ShowTrackedContextMenu(menu, screenPt);
         }
 
         private void UpdateVolumeFromCursor(float x)
