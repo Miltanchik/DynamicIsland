@@ -2322,12 +2322,13 @@ namespace DynamicIslandWin
     // 3B. NATIVE COM CUIAutomation8 (UIA v3) STA FAVORITE SYNC & SAFE DISPATCH
     //     Replaces legacy .NET 3.0 System.Windows.Automation (which crashes Electron/CEF)
     // =========================================================================
-    [ComImport, Guid("E22AD333-B25F-460C-83D0-0581107395C9")]
     [ComImport, Guid("6D5140C1-7436-11CE-8034-00AA006009FA"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     internal interface IComServiceProvider
     {
         [PreserveSig] int QueryService(ref Guid guidService, ref Guid riid, out IntPtr ppvObject);
     }
+
+    [ComImport, Guid("E22AD333-B25F-460C-83D0-0581107395C9")]
     internal class CUIAutomation8ComObject { }
 
     [ComImport, Guid("352FFBA8-0973-437C-A61F-F64CAFD81DF9"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
