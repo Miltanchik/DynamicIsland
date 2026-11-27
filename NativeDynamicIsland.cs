@@ -3255,13 +3255,12 @@ namespace DynamicIslandWin
             "ForegroundStaging", "TaskListThumbnailWnd", "TaskListOverlayWnd", "Shell_InputSwitchTopLevelWindow"
         };
 
-        // Explicit Non-Game Process Blacklist (Browsers, Messengers, Media/Video Players, Shells, IDEs, Office, Game Launchers)
         private static readonly HashSet<string> NonGameProcessBlacklist = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             // Browsers
             "chrome", "msedge", "opera", "opera_gx", "firefox", "yandex", "browser", "brave", "vivaldi",
             "waterfox", "tor", "arc", "zen", "maxthon", "iexplore", "whale", "thorium", "librewolf", "floorp",
-            // Messengers, Voice & Streaming / Capture Apps
+            // Messengers, Voice & Capture Apps
             "discord", "discordptb", "discordcanary", "telegram", "ayugram", "kotatogram", "unigram",
             "whatsapp", "viber", "skype", "slack", "teams", "ms-teams", "zoom", "obs64", "obs32", "streamlabs", "sharex",
             // Video & Audio Players
@@ -3275,7 +3274,7 @@ namespace DynamicIslandWin
             "clion64", "goland64", "sublime_text", "notepad", "notepad++", "winword", "excel", "powerpnt", "onenote", "outlook",
             "acrobat", "acrord32", "foxitreader", "sumatrapdf", "mspaint", "paintdotnet", "photoshop", "illustrator", "figma",
             "canva", "blender", "obs", "nvidia share", "nvcontainer", "nvidia overlay", "amdow", "radeonsoftware",
-            // Game Storefront / Launcher Clients (menus themselves are not games; actual game binaries have their own .exe)
+            // Game Launchers / Storefronts
             "steam", "steamwebhelper", "epicgameslauncher", "epicwebhelper", "riotclientux", "riotclientuxrender",
             "riotclientservices", "battle.net", "agent", "galaxyclient", "eadesktop", "eabackgroundservice",
             "ubisoftconnect", "upc", "playnite.desktopapp", "playnite.fullscreenapp",
@@ -3285,10 +3284,10 @@ namespace DynamicIslandWin
 
         private static readonly string[] GameInstallPathMarkers = new string[]
         {
-            "\steamapps\common\", "\steamlibrary\", "\epic games\", "\riot games\",
-            "\xboxgames\", "\windowsapps\", "\gog galaxy\games\", "\gog games\",
-            "\ubisoft game launcher\games\", "\ea games\", "\origin games\",
-            "\battle.net\", "\battlenet\", "\games\", "\игры\", "\genshin impact\", "\honkai", "\wuthering waves\"
+            @"\steamapps\common\", @"\steamlibrary\", @"\epic games\", @"\riot games\",
+            @"\xboxgames\", @"\windowsapps\", @"\gog galaxy\games\", @"\gog games\",
+            @"\ubisoft game launcher\games\", @"\ea games\", @"\origin games\",
+            @"\battle.net\", @"\battlenet\", @"\games\", @"\игры\", @"\genshin impact\", @"\honkai", @"\wuthering waves\"
         };
 
         private static readonly string[] GameEngineWindowClasses = new string[]
@@ -3370,12 +3369,11 @@ namespace DynamicIslandWin
                     if (File.Exists(p1) || Directory.Exists(p1)) return true;
                 }
 
-                // Unreal Engine / Unity subfolder layouts (e.g. Game\Binaries\Win64\Game.exe or Game_Data\)
                 string stem = Path.GetFileNameWithoutExtension(exePath) ?? "";
                 if (!string.IsNullOrEmpty(stem) && Directory.Exists(Path.Combine(dir, stem + "_Data")))
                     return true;
-                if (dir.IndexOf("\binaries\win64", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    dir.IndexOf("\binaries\wingdk", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (dir.IndexOf(@"\binaries\win64", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    dir.IndexOf(@"\binaries\wingdk", StringComparison.OrdinalIgnoreCase) >= 0)
                     return true;
             }
             catch { }
@@ -3400,15 +3398,15 @@ namespace DynamicIslandWin
             bool blacklisted = string.IsNullOrEmpty(nameTrim) || NonGameProcessBlacklist.Contains(nameTrim);
             if (!blacklisted && !string.IsNullOrEmpty(pathLower))
             {
-                if (pathLower.Contains("\windows\system32\") ||
-                    pathLower.Contains("\windows\explorer.exe") ||
-                    pathLower.Contains("\windows\immersivecontrolpanel\") ||
-                    pathLower.Contains("\program files\google\chrome\") ||
-                    pathLower.Contains("\program files (x86)\microsoft\edge\") ||
-                    pathLower.Contains("\appdata\local\discord\") ||
-                    pathLower.Contains("\appdata\local\programs\yandexmusic\") ||
-                    pathLower.Contains("\appdata\roaming\spotify\") ||
-                    pathLower.Contains("\appdata\roaming\telegram desktop\"))
+                if (pathLower.Contains(@"\windows\system32\") ||
+                    pathLower.Contains(@"\windows\explorer.exe") ||
+                    pathLower.Contains(@"\windows\immersivecontrolpanel\") ||
+                    pathLower.Contains(@"\program files\google\chrome\") ||
+                    pathLower.Contains(@"\program files (x86)\microsoft\edge\") ||
+                    pathLower.Contains(@"\appdata\local\discord\") ||
+                    pathLower.Contains(@"\appdata\local\programs\yandexmusic\") ||
+                    pathLower.Contains(@"\appdata\roaming\spotify\") ||
+                    pathLower.Contains(@"\appdata\roaming\telegram desktop\"))
                 {
                     blacklisted = true;
                 }
@@ -3427,7 +3425,6 @@ namespace DynamicIslandWin
                 }
                 if (!positiveGame && (nameTrim.Equals("javaw", StringComparison.OrdinalIgnoreCase) || nameTrim.Equals("java", StringComparison.OrdinalIgnoreCase)))
                 {
-                    // Minecraft / Java games
                     if (pathLower.Contains("minecraft") || pathLower.Contains("curseforge") || pathLower.Contains("prismlauncher") || pathLower.Contains("modrinth") || pathLower.Contains("tlauncher") || pathLower.Contains("azul") || pathLower.Contains("adoptium") || pathLower.Contains("runtime"))
                         positiveGame = true;
                 }
@@ -3489,7 +3486,6 @@ namespace DynamicIslandWin
                 IntPtr fg = NativeWin32.GetForegroundWindow();
                 if (fg == IntPtr.Zero || fg == ourHwnd) return false;
 
-                // Minimized window can NEVER keep game metrics visible
                 if (NativeWin32.IsIconic(fg))
                 {
                     definiteNonGameForeground = true;
@@ -3519,7 +3515,6 @@ namespace DynamicIslandWin
                     return false;
                 }
 
-                // Chromium / Electron / Firefox windows (browsers, web wrappers, messengers) are NOT games unless explicitly inside a game library folder
                 if ((cls.StartsWith("Chrome_WidgetWin", StringComparison.Ordinal) || cls == "MozillaWindowClass") && !info.HasPositiveGameTraits)
                 {
                     definiteNonGameForeground = true;
@@ -3543,7 +3538,6 @@ namespace DynamicIslandWin
                     return false;
                 }
 
-                // Positive game match: known game engine window class, game library / engine directory, or exclusive D3D fullscreen on a non-blacklisted native app
                 for (int i = 0; i < GameEngineWindowClasses.Length; i++)
                 {
                     if (cls.IndexOf(GameEngineWindowClasses[i], StringComparison.OrdinalIgnoreCase) >= 0)
