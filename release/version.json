@@ -1,8 +1,8 @@
 {
-  "version": "3.3.0",
+  "version": "3.4.0",
   "download_url": "https://raw.githubusercontent.com/Miltanchik/DynamicIsland/main/release/DynamicIslandWin_Setup.exe",
-  "sha256": "7851c311589435a764da0fcf83edf6b09eb8a5339bb398f678cc35dce90cd315",
+  "sha256": "0065daa4bddba4639087a518e37d8b20c9e67dc56938714129e1f4931410dbb3",
   "release_url": "https://github.com/Miltanchik/DynamicIsland/tree/main/release",
-  "published_at": "2026-11-28T02:06:40+03:00",
+  "published_at": "2026-11-28T02:47:44+03:00",
   "changelog": "Dynamic Island v3.3.0:\n- Настройка цветовой гаммы окна настроек: готовые пресеты (Тёмная, Светлая, Неон, Монохром, Своя), Color Picker акцента и фона, синхронизация с темой острова и мгновенное применение на лету\n- Кастомный эквалайзер: 4 стиля визуализации (Столбики, Точки, Волна, Зеркальный + Выкл), адаптация цветов под обложку трека / один цвет / градиент, настройка числа полос, чувствительности и плавности"
 }

@@ -19,8 +19,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("100% Self-Contained Single-File Installer for Dynamic Island Windows 10/11")]
 [assembly: AssemblyProduct("Dynamic Island Studio Setup")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
-[assembly: AssemblyVersion("3.3.0.0")]
-[assembly: AssemblyFileVersion("3.3.0.0")]
+[assembly: AssemblyVersion("3.4.0.0")]
+[assembly: AssemblyFileVersion("3.4.0.0")]
 
 namespace DynamicIslandSetup
 {

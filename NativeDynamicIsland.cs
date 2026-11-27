@@ -34,8 +34,8 @@ using System.Reflection;
 [assembly: AssemblyProduct("Dynamic Island Studio")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("3.3.0.0")]
-[assembly: AssemblyFileVersion("3.3.0.0")]
+[assembly: AssemblyVersion("3.4.0.0")]
+[assembly: AssemblyFileVersion("3.4.0.0")]
 namespace DynamicIslandWin
 {
     public static class ColorThemeUtils
@@ -71,6 +71,13 @@ namespace DynamicIslandWin
                 (int)Math.Round(a.R + (b.R - a.R) * t),
                 (int)Math.Round(a.G + (b.G - a.G) * t),
                 (int)Math.Round(a.B + (b.B - a.B) * t));
+        }
+
+        public static Color SampleGradient3(Color c1, Color c2, Color c3, float t)
+        {
+            t = Math.Max(0f, Math.Min(1f, t));
+            if (t <= 0.5f) return Blend(c1, c2, t * 2.0f);
+            return Blend(c2, c3, (t - 0.5f) * 2.0f);
         }
 
         public static Color BoostVibrance(Color c, float minBright = 0.52f)
@@ -198,6 +205,19 @@ namespace DynamicIslandWin
         public int eq_smoothing_pct { get; set; }
         public bool show_compact_cover { get; set; }
 
+        public string exp_eq_style { get; set; }
+        public string exp_eq_color_mode { get; set; }
+        public string exp_eq_color1_hex { get; set; }
+        public string exp_eq_color2_hex { get; set; }
+        public string exp_eq_color3_hex { get; set; }
+        public bool exp_eq_glow_enabled { get; set; }
+        public int exp_eq_opacity_pct { get; set; }
+        public int exp_eq_bar_count { get; set; }
+        public int exp_eq_thickness_px { get; set; }
+        public int exp_eq_roundness_pct { get; set; }
+        public int exp_eq_height_pct { get; set; }
+        public int exp_eq_smoothing_pct { get; set; }
+
         public bool expand_on_hover { get; set; }
         public int anim_duration_ms { get; set; }
         public int spring_overshoot_pct { get; set; }
@@ -265,6 +285,19 @@ namespace DynamicIslandWin
             eq_sensitivity_pct = 100;
             eq_smoothing_pct = 55;
             show_compact_cover = true;
+
+            exp_eq_style = "Столбики";
+            exp_eq_color_mode = "Градиент темы";
+            exp_eq_color1_hex = "#22D3EE";
+            exp_eq_color2_hex = "#A855F7";
+            exp_eq_color3_hex = "#EC4899";
+            exp_eq_glow_enabled = true;
+            exp_eq_opacity_pct = 68;
+            exp_eq_bar_count = 28;
+            exp_eq_thickness_px = 5;
+            exp_eq_roundness_pct = 85;
+            exp_eq_height_pct = 100;
+            exp_eq_smoothing_pct = 55;
 
             expand_on_hover = true;
             anim_duration_ms = 330;
@@ -368,6 +401,18 @@ namespace DynamicIslandWin
                 if (cfg.eq_bar_count < 4 || cfg.eq_bar_count > 12) cfg.eq_bar_count = 6;
                 if (cfg.eq_sensitivity_pct < 40 || cfg.eq_sensitivity_pct > 220) cfg.eq_sensitivity_pct = 100;
                 if (cfg.eq_smoothing_pct < 10 || cfg.eq_smoothing_pct > 95) cfg.eq_smoothing_pct = 55;
+                if (string.IsNullOrEmpty(cfg.exp_eq_style)) cfg.exp_eq_style = "Столбики";
+                if (cfg.exp_eq_style == "Off") cfg.exp_eq_style = "Выкл";
+                if (string.IsNullOrEmpty(cfg.exp_eq_color_mode)) cfg.exp_eq_color_mode = "Градиент темы";
+                if (string.IsNullOrEmpty(cfg.exp_eq_color1_hex)) cfg.exp_eq_color1_hex = "#22D3EE";
+                if (string.IsNullOrEmpty(cfg.exp_eq_color2_hex)) cfg.exp_eq_color2_hex = "#A855F7";
+                if (string.IsNullOrEmpty(cfg.exp_eq_color3_hex)) cfg.exp_eq_color3_hex = "#EC4899";
+                if (cfg.exp_eq_opacity_pct < 15 || cfg.exp_eq_opacity_pct > 100) cfg.exp_eq_opacity_pct = 68;
+                if (cfg.exp_eq_bar_count < 8 || cfg.exp_eq_bar_count > 48) cfg.exp_eq_bar_count = 28;
+                if (cfg.exp_eq_thickness_px < 2 || cfg.exp_eq_thickness_px > 14) cfg.exp_eq_thickness_px = 5;
+                if (cfg.exp_eq_roundness_pct < 0 || cfg.exp_eq_roundness_pct > 100) cfg.exp_eq_roundness_pct = 85;
+                if (cfg.exp_eq_height_pct < 35 || cfg.exp_eq_height_pct > 180) cfg.exp_eq_height_pct = 100;
+                if (cfg.exp_eq_smoothing_pct < 10 || cfg.exp_eq_smoothing_pct > 95) cfg.exp_eq_smoothing_pct = 55;
                 if (string.IsNullOrEmpty(cfg.fullscreen_mode)) cfg.fullscreen_mode = cfg.hide_in_fullscreen ? "Авто-скрытие" : "Неоновая телеметрия";
                 if (string.IsNullOrEmpty(cfg.watchdog_action)) cfg.watchdog_action = "Сон";
                 if (cfg.download_threshold_mbps < 1) cfg.download_threshold_mbps = 2;
@@ -5443,7 +5488,7 @@ namespace DynamicIslandWin
 
     public sealed class UpdateManager
     {
-        public const string CurrentVersionStr = "3.3.0";
+        public const string CurrentVersionStr = "3.4.0";
         public const string DefaultRepo = "Miltanchik/DynamicIsland";
 
         public string LatestVersionStr { get; private set; }
@@ -5901,16 +5946,19 @@ namespace DynamicIslandWin
         private PointF _mouse = new PointF(-99, -99);
         private float _scroll = 0f;
         private float _maxScroll = 0f;
+        private const int LogicalW = 560;
+        private const int LogicalH = 392;
+        private float _dpiScale = 1.0f;
         private bool _dragging = false;
         private Point _dragOff;
 
-        private readonly Font _fTitle = new Font("Consolas", 8.8f, FontStyle.Bold);
-        private readonly Font _fHuge = new Font("Consolas", 19f, FontStyle.Bold);
-        private readonly Font _fMono = new Font("Consolas", 9.4f, FontStyle.Bold);
-        private readonly Font _fTiny = new Font("Consolas", 7.8f, FontStyle.Bold);
-        private readonly Font _fBody = new Font("Segoe UI", 9.0f, FontStyle.Regular);
-        private readonly Font _fBtn = new Font("Consolas", 8.2f, FontStyle.Bold);
-        private readonly Font _fHead = new Font("Consolas", 14f, FontStyle.Bold);
+        private readonly Font _fTitle = new Font("Consolas", 11.7f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fHuge = new Font("Consolas", 25.0f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fMono = new Font("Consolas", 12.5f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fTiny = new Font("Consolas", 10.4f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fBody = new Font("Segoe UI", 12.0f, FontStyle.Regular, GraphicsUnit.Pixel);
+        private readonly Font _fBtn = new Font("Consolas", 10.9f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fHead = new Font("Consolas", 18.5f, FontStyle.Bold, GraphicsUnit.Pixel);
         private readonly StringFormat _sfC = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
         private readonly StringFormat _sfL = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
 
@@ -5926,10 +5974,9 @@ namespace DynamicIslandWin
             ShowInTaskbar = false;
             DoubleBuffered = true;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
-            ClientSize = new Size(560, 392);
             BackColor = ColChassis;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
-            Region = Region.FromHrgn(NativeWin32.CreateRoundRectRgn(0, 0, Width + 1, Height + 1, 10, 10));
+            ApplyUpdateDialogScale();
 
             _stateHandler = delegate
             {
@@ -6030,15 +6077,63 @@ namespace DynamicIslandWin
             try { Process.Start(new ProcessStartInfo(_um.ReleasePageUrl) { UseShellExecute = true }); } catch { }
         }
 
+        private void ApplyUpdateDialogScale()
+        {
+            float dpi = 96f;
+            try { if (IsHandleCreated) { uint wd = NativeWin32.GetDpiForWindow(Handle); if (wd >= 72 && wd <= 384) dpi = wd; } } catch { }
+            if (dpi == 96f) { try { using (Graphics g = CreateGraphics()) dpi = g.DpiX; } catch { } }
+            float uiFactor = _cfg != null ? Math.Max(0.85f, Math.Min(1.25f, _cfg.ui_scale_percent / 100f)) : 1.0f;
+            float rawScale = (dpi / 96f) * uiFactor;
+            Rectangle wa = Screen.FromControl(this).WorkingArea;
+            float maxScaleW = Math.Max(0.85f, (wa.Width - 24f) / LogicalW);
+            float maxScaleH = Math.Max(0.85f, (wa.Height - 24f) / LogicalH);
+            _dpiScale = Math.Max(0.85f, Math.Min(rawScale, Math.Min(maxScaleW, maxScaleH)));
+
+            int cw = (int)Math.Round(LogicalW * _dpiScale);
+            int ch = (int)Math.Round(LogicalH * _dpiScale);
+            if (ClientSize.Width != cw || ClientSize.Height != ch)
+            {
+                ClientSize = new Size(cw, ch);
+                int r = Math.Max(8, (int)Math.Round(10f * _dpiScale));
+                Region = Region.FromHrgn(NativeWin32.CreateRoundRectRgn(0, 0, Width + 1, Height + 1, r, r));
+            }
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            ApplyUpdateDialogScale();
+            Invalidate();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == NativeWin32.WM_DPICHANGED)
+            {
+                ApplyUpdateDialogScale();
+                Invalidate();
+            }
+        }
+
+        private PointF ToLogical(Point p)
+        {
+            float s = Math.Max(0.5f, _dpiScale);
+            return new PointF(p.X / s, p.Y / s);
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            g.ScaleTransform(_dpiScale, _dpiScale);
             _hits.Clear();
 
-            using (var bg = new SolidBrush(ColChassis)) g.FillRectangle(bg, ClientRectangle);
+            float W = LogicalW;
+            float H = LogicalH;
+            using (var bg = new SolidBrush(ColChassis)) g.FillRectangle(bg, 0, 0, W, H);
 
             using (var bar = new SolidBrush(Color.FromArgb(14, 14, 17)))
             using (var pen = new Pen(ColBorder, 1f))
@@ -6046,17 +6141,15 @@ namespace DynamicIslandWin
             using (var tb = new SolidBrush(ColText))
             using (var db = new SolidBrush(ColDim))
             {
-                g.FillRectangle(bar, 0, 0, Width, 34);
-                g.DrawLine(pen, 0, 34, Width, 34);
+                g.FillRectangle(bar, 0, 0, W, 34);
+                g.DrawLine(pen, 0, 34, W, 34);
                 g.FillRectangle(ac, 14, 11, 8, 12);
                 g.DrawString("UPDATE CENTER // DYNAMIC ISLAND", _fTitle, tb, new RectangleF(28, 0, 330, 34), _sfL);
-                g.DrawString("ТЕКУЩАЯ v" + UpdateManager.CurrentVersionStr, _fTiny, db, new RectangleF(Width - 230, 0, 150, 34), _sfL);
+                g.DrawString("ТЕКУЩАЯ v" + UpdateManager.CurrentVersionStr, _fTiny, db, new RectangleF(W - 230, 0, 150, 34), _sfL);
             }
-            Btn(g, new RectangleF(Width - 70, 6, 56, 22), "ЗАКРЫТЬ", 0, delegate { Close(); });
+            Btn(g, new RectangleF(W - 70, 6, 56, 22), "ЗАКРЫТЬ", 0, delegate { Close(); });
 
             UpdateCheckState st = _um.State;
-            float W = Width;
-            float H = Height;
             var body = new RectangleF(16f, 46f, W - 32f, H - 62f);
             float btnY = H - 52f;
 
@@ -6214,18 +6307,18 @@ namespace DynamicIslandWin
         {
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left) return;
-            var pt = new PointF(e.X, e.Y);
+            var pt = ToLogical(e.Location);
             foreach (Hit h in _hits)
             {
                 if (h.Rect.Contains(pt)) { h.Click(); return; }
             }
-            if (e.Y <= 34) { _dragging = true; _dragOff = e.Location; }
+            if (pt.Y <= 34f) { _dragging = true; _dragOff = e.Location; }
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            _mouse = new PointF(e.X, e.Y);
+            _mouse = ToLogical(e.Location);
             if (_dragging && e.Button == MouseButtons.Left)
             {
                 Point sp = PointToScreen(e.Location);
@@ -6499,14 +6592,19 @@ namespace DynamicIslandWin
             "СКИН И СИСТЕМА"
         };
 
-        private readonly Font _fConsoleBrand = new Font("Consolas", 8.8f, FontStyle.Bold);
-        private readonly Font _fBentoHeader = new Font("Segoe UI Semibold", 8.4f, FontStyle.Bold);
-        private readonly Font _fLabel = new Font("Segoe UI Semibold", 8.8f, FontStyle.Bold);
-        private readonly Font _fSub = new Font("Segoe UI", 7.8f, FontStyle.Regular);
-        private readonly Font _fChip = new Font("Segoe UI Semibold", 8.0f, FontStyle.Bold);
-        private readonly Font _fMonoBig = new Font("Consolas", 11.0f, FontStyle.Bold);
-        private readonly Font _fMonoVal = new Font("Consolas", 9.2f, FontStyle.Bold);
-        private readonly Font _fMonoTiny = new Font("Consolas", 7.6f, FontStyle.Bold);
+        private const int LogicalW = 880;
+        private const int LogicalH = 640;
+        private float _renderScale = 1.0f;
+        private int _eqTargetExpandedMode = 0; // 0 = Compact EQ, 1 = Expanded Island EQ
+
+        private readonly Font _fConsoleBrand = new Font("Consolas", 11.7f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fBentoHeader = new Font("Segoe UI Semibold", 11.2f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fLabel = new Font("Segoe UI Semibold", 11.7f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fSub = new Font("Segoe UI", 10.4f, FontStyle.Regular, GraphicsUnit.Pixel);
+        private readonly Font _fChip = new Font("Segoe UI Semibold", 10.6f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fMonoBig = new Font("Consolas", 14.6f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fMonoVal = new Font("Consolas", 12.2f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly Font _fMonoTiny = new Font("Consolas", 10.1f, FontStyle.Bold, GraphicsUnit.Pixel);
 
         private readonly StringFormat _sfLeft = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
         private readonly StringFormat _sfCenter = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
@@ -6521,13 +6619,10 @@ namespace DynamicIslandWin
             TopMost = true;
             DoubleBuffered = true;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
-            ClientSize = new Size(880, 640);
             BackColor = ColChassis;
             ForeColor = ColTextMain;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
-
-            // Crisp 8px technical chassis corners (no soft rounded macOS sheet)
-            Region = Region.FromHrgn(NativeWin32.CreateRoundRectRgn(0, 0, Width + 1, Height + 1, 10, 10));
+            SyncSettingsWindowScale(false);
 
             _inlineBox = new TextBox
             {
@@ -6744,7 +6839,7 @@ namespace DynamicIslandWin
                 dirty = true;
 
             if (dirty)
-                Invalidate(new Rectangle(0, 0, Width, 322));
+                Invalidate(new Rectangle(0, 0, Width, Math.Min(Height, (int)Math.Ceiling(324f * _renderScale))));
         }
 
         private void BeginInlineNumericEdit(RectangleF boxRc, int curVal, int minVal, int maxVal, Action<int> setter)
@@ -6756,11 +6851,13 @@ namespace DynamicIslandWin
             _inlineCommitSetter = setter;
 
             _inlineBox.TextAlign = HorizontalAlignment.Center;
+            float sc = Math.Max(0.75f, _renderScale);
+            int ih = Math.Max(15, (int)Math.Round(16f * sc));
             _inlineBox.SetBounds(
-                (int)Math.Round(boxRc.X + 2),
-                (int)Math.Round(boxRc.Y + (boxRc.Height - 16) / 2f),
-                Math.Max(38, (int)Math.Round(boxRc.Width - 4)),
-                16);
+                (int)Math.Round((boxRc.X + 2f) * sc),
+                (int)Math.Round((boxRc.Y + (boxRc.Height - 16f) / 2f) * sc),
+                Math.Max(38, (int)Math.Round((boxRc.Width - 4f) * sc)),
+                ih);
             _inlineBox.Text = curVal.ToString();
             _inlineBox.Visible = true;
             _inlineBox.BringToFront();
@@ -6775,11 +6872,13 @@ namespace DynamicIslandWin
             _inlineCommitSetter = null;
 
             _inlineBox.TextAlign = HorizontalAlignment.Left;
+            float sc = Math.Max(0.75f, _renderScale);
+            int ih = Math.Max(15, (int)Math.Round(16f * sc));
             _inlineBox.SetBounds(
-                (int)Math.Round(boxRc.X + 22),
-                (int)Math.Round(boxRc.Y + (boxRc.Height - 16) / 2f),
-                Math.Max(54, (int)Math.Round(boxRc.Width - 26)),
-                16);
+                (int)Math.Round((boxRc.X + 22f) * sc),
+                (int)Math.Round((boxRc.Y + (boxRc.Height - 16f) / 2f) * sc),
+                Math.Max(54, (int)Math.Round((boxRc.Width - 26f) * sc)),
+                ih);
             _inlineBox.Text = _filterQuery;
             _inlineBox.Visible = true;
             _inlineBox.BringToFront();
@@ -6827,10 +6926,77 @@ namespace DynamicIslandWin
             }
         }
 
+        private void SyncSettingsWindowScale(bool preserveCenter)
+        {
+            float dpi = 96f;
+            try { if (IsHandleCreated) { uint wd = NativeWin32.GetDpiForWindow(Handle); if (wd >= 72 && wd <= 384) dpi = wd; } } catch { }
+            if (dpi == 96f) { try { using (Graphics g = CreateGraphics()) dpi = g.DpiX; } catch { } }
+
+            // Follow Windows DPI natively + subtle gentle response to ui_scale_percent while never overflowing screen working area
+            float uiFactor = 1.0f + ((_cfg.ui_scale_percent - 100f) / 100f) * 0.35f;
+            float desired = (dpi / 96f) * Math.Max(0.86f, Math.Min(1.22f, uiFactor));
+
+            Rectangle wa = Screen.FromControl(this).WorkingArea;
+            float maxW = Math.Max(0.80f, (wa.Width - 20f) / LogicalW);
+            float maxH = Math.Max(0.80f, (wa.Height - 20f) / LogicalH);
+            float clamped = Math.Max(0.82f, Math.Min(desired, Math.Min(maxW, maxH)));
+
+            int targetW = (int)Math.Round(LogicalW * clamped);
+            int targetH = (int)Math.Round(LogicalH * clamped);
+            _renderScale = clamped;
+
+            if (ClientSize.Width != targetW || ClientSize.Height != targetH)
+            {
+                Point oldCenter = new Point(Left + Width / 2, Top + Height / 2);
+                ClientSize = new Size(targetW, targetH);
+                int rad = Math.Max(8, (int)Math.Round(10f * _renderScale));
+                Region = Region.FromHrgn(NativeWin32.CreateRoundRectRgn(0, 0, Width + 1, Height + 1, rad, rad));
+                if (_inlineBox != null)
+                {
+                    try { _inlineBox.Font = new Font("Consolas", Math.Max(10f, 12.6f * _renderScale), FontStyle.Bold, GraphicsUnit.Pixel); } catch { }
+                }
+                if (preserveCenter && IsHandleCreated && !_draggingSlider_ActiveSafe())
+                {
+                    int nx = Math.Max(wa.Left + 4, Math.Min(wa.Right - Width - 4, oldCenter.X - Width / 2));
+                    int ny = Math.Max(wa.Top + 4, Math.Min(wa.Bottom - Height - 4, oldCenter.Y - Height / 2));
+                    Location = new Point(nx, ny);
+                }
+            }
+        }
+
+        private bool _draggingSlider_ActiveSafe()
+        {
+            return _draggingSlider != null;
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            SyncSettingsWindowScale(false);
+            Invalidate();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == NativeWin32.WM_DPICHANGED)
+            {
+                SyncSettingsWindowScale(true);
+                Invalidate();
+            }
+        }
+
+        private PointF ToLogicalPt(Point clientPt)
+        {
+            float s = Math.Max(0.5f, _renderScale);
+            return new PointF(clientPt.X / s, clientPt.Y / s);
+        }
+
         private void ApplyLive()
         {
             _lastModifiedTick = Environment.TickCount;
             RefreshSettingsPalette();
+            if (_draggingSlider == null) SyncSettingsWindowScale(true);
             SyncStageTargetsFromMode(false);
             ConfigManager.SetAutostart(_cfg.autostart);
             ConfigManager.Save(_cfg);
@@ -7349,13 +7515,14 @@ namespace DynamicIslandWin
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            g.ScaleTransform(_renderScale, _renderScale);
 
             _hits.Clear();
             _sliderHits.Clear();
             _spatialPadRect = RectangleF.Empty;
 
             using (var bgBr = new SolidBrush(ColChassis))
-                g.FillRectangle(bgBr, ClientRectangle);
+                g.FillRectangle(bgBr, 0, 0, LogicalW, LogicalH);
 
             // -----------------------------------------------------------------
             // TOP CONSOLE HEADER BAR (y = 0..34)
@@ -7363,8 +7530,8 @@ namespace DynamicIslandWin
             using (var barBr = new SolidBrush(ColHeaderBar))
             using (var barPen = new Pen(ColBorder, 1f))
             {
-                g.FillRectangle(barBr, 0, 0, Width, 34);
-                g.DrawLine(barPen, 0, 34, Width, 34);
+                g.FillRectangle(barBr, 0, 0, LogicalW, 34);
+                g.DrawLine(barPen, 0, 34, LogicalW, 34);
             }
 
             using (var accBr = new SolidBrush(ColAccent))
@@ -7379,13 +7546,13 @@ namespace DynamicIslandWin
             bool updAvail = (Updater != null && Updater.IsUpdateAvailable);
             bool updBusy = (Updater != null && (Updater.IsChecking || Updater.IsDownloading));
             string updLabel = updAvail ? ("● ДОСТУПНО v" + Updater.LatestVersionStr) : (updBusy ? "⟳ ПРОВЕРКА..." : "↻ ОБНОВЛЕНИЯ");
-            DrawHardwareButton(g, new RectangleF(Width - 400, 6, 140, 22), updLabel, updAvail, false, () =>
+            DrawHardwareButton(g, new RectangleF(LogicalW - 400, 6, 140, 22), updLabel, updAvail, false, () =>
             {
                 if (ManualUpdateCheckRequested != null) ManualUpdateCheckRequested();
             });
-            DrawHardwareButton(g, new RectangleF(Width - 252, 6, 76, 22), "ВЫХОД APP", false, true, () => Application.Exit());
-            DrawHardwareButton(g, new RectangleF(Width - 170, 6, 80, 22), "ПРИМЕНИТЬ", false, false, () => ApplyLive());
-            DrawHardwareButton(g, new RectangleF(Width - 84, 6, 70, 22), "ГОТОВО ✕", true, false, () =>
+            DrawHardwareButton(g, new RectangleF(LogicalW - 252, 6, 76, 22), "ВЫХОД APP", false, true, () => Application.Exit());
+            DrawHardwareButton(g, new RectangleF(LogicalW - 170, 6, 80, 22), "ПРИМЕНИТЬ", false, false, () => ApplyLive());
+            DrawHardwareButton(g, new RectangleF(LogicalW - 84, 6, 70, 22), "ГОТОВО ✕", true, false, () =>
             {
                 CommitInlineInput(true);
                 ApplyLive();
@@ -7396,13 +7563,13 @@ namespace DynamicIslandWin
             // -----------------------------------------------------------------
             // ZONE 1: INTERACTIVE STAGE (y = 40..260, ~38% of window height)
             // -----------------------------------------------------------------
-            var stageRc = new RectangleF(14f, 40f, Width - 28f, 220f);
+            var stageRc = new RectangleF(14f, 40f, LogicalW - 28f, 220f);
             PaintInteractiveStage(g, stageRc);
 
             // -----------------------------------------------------------------
             // ZONE 2: CENTRAL MODE RAIL (y = 266..302)
             // -----------------------------------------------------------------
-            var railRc = new RectangleF(14f, 266f, Width - 28f, 36f);
+            var railRc = new RectangleF(14f, 266f, LogicalW - 28f, 36f);
             PaintModeRail(g, railRc);
 
             // -----------------------------------------------------------------
@@ -7414,7 +7581,7 @@ namespace DynamicIslandWin
             else PaintDeck04SkinAndSystem(g);
 
             // Crisp 1px Chassis Outer Frame
-            using (GraphicsPath framePath = SharpRoundRect(new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), 9f))
+            using (GraphicsPath framePath = SharpRoundRect(new RectangleF(0.5f, 0.5f, LogicalW - 1f, LogicalH - 1f), 9f))
             using (var framePen = new Pen(ColBorderHi, 1f))
                 g.DrawPath(framePen, framePath);
         }
@@ -8454,7 +8621,7 @@ namespace DynamicIslandWin
         {
             base.OnMouseWheel(e);
             if (e.Delta == 0) return;
-            PointF pt = new PointF(e.X, e.Y);
+            PointF pt = ToLogicalPt(e.Location);
             int dir = e.Delta > 0 ? 1 : -1;
 
             foreach (var s in _sliderHits)
@@ -8475,7 +8642,7 @@ namespace DynamicIslandWin
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            PointF pt = new PointF(e.X, e.Y);
+            PointF pt = ToLogicalPt(e.Location);
 
             if (_inlineBox.Visible && !_inlineBox.Bounds.Contains(e.Location))
                 CommitInlineInput(true);
@@ -8508,7 +8675,7 @@ namespace DynamicIslandWin
                 return;
             }
 
-            if (e.Y <= 36)
+            if (pt.Y <= 36f)
             {
                 _draggingWindow = true;
                 _windowDragOffset = e.Location;
@@ -8518,11 +8685,11 @@ namespace DynamicIslandWin
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            _mousePt = new PointF(e.X, e.Y);
+            _mousePt = ToLogicalPt(e.Location);
 
             if (_draggingSlider != null && (e.Button & MouseButtons.Left) == MouseButtons.Left)
             {
-                UpdateSliderFromMouseX(_draggingSlider, e.X);
+                UpdateSliderFromMouseX(_draggingSlider, _mousePt.X);
                 return;
             }
 
@@ -8545,9 +8712,15 @@ namespace DynamicIslandWin
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            bool endedSlider = (_draggingSlider != null);
             _draggingSlider = null;
             _draggingSpatialPad = false;
             _draggingWindow = false;
+            if (endedSlider)
+            {
+                SyncSettingsWindowScale(true);
+                Invalidate();
+            }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
