@@ -2789,6 +2789,13 @@ namespace DynamicIslandWin
                     else ReleaseCom(items[k].Element);
                     items[k].Element = null;
                 }
+                if (winner == null)
+                {
+                    var sbSample = new StringBuilder();
+                    for (int k = 0; k < Math.Min(items.Count, 20); k++)
+                        sbSample.AppendFormat("[{0}:'{1}'/t={2}:{3}]", k, items[k].NameLower, items[k].HasToggle ? 1 : 0, items[k].ToggleVal);
+                    dbg = string.Format("miss len={0} anchors={1}/{2} sample={3}", len, strongAnchors.Count, playAnchors.Count, sbSample.ToString());
+                }
                 resolvedLiked = bestLiked;
                 return winner;
             }
@@ -2944,7 +2951,11 @@ namespace DynamicIslandWin
 
             if (!job.IsToggleAction)
             {
-                if (topHwnd == IntPtr.Zero) return;
+                if (topHwnd == IntPtr.Zero)
+                {
+                    LogDiagnostic("DIAG", "PassiveSync topHwnd=0 for appId='" + (job.Snapshot.AppId ?? "") + "' track='" + job.TrackKey + "'");
+                    return;
+                }
                 bool playerLiked; string dbg;
                 var btn = FindPlayerBarLikeElement(uia, topHwnd, renderHwnd, isBrowser, winTitle, true, out playerLiked, out dbg);
                 if (btn != null)
@@ -2953,6 +2964,11 @@ namespace DynamicIslandWin
                     res.SyncedFromPlayer = true; res.IsLiked = playerLiked;
                     LogDiagnostic("SYNC", "Read player favorite state for '" + job.TrackKey + "' -> IsLiked=" + playerLiked + " [" + dbg + "]");
                     if (job.Callback != null) job.Callback(res);
+                }
+                else
+                {
+                    LogDiagnostic("DIAG", string.Format("PassiveSync btn=null top={0} render={1} vis={2} iconic={3} title='{4}' dbg='{5}'",
+                        topHwnd, renderHwnd, NativeWin32.IsWindowVisible(topHwnd), NativeWin32.IsIconic(topHwnd), winTitle, dbg));
                 }
                 return;
             }
