@@ -24,6 +24,7 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using Windows.Foundation;
+using Windows.Media;
 using Windows.Media.Control;
 using Windows.Storage.Streams;
 
@@ -33,8 +34,8 @@ using System.Reflection;
 [assembly: AssemblyProduct("Dynamic Island Studio")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("3.1.3.0")]
-[assembly: AssemblyFileVersion("3.1.3.0")]
+[assembly: AssemblyVersion("3.2.0.0")]
+[assembly: AssemblyFileVersion("3.2.0.0")]
 namespace DynamicIslandWin
 {
     // =========================================================================
@@ -75,7 +76,12 @@ namespace DynamicIslandWin
         public int collapse_delay_ms { get; set; }
         public bool enable_lctrl_resize { get; set; }
         public bool hide_in_fullscreen { get; set; }
+        public bool hide_on_video_playback { get; set; }
         public bool prefer_music_players { get; set; }
+        public string default_music_player_id { get; set; }
+        public string last_used_music_player_id { get; set; }
+        public string last_used_music_player_name { get; set; }
+        public string last_used_music_player_path { get; set; }
 
         public bool enable_live_activities { get; set; }
         public bool show_clock { get; set; }
@@ -128,7 +134,12 @@ namespace DynamicIslandWin
             collapse_delay_ms = 360;
             enable_lctrl_resize = true;
             hide_in_fullscreen = false;
+            hide_on_video_playback = false;
             prefer_music_players = true;
+            default_music_player_id = "";
+            last_used_music_player_id = "";
+            last_used_music_player_name = "";
+            last_used_music_player_path = "";
 
             enable_live_activities = true;
             show_clock = true;
@@ -211,6 +222,10 @@ namespace DynamicIslandWin
                 if (string.IsNullOrEmpty(cfg.watchdog_action)) cfg.watchdog_action = "Сон";
                 if (cfg.download_threshold_mbps < 1) cfg.download_threshold_mbps = 2;
                 if (cfg.skipped_version == null) cfg.skipped_version = "";
+                if (cfg.default_music_player_id == null) cfg.default_music_player_id = "";
+                if (cfg.last_used_music_player_id == null) cfg.last_used_music_player_id = "";
+                if (cfg.last_used_music_player_name == null) cfg.last_used_music_player_name = "";
+                if (cfg.last_used_music_player_path == null) cfg.last_used_music_player_path = "";
                 if (string.IsNullOrWhiteSpace(cfg.github_repo) || cfg.github_repo.IndexOf("DynamicIslandWin/DynamicIslandWin", StringComparison.OrdinalIgnoreCase) >= 0 || cfg.github_repo.IndexOf("/") < 1)
                     cfg.github_repo = "Miltanchik/DynamicIsland";
                 return cfg;
