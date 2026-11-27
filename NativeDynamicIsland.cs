@@ -34,8 +34,8 @@ using System.Reflection;
 [assembly: AssemblyProduct("Dynamic Island Studio")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("3.2.1.0")]
-[assembly: AssemblyFileVersion("3.2.1.0")]
+[assembly: AssemblyVersion("3.3.0.0")]
+[assembly: AssemblyFileVersion("3.3.0.0")]
 namespace DynamicIslandWin
 {
     public static class ColorThemeUtils
@@ -5443,7 +5443,7 @@ namespace DynamicIslandWin
 
     public sealed class UpdateManager
     {
-        public const string CurrentVersionStr = "3.2.1";
+        public const string CurrentVersionStr = "3.3.0";
         public const string DefaultRepo = "Miltanchik/DynamicIsland";
 
         public string LatestVersionStr { get; private set; }
@@ -8683,9 +8683,11 @@ namespace DynamicIslandWin
         private volatile string _pendingLiveActivityBanner = null;
         private long _lastExpandedProgressRedrawTick = 0;
 
-        private readonly float[] _eqBars = new float[7] { 0.12f, 0.12f, 0.12f, 0.12f, 0.12f, 0.12f, 0.12f };
-        private readonly float[] _expEqBars = new float[28];
+        private readonly float[] _eqBars = new float[12] { 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f };
+        private readonly float[] _expEqBars = new float[36];
         private float _eqPhase = 0f;
+        private Color _smoothCoverEq1 = Color.FromArgb(34, 211, 238);
+        private Color _smoothCoverEq2 = Color.FromArgb(236, 72, 153);
 
         private readonly object _stateLock = new object();
         private string _clockStr = DateTime.Now.ToString("HH:mm");
@@ -9480,36 +9482,59 @@ namespace DynamicIslandWin
                 float masterPeak, leftPeak, rightPeak;
                 _audio.SampleAudioPeaks(out masterPeak, out leftPeak, out rightPeak);
 
-                float boostedL = (float)Math.Pow(Math.Max(0f, leftPeak), 0.50);
-                float boostedR = (float)Math.Pow(Math.Max(0f, rightPeak), 0.50);
-                float boostedM = (float)Math.Pow(Math.Max(0f, masterPeak), 0.48);
+                float sensGain = Math.Max(0.40f, Math.Min(2.20f, _config.eq_sensitivity_pct / 100f));
+                float smoothNorm = Math.Max(0.10f, Math.Min(0.95f, _config.eq_smoothing_pct / 100f));
+                float attackRate = Math.Max(0.18f, 0.74f - smoothNorm * 0.52f);
+                float releaseRate = Math.Max(0.07f, 0.42f - smoothNorm * 0.33f);
+                float idleDecay = 0.64f + smoothNorm * 0.30f;
+
+                float boostedL = (float)Math.Pow(Math.Max(0f, leftPeak), 0.50) * sensGain;
+                float boostedR = (float)Math.Pow(Math.Max(0f, rightPeak), 0.50) * sensGain;
+                float boostedM = (float)Math.Pow(Math.Max(0f, masterPeak), 0.48) * sensGain;
 
                 bool audioActive = (masterPeak > 0.0025f) && !_audio.LastMuted;
                 if (!audioActive && _currentMedia.IsPlaying && !_audio.LastMuted)
                 {
-                    boostedM = 0.48f; boostedL = 0.45f; boostedR = 0.45f;
+                    boostedM = 0.46f * sensGain; boostedL = 0.43f * sensGain; boostedR = 0.43f * sensGain;
                     audioActive = true;
                 }
 
+                // Smoothly cross-fade cover-adaptive equalizer colors when "Обложка трека" mode is active
+                if (_config.eq_color_mode == "Обложка трека")
+                {
+                    Color targetC1, targetC2;
+                    if (_currentMedia != null && _currentMedia.HasCoverColors)
+                    {
+                        targetC1 = _currentMedia.CoverColor1;
+                        targetC2 = _currentMedia.CoverColor2;
+                    }
+                    else
+                    {
+                        GetThemeAccentColors(255, out targetC1, out targetC2);
+                    }
+                    if (Math.Abs(_smoothCoverEq1.R - targetC1.R) + Math.Abs(_smoothCoverEq1.G - targetC1.G) + Math.Abs(_smoothCoverEq1.B - targetC1.B) > 3 ||
+                        Math.Abs(_smoothCoverEq2.R - targetC2.R) + Math.Abs(_smoothCoverEq2.G - targetC2.G) + Math.Abs(_smoothCoverEq2.B - targetC2.B) > 3)
+                    {
+                        _smoothCoverEq1 = ColorThemeUtils.Blend(_smoothCoverEq1, targetC1, 0.16f);
+                        _smoothCoverEq2 = ColorThemeUtils.Blend(_smoothCoverEq2, targetC2, 0.16f);
+                        needsRedraw = true;
+                    }
+                }
+
+                int compactBands = Math.Max(4, Math.Min(_eqBars.Length, _config.eq_bar_count));
                 if (audioActive)
                 {
-                    _eqPhase += 0.34f + boostedM * 0.42f;
-                    float[] bandMultipliers = new float[7]
+                    _eqPhase += (0.26f + Math.Min(1.3f, boostedM) * 0.36f) * (1.18f - smoothNorm * 0.45f);
+                    for (int i = 0; i < compactBands; i++)
                     {
-                        0.72f + 0.28f * (float)Math.Sin(_eqPhase * 1.1f),
-                        0.88f + 0.30f * (float)Math.Cos(_eqPhase * 1.45f + 0.7f),
-                        1.05f + 0.25f * (float)Math.Sin(_eqPhase * 1.85f + 1.4f),
-                        0.95f + 0.32f * (float)Math.Cos(_eqPhase * 1.60f + 2.2f),
-                        0.78f + 0.28f * (float)Math.Sin(_eqPhase * 1.25f + 3.1f),
-                        0.85f + 0.30f * (float)Math.Cos(_eqPhase * 1.50f + 3.9f),
-                        0.68f + 0.26f * (float)Math.Sin(_eqPhase * 1.15f + 4.7f)
-                    };
-
-                    for (int i = 0; i < 7; i++)
-                    {
-                        float chanPeak = (i < 2) ? boostedL : (i > 4 ? boostedR : boostedM);
-                        float target = Math.Max(0.10f, Math.Min(1.0f, chanPeak * bandMultipliers[i]));
-                        float rate = (target > _eqBars[i]) ? 0.52f : 0.20f;
+                        float normI = compactBands > 1 ? (i / (float)(compactBands - 1)) : 0.5f;
+                        float chanPeak = (normI < 0.34f) ? boostedL : (normI > 0.66f ? boostedR : boostedM);
+                        float bell = 0.66f + 0.38f * (float)Math.Sin(normI * Math.PI);
+                        float harmonic = 0.72f
+                            + 0.26f * (float)Math.Sin(_eqPhase * (1.15f + (i % 3) * 0.28f) + i * 0.85f)
+                            + 0.16f * (float)Math.Cos(_eqPhase * 1.55f - i * 0.62f);
+                        float target = Math.Max(0.08f, Math.Min(1.0f, chanPeak * harmonic * bell));
+                        float rate = (target > _eqBars[i]) ? attackRate : releaseRate;
                         float nextVal = _eqBars[i] + (target - _eqBars[i]) * rate;
                         if (Math.Abs(nextVal - _eqBars[i]) > 0.004f)
                         {
@@ -9521,13 +9546,13 @@ namespace DynamicIslandWin
                     for (int i = 0; i < _expEqBars.Length; i++)
                     {
                         float normX = i / (float)(_expEqBars.Length - 1);
-                        float centerBell = 0.55f + 0.45f * (float)Math.Sin(normX * Math.PI);
+                        float centerBell = 0.52f + 0.48f * (float)Math.Sin(normX * Math.PI);
                         float chanPeak = (normX < 0.38f) ? boostedL : (normX > 0.62f ? boostedR : boostedM);
                         float wave = 0.68f
                             + 0.24f * (float)Math.Sin(_eqPhase * 1.35f + i * 0.52f)
                             + 0.18f * (float)Math.Cos(_eqPhase * 0.95f - i * 0.37f);
-                        float target = Math.Max(0.08f, Math.Min(1.0f, chanPeak * wave * centerBell));
-                        float rate = (target > _expEqBars[i]) ? 0.48f : 0.22f;
+                        float target = Math.Max(0.06f, Math.Min(1.0f, chanPeak * wave * centerBell));
+                        float rate = (target > _expEqBars[i]) ? attackRate : releaseRate;
                         float nextVal = _expEqBars[i] + (target - _expEqBars[i]) * rate;
                         if (Math.Abs(nextVal - _expEqBars[i]) > 0.004f)
                         {
@@ -9538,19 +9563,19 @@ namespace DynamicIslandWin
                 }
                 else
                 {
-                    for (int i = 0; i < 7; i++)
+                    for (int i = 0; i < _eqBars.Length; i++)
                     {
-                        if (_eqBars[i] > 0.11f)
+                        if (_eqBars[i] > 0.105f)
                         {
-                            _eqBars[i] = Math.Max(0.10f, _eqBars[i] * 0.82f);
+                            _eqBars[i] = Math.Max(0.09f, _eqBars[i] * idleDecay);
                             needsRedraw = true;
                         }
                     }
                     for (int i = 0; i < _expEqBars.Length; i++)
                     {
-                        if (_expEqBars[i] > 0.07f)
+                        if (_expEqBars[i] > 0.065f)
                         {
-                            _expEqBars[i] = Math.Max(0.06f, _expEqBars[i] * 0.82f);
+                            _expEqBars[i] = Math.Max(0.05f, _expEqBars[i] * idleDecay);
                             needsRedraw = true;
                         }
                     }
@@ -11034,14 +11059,30 @@ namespace DynamicIslandWin
         // ---------------------------------------------------------------------
         private void GetThemeAccentColors(int alpha, out Color c1, out Color c2)
         {
-            string preset = _config.theme_preset ?? "Dinasmic Neon";
-            if (preset == "Dinasmic Neon") { c1 = Color.FromArgb(alpha, 34, 211, 238); c2 = Color.FromArgb(alpha, 236, 72, 153); }
-            else if (preset == "Apple Blue") { c1 = Color.FromArgb(alpha, 10, 132, 255); c2 = Color.FromArgb(alpha, 139, 92, 246); }
-            else if (preset == "Yandex Gold-Yellow") { c1 = Color.FromArgb(alpha, 255, 214, 10); c2 = Color.FromArgb(alpha, 255, 159, 10); }
-            else if (preset == "Spotify Neon Green") { c1 = Color.FromArgb(alpha, 48, 209, 88); c2 = Color.FromArgb(alpha, 34, 211, 238); }
-            else if (preset == "Crimson Sunset") { c1 = Color.FromArgb(alpha, 255, 55, 95); c2 = Color.FromArgb(alpha, 255, 159, 10); }
-            else if (preset == "Minimal White") { c1 = Color.FromArgb(alpha, 245, 245, 247); c2 = Color.FromArgb(alpha, 174, 174, 178); }
-            else { c1 = Color.FromArgb(alpha, 34, 211, 238); c2 = Color.FromArgb(alpha, 192, 132, 252); }
+            ColorThemeUtils.ResolveIslandThemeAccents(_config.theme_preset, alpha, out c1, out c2);
+        }
+
+        private void GetEqualizerColors(int alpha, out Color eq1, out Color eq2)
+        {
+            int a = Math.Max(0, Math.Min(255, alpha));
+            string mode = _config.eq_color_mode ?? "Градиент темы";
+            if (mode == "Один цвет")
+            {
+                Color c = ColorThemeUtils.ParseHex(_config.eq_custom_color_hex, Color.FromArgb(34, 211, 238));
+                eq1 = Color.FromArgb(a, c.R, c.G, c.B);
+                eq2 = eq1;
+                return;
+            }
+            if (mode == "Обложка трека")
+            {
+                if (_currentMedia != null && _currentMedia.HasCoverColors)
+                {
+                    eq1 = Color.FromArgb(a, _smoothCoverEq1.R, _smoothCoverEq1.G, _smoothCoverEq1.B);
+                    eq2 = Color.FromArgb(a, _smoothCoverEq2.R, _smoothCoverEq2.G, _smoothCoverEq2.B);
+                    return;
+                }
+            }
+            GetThemeAccentColors(a, out eq1, out eq2);
         }
 
         private RectangleF ApplyMicroInteraction(Graphics g, RectangleF rc, float cornerRadius, int alpha, Color accentCol, bool isCircle = false)
@@ -11633,33 +11674,95 @@ namespace DynamicIslandWin
                 clockW += 50f;
             }
 
-            // 2) Far Right: Equalizer bars
+            // 2) Far Right: Custom Multi-Style Equalizer (Столбики / Точки / Волна / Зеркальный)
             float eqTotalW = 0f;
-            if ((_mode != IslandMode.Expanded || _expandedPage != 1) && _config.eq_style != "Выкл" && _config.eq_style != "Off")
+            string eqStyleNow = _config.eq_style ?? "Столбики";
+            if ((_mode != IslandMode.Expanded || _expandedPage != 1) && eqStyleNow != "Выкл" && eqStyleNow != "Off")
             {
-                int bars = (_config.eq_style != null && _config.eq_style.Contains("7")) ? 7 : 5;
-                float barW = 2.6f, gap = 2.4f;
-                float totalEqW = bars * barW + (bars - 1) * gap;
+                Color eq1, eq2;
+                GetEqualizerColors(alpha, out eq1, out eq2);
+
+                int bars = Math.Max(4, Math.Min(_eqBars.Length, _config.eq_bar_count));
+                float barW = bars >= 10 ? 2.1f : (bars >= 8 ? 2.3f : 2.6f);
+                float gap = bars >= 10 ? 1.6f : (bars >= 8 ? 1.9f : 2.3f);
+                float totalEqW = Math.Max(22f, bars * barW + (bars - 1) * gap);
                 eqTotalW = totalEqW + 16f;
                 float startX = pill.Right - 13f - totalEqW;
-                float cy = pill.Top + pill.Height / 2f;
-                float maxBarH = Math.Min(18f, pill.Height - 12f);
+                float cy = pill.Top + pill.Height * 0.5f;
+                float maxBarH = Math.Min(19f, pill.Height - 11f);
 
-                using (var b1 = new SolidBrush(acc1))
-                using (var b2 = new SolidBrush(acc2))
-                using (var shadowPen = new Pen(Color.FromArgb((int)(alpha * 0.65f), 0, 0, 0), 0.8f))
+                using (var shadowPen = new Pen(Color.FromArgb((int)(alpha * 0.58f), 0, 0, 0), 0.8f))
                 {
-                    for (int i = 0; i < bars; i++)
+                    if (eqStyleNow == "Волна")
                     {
-                        float level = _eqBars[i];
-                        float bh = Math.Max(3.0f, level * maxBarH);
-                        float bx = startX + i * (barW + gap);
-                        float by = cy - bh / 2f;
-                        var barRc = new RectangleF(bx, by, barW, bh);
-                        using (GraphicsPath bp = CreateRoundedRectPath(barRc, 1.3f))
+                        int ptsCount = bars + 2;
+                        PointF[] wavePts1 = new PointF[ptsCount];
+                        PointF[] wavePts2 = new PointF[ptsCount];
+                        for (int i = 0; i < ptsCount; i++)
                         {
-                            g.FillPath((i % 2 == 0) ? b1 : b2, bp);
-                            if (hasCustomBg) g.DrawPath(shadowPen, bp);
+                            float t = i / (float)(ptsCount - 1);
+                            float env = (float)Math.Sin(t * Math.PI);
+                            int bIdx = Math.Max(0, Math.Min(bars - 1, i - 1));
+                            float amp = _eqBars[bIdx] * env;
+                            float s1 = (float)Math.Sin(_eqPhase * 1.35f + i * 1.05f);
+                            float s2 = (float)Math.Cos(_eqPhase * 1.05f - i * 0.90f);
+                            wavePts1[i] = new PointF(startX + totalEqW * t, cy + s1 * amp * (maxBarH * 0.52f));
+                            wavePts2[i] = new PointF(startX + totalEqW * t, cy + s2 * amp * (maxBarH * 0.38f));
+                        }
+                        using (var glowPen = new Pen(Color.FromArgb((int)(alpha * 0.48f), eq2.R, eq2.G, eq2.B), 2.3f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                        using (var corePen = new Pen(eq1, 1.55f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                        {
+                            g.DrawCurve(glowPen, wavePts2, 0.48f);
+                            g.DrawCurve(corePen, wavePts1, 0.48f);
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < bars; i++)
+                        {
+                            float t = bars > 1 ? (i / (float)(bars - 1)) : 0f;
+                            Color cBar = ColorThemeUtils.Blend(eq1, eq2, t);
+                            float level = Math.Max(0.09f, Math.Min(1.0f, _eqBars[i]));
+                            float bx = startX + i * (barW + gap);
+
+                            if (eqStyleNow == "Точки")
+                            {
+                                float dotD = barW + 1.1f;
+                                float lift = (level - 0.12f) * (maxBarH * 0.58f);
+                                float topDotY = cy + maxBarH * 0.26f - lift - dotD * 0.5f;
+                                var dotRc = new RectangleF(bx - 0.5f, topDotY, dotD, dotD);
+                                using (var dBr = new SolidBrush(cBar))
+                                using (var baseBr = new SolidBrush(Color.FromArgb((int)(alpha * 0.34f), cBar.R, cBar.G, cBar.B)))
+                                {
+                                    g.FillEllipse(baseBr, bx - 0.2f, cy + maxBarH * 0.30f, barW, barW);
+                                    g.FillEllipse(dBr, dotRc);
+                                    if (hasCustomBg) g.DrawEllipse(shadowPen, dotRc);
+                                }
+                            }
+                            else if (eqStyleNow == "Зеркальный")
+                            {
+                                float halfH = Math.Max(1.6f, level * maxBarH * 0.50f);
+                                var upRc = new RectangleF(bx, cy - halfH - 0.5f, barW, halfH);
+                                var dnRc = new RectangleF(bx, cy + 0.5f, barW, halfH);
+                                using (var upBr = new SolidBrush(cBar))
+                                using (var dnBr = new SolidBrush(Color.FromArgb((int)(alpha * 0.68f), cBar.R, cBar.G, cBar.B)))
+                                {
+                                    g.FillRectangle(upBr, upRc);
+                                    g.FillRectangle(dnBr, dnRc);
+                                }
+                            }
+                            else // "Столбики" (Classic vertical bars anchored at bottom with smooth falloff)
+                            {
+                                float bh = Math.Max(2.8f, level * maxBarH);
+                                float bottomY = cy + maxBarH * 0.48f;
+                                var barRc = new RectangleF(bx, bottomY - bh, barW, bh);
+                                using (GraphicsPath bp = CreateRoundedRectPath(barRc, barW * 0.48f))
+                                using (var bBr = new SolidBrush(cBar))
+                                {
+                                    g.FillPath(bBr, bp);
+                                    if (hasCustomBg) g.DrawPath(shadowPen, bp);
+                                }
+                            }
                         }
                     }
                 }
@@ -12102,36 +12205,94 @@ namespace DynamicIslandWin
             GetThemeAccentColors(alpha, out acc1, out acc2);
             bool hasCustomBg = ShouldRenderCustomBackground();
 
-            // BACKGROUND EQUALIZER AT BOTTOM OF EXPANDED ISLAND (Screenshot 4)
-            if ((_mode != IslandMode.Expanded || _expandedPage != 1) && _config.eq_style != "Выкл" && _config.eq_style != "Off")
+            // BACKGROUND MULTI-STYLE EQUALIZER AT BOTTOM OF EXPANDED ISLAND
+            string expEqStyle = _config.eq_style ?? "Столбики";
+            if ((_mode != IslandMode.Expanded || _expandedPage != 1) && expEqStyle != "Выкл" && expEqStyle != "Off")
             {
                 float expRadius = Math.Max(12f, _config.corner_radius);
                 using (GraphicsPath clipCap = CreateRoundedRectPath(pill, expRadius))
                 {
                     Region prevClip = g.Clip;
                     g.SetClip(clipCap);
-                    int barCount = _expEqBars.Length;
+
+                    Color rawEq1, rawEq2;
+                    GetEqualizerColors(alpha, out rawEq1, out rawEq2);
+
+                    int barCount = Math.Max(12, Math.Min(_expEqBars.Length, _config.eq_bar_count * 3));
                     float eqLeft = pill.Left + 18f;
                     float eqRight = pill.Right - 18f;
                     float eqSpan = Math.Max(100f, eqRight - eqLeft);
                     float stepX = eqSpan / barCount;
-                    float barW = Math.Max(4.0f, stepX * 0.56f);
-                    float maxEqH = Math.Min(48f, pill.Height * 0.24f);
+                    float barW = Math.Max(3.6f, stepX * 0.54f);
+                    float maxEqH = Math.Min(50f, pill.Height * 0.24f);
 
-                    Color eqC1 = Color.FromArgb(Math.Min(255, (int)(alpha * 0.52f)), acc1.R, acc1.G, acc1.B);
-                    Color eqC2 = Color.FromArgb(Math.Min(255, (int)(alpha * 0.14f)), acc2.R, acc2.G, acc2.B);
-
-                    for (int i = 0; i < barCount; i++)
+                    if (expEqStyle == "Волна")
                     {
-                        float lvl = Math.Max(0.08f, _expEqBars[i]);
-                        float bh = Math.Max(4f, lvl * maxEqH);
-                        float bx = eqLeft + i * stepX + (stepX - barW) * 0.5f;
-                        float by = pill.Bottom - bh - 1.5f;
-                        var bRc = new RectangleF(bx, by, barW, bh);
-                        using (GraphicsPath bp = CreateRoundedRectPath(bRc, barW * 0.48f))
-                        using (var lg = new LinearGradientBrush(new PointF(bx, by), new PointF(bx, by + bh + 1f), eqC1, eqC2))
+                        int wCount = barCount + 2;
+                        PointF[] w1 = new PointF[wCount];
+                        PointF[] w2 = new PointF[wCount];
+                        float baseWaveY = pill.Bottom - maxEqH * 0.42f;
+                        for (int i = 0; i < wCount; i++)
                         {
-                            g.FillPath(lg, bp);
+                            float t = i / (float)(wCount - 1);
+                            float env = (float)Math.Sin(t * Math.PI);
+                            int sIdx = Math.Max(0, Math.Min(_expEqBars.Length - 1, (int)Math.Round(t * (_expEqBars.Length - 1))));
+                            float amp = _expEqBars[sIdx] * env;
+                            w1[i] = new PointF(eqLeft + eqSpan * t, baseWaveY + (float)Math.Sin(_eqPhase * 1.25f + i * 0.55f) * amp * (maxEqH * 0.52f));
+                            w2[i] = new PointF(eqLeft + eqSpan * t, baseWaveY + (float)Math.Cos(_eqPhase * 0.95f - i * 0.48f) * amp * (maxEqH * 0.38f));
+                        }
+                        using (var pGlow = new Pen(Color.FromArgb(Math.Min(255, (int)(alpha * 0.34f)), rawEq2.R, rawEq2.G, rawEq2.B), 3.4f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                        using (var pCore = new Pen(Color.FromArgb(Math.Min(255, (int)(alpha * 0.62f)), rawEq1.R, rawEq1.G, rawEq1.B), 1.9f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                        {
+                            g.DrawCurve(pGlow, w2, 0.46f);
+                            g.DrawCurve(pCore, w1, 0.46f);
+                        }
+                    }
+                    else
+                    {
+                        float mirrorMidY = pill.Bottom - maxEqH * 0.52f;
+                        for (int i = 0; i < barCount; i++)
+                        {
+                            float t = barCount > 1 ? (i / (float)(barCount - 1)) : 0f;
+                            int sIdx = Math.Max(0, Math.Min(_expEqBars.Length - 1, (int)Math.Round(t * (_expEqBars.Length - 1))));
+                            float lvl = Math.Max(0.07f, _expEqBars[sIdx]);
+                            Color cBlend = ColorThemeUtils.Blend(rawEq1, rawEq2, t);
+                            float bx = eqLeft + i * stepX + (stepX - barW) * 0.5f;
+
+                            if (expEqStyle == "Точки")
+                            {
+                                float dSz = Math.Min(7.5f, barW);
+                                float dy = pill.Bottom - 5f - lvl * (maxEqH - 8f);
+                                using (var dBr = new SolidBrush(Color.FromArgb(Math.Min(255, (int)(alpha * 0.58f)), cBlend.R, cBlend.G, cBlend.B)))
+                                using (var trBr = new SolidBrush(Color.FromArgb(Math.Min(255, (int)(alpha * 0.18f)), cBlend.R, cBlend.G, cBlend.B)))
+                                {
+                                    g.FillEllipse(trBr, bx, pill.Bottom - dSz - 2f, dSz, dSz);
+                                    g.FillEllipse(dBr, bx, dy, dSz, dSz);
+                                }
+                            }
+                            else if (expEqStyle == "Зеркальный")
+                            {
+                                float halfH = Math.Max(2.2f, lvl * maxEqH * 0.48f);
+                                using (var bUp = new SolidBrush(Color.FromArgb(Math.Min(255, (int)(alpha * 0.50f)), cBlend.R, cBlend.G, cBlend.B)))
+                                using (var bDn = new SolidBrush(Color.FromArgb(Math.Min(255, (int)(alpha * 0.26f)), cBlend.R, cBlend.G, cBlend.B)))
+                                {
+                                    g.FillRectangle(bUp, bx, mirrorMidY - halfH - 0.5f, barW, halfH);
+                                    g.FillRectangle(bDn, bx, mirrorMidY + 0.5f, barW, halfH);
+                                }
+                            }
+                            else // "Столбики"
+                            {
+                                float bh = Math.Max(4f, lvl * maxEqH);
+                                float by = pill.Bottom - bh - 1.5f;
+                                var bRc = new RectangleF(bx, by, barW, bh);
+                                Color eqC1 = Color.FromArgb(Math.Min(255, (int)(alpha * 0.54f)), cBlend.R, cBlend.G, cBlend.B);
+                                Color eqC2 = Color.FromArgb(Math.Min(255, (int)(alpha * 0.14f)), rawEq2.R, rawEq2.G, rawEq2.B);
+                                using (GraphicsPath bp = CreateRoundedRectPath(bRc, barW * 0.48f))
+                                using (var lg = new LinearGradientBrush(new PointF(bx, by), new PointF(bx, by + bh + 1f), eqC1, eqC2))
+                                {
+                                    g.FillPath(lg, bp);
+                                }
+                            }
                         }
                     }
                     g.Clip = prevClip;
