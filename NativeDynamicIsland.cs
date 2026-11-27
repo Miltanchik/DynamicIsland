@@ -38,6 +38,124 @@ using System.Reflection;
 [assembly: AssemblyFileVersion("3.2.1.0")]
 namespace DynamicIslandWin
 {
+    public static class ColorThemeUtils
+    {
+        public static string ToHex(Color c)
+        {
+            return string.Format("#{0:X2}{1:X2}{2:X2}", c.R, c.G, c.B);
+        }
+
+        public static Color ParseHex(string hex, Color fallback)
+        {
+            if (string.IsNullOrWhiteSpace(hex)) return fallback;
+            string s = hex.Trim().TrimStart('#');
+            if (s.Length == 6)
+            {
+                int val;
+                if (int.TryParse(s, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out val))
+                    return Color.FromArgb(255, (val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF);
+            }
+            return fallback;
+        }
+
+        public static double GetLuminance(Color c)
+        {
+            return 0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B;
+        }
+
+        public static Color Blend(Color a, Color b, float t)
+        {
+            t = Math.Max(0f, Math.Min(1f, t));
+            return Color.FromArgb(
+                (int)Math.Round(a.A + (b.A - a.A) * t),
+                (int)Math.Round(a.R + (b.R - a.R) * t),
+                (int)Math.Round(a.G + (b.G - a.G) * t),
+                (int)Math.Round(a.B + (b.B - a.B) * t));
+        }
+
+        public static Color BoostVibrance(Color c, float minBright = 0.52f)
+        {
+            int max = Math.Max(c.R, Math.Max(c.G, c.B));
+            int min = Math.Min(c.R, Math.Min(c.G, c.B));
+            float r = c.R, g = c.G, b = c.B;
+            if (max < (int)(255 * minBright))
+            {
+                float scale = (max > 8) ? ((255f * minBright) / max) : 1f;
+                r = Math.Min(255f, r * scale + 18f);
+                g = Math.Min(255f, g * scale + 18f);
+                b = Math.Min(255f, b * scale + 18f);
+            }
+            float avg = (r + g + b) / 3f;
+            if (max - min < 55)
+            {
+                r = Math.Max(0f, Math.Min(255f, avg + (r - avg) * 1.65f));
+                g = Math.Max(0f, Math.Min(255f, avg + (g - avg) * 1.65f));
+                b = Math.Max(0f, Math.Min(255f, avg + (b - avg) * 1.65f));
+            }
+            return Color.FromArgb(255, (int)Math.Round(r), (int)Math.Round(g), (int)Math.Round(b));
+        }
+
+        public static void ExtractDominantPairFromBitmap(Bitmap bmp, out Color primary, out Color secondary)
+        {
+            primary = Color.FromArgb(34, 211, 238);
+            secondary = Color.FromArgb(236, 72, 153);
+            if (bmp == null || bmp.Width < 4 || bmp.Height < 4) return;
+            try
+            {
+                long r1 = 0, g1 = 0, b1 = 0, w1 = 0;
+                long r2 = 0, g2 = 0, b2 = 0, w2 = 0;
+                int stepX = Math.Max(1, bmp.Width / 12);
+                int stepY = Math.Max(1, bmp.Height / 12);
+                for (int y = stepY / 2; y < bmp.Height; y += stepY)
+                {
+                    for (int x = stepX / 2; x < bmp.Width; x += stepX)
+                    {
+                        Color px = bmp.GetPixel(x, y);
+                        if (px.A < 80) continue;
+                        int mx = Math.Max(px.R, Math.Max(px.G, px.B));
+                        int mn = Math.Min(px.R, Math.Min(px.G, px.B));
+                        int sat = mx - mn;
+                        if (mx < 28) continue;
+                        int weight = 1 + (sat / 8);
+                        if (x + y < (bmp.Width + bmp.Height) / 2)
+                        {
+                            r1 += px.R * weight; g1 += px.G * weight; b1 += px.B * weight; w1 += weight;
+                        }
+                        else
+                        {
+                            r2 += px.R * weight; g2 += px.G * weight; b2 += px.B * weight; w2 += weight;
+                        }
+                    }
+                }
+                if (w1 > 0) primary = BoostVibrance(Color.FromArgb(255, (int)(r1 / w1), (int)(g1 / w1), (int)(b1 / w1)), 0.58f);
+                if (w2 > 0) secondary = BoostVibrance(Color.FromArgb(255, (int)(r2 / w2), (int)(g2 / w2), (int)(b2 / w2)), 0.52f);
+                else secondary = Blend(primary, Color.White, 0.28f);
+
+                if (Math.Abs(primary.R - secondary.R) + Math.Abs(primary.G - secondary.G) + Math.Abs(primary.B - secondary.B) < 45)
+                {
+                    secondary = Color.FromArgb(255, Math.Min(255, primary.B + 45), Math.Max(40, primary.R), Math.Min(255, primary.G + 35));
+                }
+            }
+            catch { }
+        }
+
+        public static void ResolveIslandThemeAccents(string preset, int alpha, out Color c1, out Color c2)
+        {
+            string p = preset ?? "Dinasmic Neon";
+            if (p == "Kinetic Orange") { c1 = Color.FromArgb(alpha, 255, 85, 0); c2 = Color.FromArgb(alpha, 255, 159, 10); }
+            else if (p == "Acid Lime") { c1 = Color.FromArgb(alpha, 200, 255, 0); c2 = Color.FromArgb(alpha, 16, 185, 129); }
+            else if (p == "Dinasmic Neon") { c1 = Color.FromArgb(alpha, 34, 211, 238); c2 = Color.FromArgb(alpha, 236, 72, 153); }
+            else if (p == "Apple Blue") { c1 = Color.FromArgb(alpha, 10, 132, 255); c2 = Color.FromArgb(alpha, 139, 92, 246); }
+            else if (p == "iOS Cyan-Purple") { c1 = Color.FromArgb(alpha, 34, 211, 238); c2 = Color.FromArgb(alpha, 168, 85, 247); }
+            else if (p == "Yandex Gold-Yellow") { c1 = Color.FromArgb(alpha, 255, 214, 10); c2 = Color.FromArgb(alpha, 255, 159, 10); }
+            else if (p == "Spotify Neon Green") { c1 = Color.FromArgb(alpha, 48, 209, 88); c2 = Color.FromArgb(alpha, 34, 211, 238); }
+            else if (p == "Crimson Sunset") { c1 = Color.FromArgb(alpha, 255, 55, 95); c2 = Color.FromArgb(alpha, 255, 159, 10); }
+            else if (p == "Minimal White") { c1 = Color.FromArgb(alpha, 245, 245, 247); c2 = Color.FromArgb(alpha, 174, 174, 178); }
+            else { c1 = Color.FromArgb(alpha, 34, 211, 238); c2 = Color.FromArgb(alpha, 192, 132, 252); }
+        }
+    }
+
+
     // =========================================================================
     // 1. PERSISTENT CONFIGURATION (%APPDATA%\DynamicIslandWin\config.json)
     // =========================================================================
@@ -67,7 +185,17 @@ namespace DynamicIslandWin
         public string theme_preset { get; set; }
         public int bg_opacity { get; set; }
         public int border_glow { get; set; }
+        public string settings_theme_preset { get; set; }
+        public bool settings_sync_island_accent { get; set; }
+        public string settings_custom_accent_hex { get; set; }
+        public string settings_custom_bg_hex { get; set; }
+
         public string eq_style { get; set; }
+        public string eq_color_mode { get; set; }
+        public string eq_custom_color_hex { get; set; }
+        public int eq_bar_count { get; set; }
+        public int eq_sensitivity_pct { get; set; }
+        public int eq_smoothing_pct { get; set; }
         public bool show_compact_cover { get; set; }
 
         public bool expand_on_hover { get; set; }
@@ -125,7 +253,17 @@ namespace DynamicIslandWin
             theme_preset = "Dinasmic Neon";
             bg_opacity = 248;
             border_glow = 52;
-            eq_style = "5 Полос";
+            settings_theme_preset = "Kinetic Dark";
+            settings_sync_island_accent = false;
+            settings_custom_accent_hex = "#FF5500";
+            settings_custom_bg_hex = "";
+
+            eq_style = "Столбики";
+            eq_color_mode = "Градиент темы";
+            eq_custom_color_hex = "#22D3EE";
+            eq_bar_count = 6;
+            eq_sensitivity_pct = 100;
+            eq_smoothing_pct = 55;
             show_compact_cover = true;
 
             expand_on_hover = true;
@@ -217,7 +355,19 @@ namespace DynamicIslandWin
                 if (string.IsNullOrEmpty(cfg.custom_bg_scope)) cfg.custom_bg_scope = "Везде";
                 if (cfg.custom_bg_dim_percent < 0 || cfg.custom_bg_dim_percent > 90) cfg.custom_bg_dim_percent = 20;
                 if (string.IsNullOrEmpty(cfg.theme_preset)) cfg.theme_preset = "Dinasmic Neon";
-                if (string.IsNullOrEmpty(cfg.eq_style)) cfg.eq_style = "5 Полос";
+                if (string.IsNullOrEmpty(cfg.settings_theme_preset)) cfg.settings_theme_preset = "Kinetic Dark";
+                if (string.IsNullOrEmpty(cfg.settings_custom_accent_hex)) cfg.settings_custom_accent_hex = "#FF5500";
+                if (cfg.settings_custom_bg_hex == null) cfg.settings_custom_bg_hex = "";
+
+                if (string.IsNullOrEmpty(cfg.eq_style)) cfg.eq_style = "Столбики";
+                if (cfg.eq_style == "5 Полос") { cfg.eq_style = "Столбики"; if (cfg.eq_bar_count <= 0) cfg.eq_bar_count = 5; }
+                else if (cfg.eq_style == "7 Полос") { cfg.eq_style = "Столбики"; if (cfg.eq_bar_count <= 0) cfg.eq_bar_count = 7; }
+                else if (cfg.eq_style == "Off") { cfg.eq_style = "Выкл"; }
+                if (string.IsNullOrEmpty(cfg.eq_color_mode)) cfg.eq_color_mode = "Градиент темы";
+                if (string.IsNullOrEmpty(cfg.eq_custom_color_hex)) cfg.eq_custom_color_hex = "#22D3EE";
+                if (cfg.eq_bar_count < 4 || cfg.eq_bar_count > 12) cfg.eq_bar_count = 6;
+                if (cfg.eq_sensitivity_pct < 40 || cfg.eq_sensitivity_pct > 220) cfg.eq_sensitivity_pct = 100;
+                if (cfg.eq_smoothing_pct < 10 || cfg.eq_smoothing_pct > 95) cfg.eq_smoothing_pct = 55;
                 if (string.IsNullOrEmpty(cfg.fullscreen_mode)) cfg.fullscreen_mode = cfg.hide_in_fullscreen ? "Авто-скрытие" : "Неоновая телеметрия";
                 if (string.IsNullOrEmpty(cfg.watchdog_action)) cfg.watchdog_action = "Сон";
                 if (cfg.download_threshold_mbps < 1) cfg.download_threshold_mbps = 2;
@@ -1969,6 +2119,9 @@ namespace DynamicIslandWin
         public double DurationSec = 0.0;
         public DateTime SampledAtUtc = DateTime.UtcNow;
         public Bitmap CoverBitmap = null;
+        public Color CoverColor1 = Color.FromArgb(34, 211, 238);
+        public Color CoverColor2 = Color.FromArgb(236, 72, 153);
+        public bool HasCoverColors = false;
         public object NativeSession = null;
         public int ProcessId = 0;
         public string ExecutablePath = "";
@@ -1986,6 +2139,8 @@ namespace DynamicIslandWin
         private static readonly Queue<Bitmap> _retiredCovers = new Queue<Bitmap>();
         private static string _cachedCoverKey = "";
         private static Bitmap _cachedCoverBmp = null;
+        private static Color _cachedCovC1 = Color.FromArgb(34, 211, 238);
+        private static Color _cachedCovC2 = Color.FromArgb(236, 72, 153);
         private static int _selectedPlayerIndex = 0;
         private static string _manualSelectedAppId = "";
         public static volatile bool SmtcVideoPlayingNow = false;
@@ -2267,6 +2422,9 @@ namespace DynamicIslandWin
                 if (string.Equals(key, _cachedCoverKey, StringComparison.Ordinal) && _cachedCoverBmp != null)
                 {
                     snap.CoverBitmap = _cachedCoverBmp;
+                    snap.CoverColor1 = _cachedCovC1;
+                    snap.CoverColor2 = _cachedCovC2;
+                    snap.HasCoverColors = true;
                     return;
                 }
             }
@@ -2297,9 +2455,16 @@ namespace DynamicIslandWin
                             lock (_coverLock)
                             {
                                 var prevBmp = _cachedCoverBmp;
+                                Color ext1, ext2;
+                                ColorThemeUtils.ExtractDominantPairFromBitmap(bmp, out ext1, out ext2);
                                 _cachedCoverBmp = bmp;
+                                _cachedCovC1 = ext1;
+                                _cachedCovC2 = ext2;
                                 _cachedCoverKey = key;
                                 snap.CoverBitmap = _cachedCoverBmp;
+                                snap.CoverColor1 = ext1;
+                                snap.CoverColor2 = ext2;
+                                snap.HasCoverColors = true;
                                 if (prevBmp != null && !ReferenceEquals(prevBmp, bmp))
                                 {
                                     _retiredCovers.Enqueue(prevBmp);
