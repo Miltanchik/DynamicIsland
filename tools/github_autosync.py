@@ -259,7 +259,15 @@ class AutoSyncDaemon:
         short_list = ", ".join(safe_files[:5])
         if len(safe_files) > 5:
             short_list += f" (+{len(safe_files) - 5} more)"
-        commit_msg = f"chore(autosync): {stamp} [{short_list}]"
+        if "release/version.json" in [f.replace("\\", "/") for f in safe_files]:
+            try:
+                import json as _json
+                v_str = _json.loads((self.repo_root / "release" / "version.json").read_text(encoding="utf-8")).get("version", "")
+                commit_msg = f"chore(release): publish Dynamic Island v{v_str} via autosync" if v_str else f"chore(autosync): {stamp} [{short_list}]"
+            except Exception:
+                commit_msg = f"chore(autosync): {stamp} [{short_list}]"
+        else:
+            commit_msg = f"chore(autosync): {stamp} [{short_list}]"
 
         cm_res = self.run_git(git_exe, ["commit", "-m", commit_msg])
         if cm_res.returncode != 0:

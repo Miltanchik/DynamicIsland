@@ -347,14 +347,7 @@ def main() -> int:
         actual_sha = sha256_file(setup_p) if setup_p.is_file() else ""
         if old_json_ver == cur_ver and actual_sha and old_json_sha == actual_sha:
             return 0
-        # Bidirectional version pick: whether user bumped CurrentVersionStr in C# OR "version" in release/version.json, take the higher version!
-        try:
-            ver_cs_tuple = parse_semver(cur_ver)
-            ver_js_tuple = parse_semver(old_json_ver) if old_json_ver else (0, 0, 0)
-            chosen_tuple = max(ver_cs_tuple, ver_js_tuple)
-            next_ver = f"{chosen_tuple[0]}.{chosen_tuple[1]}.{chosen_tuple[2]}"
-        except Exception:
-            next_ver = compute_next_version(cur_ver, args.target)
+        next_ver = compute_next_version(cur_ver, "sync")
     else:
         next_ver = compute_next_version(cur_ver, args.target)
     version_changed = (next_ver != old_json_ver) or (next_ver != cur_ver)
@@ -380,8 +373,7 @@ def main() -> int:
         else:
             final_notes = manual_notes
     else:
-        json_bumped_directly = (old_json_ver == next_ver and cur_ver != next_ver and bool(str(old_manifest.get("changelog", "")).strip()))
-        final_notes = str(old_manifest.get("changelog", "")).strip() if json_bumped_directly else collect_auto_changelog(repo_root, next_ver, str(old_manifest.get("changelog", "")), version_changed)
+        final_notes = collect_auto_changelog(repo_root, next_ver, str(old_manifest.get("changelog", "")), version_changed)
 
     manifest = write_manifest_and_sums(repo_root, args.repo, next_ver, final_notes, out_app, out_setup)
     print(f"[Release] Updated release/version.json -> v{manifest['version']} (sha256={manifest['sha256'][:16]}...)")
