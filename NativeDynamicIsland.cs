@@ -4381,7 +4381,7 @@ namespace DynamicIslandWin
 
     public sealed class UpdateManager
     {
-        public const string CurrentVersionStr = "3.1.3";
+        public const string CurrentVersionStr = "3.2.0";
         public const string DefaultRepo = "Miltanchik/DynamicIsland";
 
         public string LatestVersionStr { get; private set; }
@@ -4421,7 +4421,7 @@ namespace DynamicIslandWin
             ReleaseNotes = "";
             DownloadUrl = "";
             ExpectedSha256 = "";
-            ReleasePageUrl = "https://github.com/" + DefaultRepo + "/releases";
+            ReleasePageUrl = "https://github.com/" + DefaultRepo + "/tree/main/release";
             RepoSlug = DefaultRepo;
             ErrorText = "";
             State = UpdateCheckState.Idle;
@@ -4520,80 +4520,161 @@ namespace DynamicIslandWin
             });
         }
 
+        private static string ExtractChangelogValue(Dictionary<string, object> dict)
+        {
+            if (dict == null) return "";
+            string[] keys = new string[] { "changelog", "notes", "release_notes", "body" };
+            foreach (string k in keys)
+            {
+                if (!dict.ContainsKey(k) || dict[k] == null) continue;
+                var arr = dict[k] as System.Collections.IEnumerable;
+                if (arr != null && !(dict[k] is string))
+                {
+                    var sb = new StringBuilder();
+                    foreach (object item in arr)
+                    {
+                        string ln = Convert.ToString(item) ?? "";
+                        if (ln.Length > 0) sb.AppendLine("• " + ln);
+                    }
+                    return sb.ToString().Trim();
+                }
+                string val = Convert.ToString(dict[k]) ?? "";
+                if (!string.IsNullOrWhiteSpace(val)) return val.Trim();
+            }
+            return "";
+        }
+
         private void CheckCore(string repoCfg, string skipped, bool manual, bool autoInstall)
         {
             EnsureTls();
             string repo = NormalizeRepo(repoCfg);
             RepoSlug = repo;
-            ReleasePageUrl = "https://github.com/" + repo + "/releases";
-
-            string json;
-            try
-            {
-                json = HttpGetString("https://api.github.com/repos/" + repo + "/releases/latest", 9000);
-            }
-            catch (WebException wex)
-            {
-                HttpWebResponse r = wex.Response as HttpWebResponse;
-                if (r != null && r.StatusCode == HttpStatusCode.NotFound)
-                {
-                    _hasUpdate = false;
-                    ErrorText = "В репозитории " + repo + " пока нет опубликованных релизов.";
-                    StatusText = "Релизы на GitHub ещё не опубликованы";
-                    State = UpdateCheckState.NoReleases;
-                    return;
-                }
-                if (r != null && (int)r.StatusCode == 403)
-                {
-                    SetError("Достигнут лимит запросов GitHub API. Повторите проверку через несколько минут.");
-                    return;
-                }
-                SetError(r != null
-                    ? ("GitHub вернул ошибку " + (int)r.StatusCode + " " + r.StatusDescription)
-                    : "Нет соединения с GitHub. Проверьте подключение к интернету.");
-                return;
-            }
+            ReleasePageUrl = "https://github.com/" + repo + "/tree/main/release";
 
             var ser = new JavaScriptSerializer();
             ser.MaxJsonLength = int.MaxValue;
-            var dict = ser.Deserialize<Dictionary<string, object>>(json);
-            if (dict == null || !dict.ContainsKey("tag_name"))
+
+            string manifestJson = null;
+            string fallbackSetupUrl = "https://raw.githubusercontent.com/" + repo + "/main/release/DynamicIslandWin_Setup.exe";
+
+            // 1) Primary source: raw.githubusercontent.com/<repo>/main/release/version.json (cache-busted)
+            try
             {
-                SetError("Некорректный ответ GitHub (отсутствует tag_name).");
+                string rawManifestUrl = "https://raw.githubusercontent.com/" + repo + "/main/release/version.json?cb=" + unchecked((uint)Environment.TickCount);
+                manifestJson = HttpGetString(rawManifestUrl, 8500);
+            }
+            catch (WebException)
+            {
+                manifestJson = null;
+            }
+
+            // 2) Fallback source: GitHub Contents API https://api.github.com/repos/<repo>/contents/release?ref=main
+            if (string.IsNullOrWhiteSpace(manifestJson))
+            {
+                try
+                {
+                    string contentsJson = HttpGetString("https://api.github.com/repos/" + repo + "/contents/release?ref=main", 9000);
+                    var entries = ser.DeserializeObject(contentsJson) as object[];
+                    if (entries != null)
+                    {
+                        string manifestDlUrl = "";
+                        int bestPri = 0;
+                        foreach (object entryObj in entries)
+                        {
+                            var eDict = entryObj as Dictionary<string, object>;
+                            if (eDict == null) continue;
+                            string nm = Convert.ToString(eDict.ContainsKey("name") ? eDict["name"] : "") ?? "";
+                            string dl = Convert.ToString(eDict.ContainsKey("download_url") ? eDict["download_url"] : "") ?? "";
+                            string low = nm.ToLowerInvariant();
+                            if (low == "version.json" && !string.IsNullOrEmpty(dl))
+                            {
+                                manifestDlUrl = dl;
+                            }
+                            else if (low.EndsWith(".exe") && !string.IsNullOrEmpty(dl))
+                            {
+                                int pri = low == "dynamicislandwin_setup.exe" ? 3 : (low == "dinamicisland-setup.exe" ? 2 : (low.Contains("setup") ? 1 : 0));
+                                if (pri > bestPri) { bestPri = pri; fallbackSetupUrl = dl; }
+                            }
+                        }
+                        if (!string.IsNullOrEmpty(manifestDlUrl))
+                        {
+                            manifestJson = HttpGetString(manifestDlUrl + (manifestDlUrl.Contains("?") ? "&cb=" : "?cb=") + unchecked((uint)Environment.TickCount), 8500);
+                        }
+                    }
+                }
+                catch (WebException wex)
+                {
+                    HttpWebResponse r = wex.Response as HttpWebResponse;
+                    if (r != null && r.StatusCode == HttpStatusCode.NotFound)
+                    {
+                        _hasUpdate = false;
+                        ErrorText = "В ветке main репозитория " + repo + " не найдена папка release/version.json.";
+                        StatusText = "Манифест release/version.json не найден";
+                        State = UpdateCheckState.NoReleases;
+                        return;
+                    }
+                    if (r != null && (int)r.StatusCode == 403)
+                    {
+                        SetError("Достигнут лимит запросов GitHub API. Повторите проверку через несколько минут.");
+                        return;
+                    }
+                    SetError(r != null
+                        ? ("GitHub вернул ошибку " + (int)r.StatusCode + " " + r.StatusDescription)
+                        : "Нет соединения с GitHub. Проверьте подключение к интернету.");
+                    return;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(manifestJson))
+            {
+                _hasUpdate = false;
+                ErrorText = "Файл release/version.json пока отсутствует в ветке main репозитория " + repo + ".";
+                StatusText = "Манифест version.json ещё не опубликован";
+                State = UpdateCheckState.NoReleases;
                 return;
             }
 
-            string tagRaw = Convert.ToString(dict["tag_name"]) ?? "";
+            string cleanJson = manifestJson.Trim().TrimStart('\uFEFF');
+            var dict = ser.Deserialize<Dictionary<string, object>>(cleanJson);
+            if (dict == null || (!dict.ContainsKey("version") && !dict.ContainsKey("tag_name")))
+            {
+                SetError("Некорректный формат release/version.json (отсутствует поле version).");
+                return;
+            }
+
+            string tagRaw = Convert.ToString(dict.ContainsKey("version") ? dict["version"] : dict["tag_name"]) ?? "";
             string tag = tagRaw.Trim().TrimStart('v', 'V');
             Version vNew = ParseVersion(tagRaw);
             Version vCur = ParseVersion(CurrentVersionStr);
             if (vNew == null || vCur == null)
             {
-                SetError("Не удалось разобрать номер версии релиза: " + tagRaw);
+                SetError("Не удалось разобрать номер версии в version.json: " + tagRaw);
                 return;
             }
 
-            string body = dict.ContainsKey("body") ? (Convert.ToString(dict["body"]) ?? "") : "";
-            string htmlUrl = dict.ContainsKey("html_url") ? (Convert.ToString(dict["html_url"]) ?? "") : "";
-            if (string.IsNullOrEmpty(htmlUrl)) htmlUrl = ReleasePageUrl;
+            string body = ExtractChangelogValue(dict);
+            string htmlUrl = dict.ContainsKey("release_url") ? (Convert.ToString(dict["release_url"]) ?? "") : "";
+            if (string.IsNullOrWhiteSpace(htmlUrl)) htmlUrl = ReleasePageUrl;
 
-            string setupUrl = "", setupName = "", sumsUrl = "";
-            int bestPriority = 0;
-            System.Collections.IEnumerable assets = dict.ContainsKey("assets") ? dict["assets"] as System.Collections.IEnumerable : null;
-            if (assets != null)
+            string setupUrl = dict.ContainsKey("download_url") ? (Convert.ToString(dict["download_url"]) ?? "").Trim() : "";
+            if (string.IsNullOrWhiteSpace(setupUrl))
             {
-                foreach (object o in assets)
-                {
-                    var a = o as Dictionary<string, object>;
-                    if (a == null) continue;
-                    string nm = Convert.ToString(a.ContainsKey("name") ? a["name"] : "") ?? "";
-                    string dl = Convert.ToString(a.ContainsKey("browser_download_url") ? a["browser_download_url"] : "") ?? "";
-                    string low = nm.ToLowerInvariant();
-                    if (low == "sha256sums.txt") { sumsUrl = dl; continue; }
-                    if (!low.EndsWith(".exe")) continue;
-                    int pri = low == "dynamicislandwin_setup.exe" ? 3 : (low == "dinamicisland-setup.exe" ? 2 : (low.Contains("setup") ? 1 : 0));
-                    if (pri > bestPriority) { bestPriority = pri; setupUrl = dl; setupName = nm; }
-                }
+                setupUrl = fallbackSetupUrl;
+            }
+            else if (!setupUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                     !setupUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                string relPath = setupUrl.TrimStart('/');
+                if (!relPath.StartsWith("release/", StringComparison.OrdinalIgnoreCase))
+                    relPath = "release/" + relPath;
+                setupUrl = "https://raw.githubusercontent.com/" + repo + "/main/" + relPath;
+            }
+
+            string sha = "";
+            if (dict.ContainsKey("sha256") && dict["sha256"] != null)
+            {
+                string rawSha = (Convert.ToString(dict["sha256"]) ?? "").Trim().ToLowerInvariant();
+                if (rawSha.Length == 64) sha = rawSha;
             }
 
             if (vNew > vCur)
@@ -4604,12 +4685,6 @@ namespace DynamicIslandWin
                     StatusText = "v" + CurrentVersionStr + " (Пропущена v" + tag + ")";
                     State = UpdateCheckState.UpToDate;
                     return;
-                }
-
-                string sha = "";
-                if (!string.IsNullOrEmpty(sumsUrl) && !string.IsNullOrEmpty(setupName))
-                {
-                    try { sha = ExtractSha(HttpGetString(sumsUrl, 7000), setupName); } catch { sha = ""; }
                 }
 
                 string previous = LatestVersionStr;
@@ -4634,7 +4709,7 @@ namespace DynamicIslandWin
 
             _hasUpdate = false;
             LatestVersionStr = tag;
-            StatusText = "Установлена последняя версия v" + CurrentVersionStr;
+            StatusText = "Установлена актуальная v" + CurrentVersionStr;
             State = UpdateCheckState.UpToDate;
         }
 
@@ -4643,7 +4718,7 @@ namespace DynamicIslandWin
             if (IsDownloading) return;
             if (string.IsNullOrEmpty(DownloadUrl))
             {
-                try { Process.Start(new ProcessStartInfo(string.IsNullOrEmpty(ReleasePageUrl) ? ("https://github.com/" + DefaultRepo + "/releases") : ReleasePageUrl) { UseShellExecute = true }); } catch { }
+                try { Process.Start(new ProcessStartInfo(string.IsNullOrEmpty(ReleasePageUrl) ? ("https://github.com/" + DefaultRepo + "/tree/main/release") : ReleasePageUrl) { UseShellExecute = true }); } catch { }
                 return;
             }
 
@@ -4974,7 +5049,7 @@ namespace DynamicIslandWin
 
                 string sha = _um.ExpectedSha256;
                 using (var sb = new SolidBrush(ColDim))
-                    g.DrawString(string.IsNullOrEmpty(sha) ? "SHA-256: НЕ ОПУБЛИКОВАН В РЕЛИЗЕ" : ("SHA-256: " + sha.Substring(0, 16) + "…  ПРОВЕРКА ВКЛЮЧЕНА"),
+                    g.DrawString(string.IsNullOrEmpty(sha) ? ("ИСТОЧНИК: " + _um.RepoSlug + "/main/release  •  PE-ПРОВЕРКА ВКЛЮЧЕНА") : ("SHA-256: " + sha.Substring(0, 16) + "…  ПРОВЕРКА ВКЛЮЧЕНА"),
                         _fTiny, sb, new RectangleF(body.X, btnY - 14, body.Width, 12), _sfL);
 
                 Btn(g, new RectangleF(body.X, btnY + 2, 214, 30), "ОБНОВИТЬ СЕЙЧАС", 1, delegate { _um.StartDownloadAndApplyAsync(); Invalidate(); });
@@ -5017,11 +5092,11 @@ namespace DynamicIslandWin
             string head = "";
             string sub = "";
             Color headCol = ColText;
-            if (st == UpdateCheckState.Checking) { head = "ПРОВЕРКА ОБНОВЛЕНИЙ…"; sub = "Запрос к GitHub Releases: " + _um.RepoSlug; }
+            if (st == UpdateCheckState.Checking) { head = "ПРОВЕРКА ОБНОВЛЕНИЙ…"; sub = "Запрос к main/release/version.json: " + _um.RepoSlug; }
             else if (st == UpdateCheckState.UpToDate) { head = "✓ ВЫ НА АКТУАЛЬНОЙ ВЕРСИИ"; sub = "Установлена v" + UpdateManager.CurrentVersionStr + "  •  " + _um.RepoSlug; headCol = ColLime; }
             else if (st == UpdateCheckState.NoReleases) { head = "РЕЛИЗОВ ПОКА НЕТ"; sub = _um.ErrorText; headCol = Color.FromArgb(255, 189, 46); }
             else if (st == UpdateCheckState.Error) { head = "ОШИБКА ПРОВЕРКИ"; sub = _um.ErrorText; headCol = Color.FromArgb(255, 105, 95); }
-            else { head = "ЦЕНТР ОБНОВЛЕНИЙ"; sub = "Нажмите «ПРОВЕРИТЬ» для запроса к GitHub Releases."; }
+            else { head = "ЦЕНТР ОБНОВЛЕНИЙ"; sub = "Нажмите «ПРОВЕРИТЬ» для проверки main/release/version.json."; }
 
             using (var hb = new SolidBrush(headCol))
                 g.DrawString(head, _fHead, hb, new RectangleF(body.X, body.Y + 58, body.Width, 34), _sfC);
@@ -5046,7 +5121,7 @@ namespace DynamicIslandWin
 
             if (st == UpdateCheckState.NoReleases)
             {
-                Btn(g, new RectangleF(body.X, btnY, 250, 32), "ОТКРЫТЬ РЕЛИЗЫ НА GITHUB", 1, delegate { DoOpenReleases(); });
+                Btn(g, new RectangleF(body.X, btnY, 250, 32), "ОТКРЫТЬ ПАПКУ RELEASE", 1, delegate { DoOpenReleases(); });
                 Btn(g, new RectangleF(body.X + 258, btnY, body.Width - 258, 32), "ПРОВЕРИТЬ СНОВА", 0, delegate { DoCheck(); });
             }
             else if (st == UpdateCheckState.Error)
@@ -5056,7 +5131,7 @@ namespace DynamicIslandWin
                     if (_um.IsUpdateAvailable && !string.IsNullOrEmpty(_um.DownloadUrl)) _um.StartDownloadAndApplyAsync(); else DoCheck();
                     Invalidate();
                 });
-                Btn(g, new RectangleF(body.X + 258, btnY, body.Width - 258, 32), "ОТКРЫТЬ РЕЛИЗЫ НА GITHUB", 0, delegate { DoOpenReleases(); });
+                Btn(g, new RectangleF(body.X + 258, btnY, body.Width - 258, 32), "ОТКРЫТЬ ПАПКУ RELEASE", 0, delegate { DoOpenReleases(); });
             }
             else
             {
