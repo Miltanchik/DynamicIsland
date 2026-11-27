@@ -3677,6 +3677,7 @@ namespace DynamicIslandWin
         private readonly Font _fTiny = new Font("Consolas", 7.8f, FontStyle.Bold);
         private readonly Font _fBody = new Font("Segoe UI", 9.0f, FontStyle.Regular);
         private readonly Font _fBtn = new Font("Consolas", 8.2f, FontStyle.Bold);
+        private readonly Font _fHead = new Font("Consolas", 14f, FontStyle.Bold);
         private readonly StringFormat _sfC = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
         private readonly StringFormat _sfL = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
 
@@ -3927,7 +3928,7 @@ namespace DynamicIslandWin
             else { head = "ЦЕНТР ОБНОВЛЕНИЙ"; sub = "Нажмите «ПРОВЕРИТЬ» для запроса к GitHub Releases."; }
 
             using (var hb = new SolidBrush(headCol))
-                g.DrawString(head, new Font("Consolas", 14f, FontStyle.Bold), hb, new RectangleF(body.X, body.Y + 58, body.Width, 34), _sfC);
+                g.DrawString(head, _fHead, hb, new RectangleF(body.X, body.Y + 58, body.Width, 34), _sfC);
             using (var sb = new SolidBrush(ColMuted))
             {
                 var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Near };
@@ -5995,6 +5996,13 @@ namespace DynamicIslandWin
         private readonly ScreenshotVaultManager _screenshotVault = new ScreenshotVaultManager();
         private readonly DownloadWatchdogService _watchdog = new DownloadWatchdogService();
         private readonly UpdateManager _updater = new UpdateManager();
+        private int _lastGameRenderTick = 0;
+        private bool _gameRenderPending = false;
+        private int _fsLastTrueTick = 0;
+        private int _lastTopmostAssertTick = 0;
+        private volatile bool _pendingUpdatePopup = false;
+        private UpdateDialogForm _updateDialog = null;
+        private System.Windows.Forms.Timer _relayoutTimer = null;
 
         private bool _ghostModeActive = false;
         private bool _ghostUnlockedByUser = false;
@@ -6183,17 +6191,32 @@ namespace DynamicIslandWin
         private void OnDisplaySettingsChanged(object sender, EventArgs e)
         {
             if (_disposing || !IsHandleCreated) return;
-            try
-            {
-                BeginInvoke((MethodInvoker)delegate
-                {
-                    EnsureCachedFonts();
-                    PositionOnMonitor(_config.monitor_index);
-                    WakeRenderLoop();
-                    RenderLayeredFrame();
-                });
-            }
+            try { BeginInvoke((MethodInvoker)delegate { ScheduleDisplayRelayout(); }); }
             catch { }
+        }
+
+        // Games switch display modes in bursts (WM_DISPLAYCHANGE storm): coalesce into ONE relayout after 450ms of silence
+        private void ScheduleDisplayRelayout()
+        {
+            if (_disposing || !IsHandleCreated) return;
+            if (_relayoutTimer == null)
+            {
+                _relayoutTimer = new System.Windows.Forms.Timer { Interval = 450 };
+                _relayoutTimer.Tick += delegate
+                {
+                    _relayoutTimer.Stop();
+                    try
+                    {
+                        EnsureCachedFonts();
+                        PositionOnMonitor(_config.monitor_index);
+                        WakeRenderLoop();
+                        RenderLayeredFrame();
+                    }
+                    catch { }
+                };
+            }
+            _relayoutTimer.Stop();
+            _relayoutTimer.Start();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -6235,6 +6258,9 @@ namespace DynamicIslandWin
             }
         }
 
+        // The overlay must NEVER take focus (games, Alt+Tab, startup over a fullscreen app)
+        protected override bool ShowWithoutActivation { get { return true; } }
+
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
@@ -6247,6 +6273,12 @@ namespace DynamicIslandWin
                 _bgStateDirty = true;
             };
             _updater.OnStateChanged += () => { _bgStateDirty = true; WakeRenderLoop(); };
+            _updater.UpdateAvailableDetected += () => { _pendingUpdatePopup = true; WakeRenderLoop(); };
+            _updater.RestartRequested += () =>
+            {
+                try { BeginInvoke((MethodInvoker)delegate { Application.Exit(); }); }
+                catch { Application.Exit(); }
+            };
             _audio.OnAudioEndpointChanged += () => { _bgStateDirty = true; _bgWakeEvent.Set(); WakeRenderLoop(); };
             SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
             SystemEvents.SessionEnding += (s, args) =>
@@ -6262,12 +6294,12 @@ namespace DynamicIslandWin
                     evType != NativeWin32.EVENT_SYSTEM_MINIMIZEEND)
                     return;
 
-                if (_mode == IslandMode.Expanded && _expandedPage == 1 && IsHandleCreated)
+                if (_mode == IslandMode.Expanded && _expandedPage == 1 && IsHandleCreated && !_isFullscreenAppActive)
                 {
                     try
                     {
                         var src = _streamEngine.GetActiveSource(Handle);
-                        if (src != null && (hwnd == src.Hwnd || evType == NativeWin32.EVENT_SYSTEM_FOREGROUND))
+                        if (src != null && hwnd == src.Hwnd)
                         {
                             _dwmOverlay.EnsureStreamSourceAlive(Handle, src, _streamEngine.CropModeIndex);
                         }
@@ -6299,6 +6331,11 @@ namespace DynamicIslandWin
 
         protected override void WndProc(ref Message m)
         {
+            if (m.Msg == NativeWin32.WM_MOUSEACTIVATE)
+            {
+                m.Result = (IntPtr)NativeWin32.MA_NOACTIVATE;
+                return;
+            }
             if (m.Msg == NativeWin32.WM_CLIPBOARDUPDATE)
             {
                 if (_config.enable_screenshot_vault)
@@ -6345,10 +6382,7 @@ namespace DynamicIslandWin
             }
             else if (m.Msg == NativeWin32.WM_DISPLAYCHANGE || m.Msg == NativeWin32.WM_DPICHANGED)
             {
-                EnsureCachedFonts();
-                PositionOnMonitor(_config.monitor_index);
-                WakeRenderLoop();
-                RenderLayeredFrame();
+                ScheduleDisplayRelayout();
             }
             base.WndProc(ref m);
         }
@@ -6431,6 +6465,11 @@ namespace DynamicIslandWin
         private void WakeRenderLoop()
         {
             if (_disposing || _isSystemSuspended) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke((MethodInvoker)delegate { WakeRenderLoop(); }); } catch { }
+                return;
+            }
             if (_frameTimer != null)
             {
                 if (_frameTimer.Interval != 14) _frameTimer.Interval = 14;
@@ -7688,6 +7727,23 @@ namespace DynamicIslandWin
             menu.Show(screenPt);
         }
 
+        public void ShowUpdateDialog(bool manual, IWin32Window owner)
+        {
+            if (_updateDialog != null && !_updateDialog.IsDisposed)
+            {
+                try { _updateDialog.Activate(); } catch { }
+                return;
+            }
+            if (manual && !_updater.IsUpdateAvailable && !_updater.IsDownloading)
+                _updater.CheckForUpdatesAsync(_config, true);
+
+            var dlg = new UpdateDialogForm(_updater, _config, !manual);
+            _updateDialog = dlg;
+            dlg.FormClosed += delegate { _updateDialog = null; };
+            if (manual) dlg.ShowDialog(owner ?? this);
+            else dlg.Show();
+        }
+
         public void OpenSettingsDialog()
         {
             using (var dlg = new SettingsForm(_config))
@@ -7704,13 +7760,8 @@ namespace DynamicIslandWin
                     PositionOnMonitor(_config.monitor_index);
                     RenderLayeredFrame();
                 };
-                dlg.ManualUpdateCheckRequested += () =>
-                {
-                    _updater.CheckForUpdatesAsync(_config, true);
-                    _expandedPage = 2;
-                    ExpandIsland();
-                    RenderLayeredFrame();
-                };
+                dlg.Updater = _updater;
+                dlg.ManualUpdateCheckRequested += () => ShowUpdateDialog(true, dlg);
                 dlg.ShowDialog(this);
             }
         }
@@ -9189,6 +9240,7 @@ namespace DynamicIslandWin
                 var trayMenu = new ContextMenuStrip();
                 trayMenu.Items.Add("Раскрыть островок", null, (s, e) => mainForm.ExpandIsland());
                 trayMenu.Items.Add("Пульт настроек (Kinetic Stage & Deck)...", null, (s, e) => mainForm.OpenSettingsDialog());
+                trayMenu.Items.Add("Проверить обновления...", null, (s, e) => mainForm.ShowUpdateDialog(true, null));
                 trayMenu.Items.Add("Сбросить позицию по центру", null, (s, e) =>
                 {
                     var cfg = ConfigManager.Load();
