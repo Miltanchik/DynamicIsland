@@ -8124,6 +8124,23 @@ namespace DynamicIslandWin
         private VaultCaptureItem _pendingDragVaultItem = null;
         private Point _vaultDragStartPt;
 
+        private readonly uint _ourProcessId = (uint)Process.GetCurrentProcess().Id;
+        private volatile int _ownDialogOrMenuDepth = 0;
+        private int _lastZOrderCheckTick = 0;
+        private bool _wasSuppressedTopMost = false;
+        private volatile bool _isVideoPlayingActive = false;
+        private volatile bool _hiddenByVideo = false;
+        private int _pressedDockIndex = -1;
+        private PinnedAppItem _pressedDockItem = null;
+        private Point _dockMouseDownPt;
+        private float _dockGrabOffsetX = 17f;
+        private float _dockDragCurrentX = 0f;
+        private float _dockRowStartX = 0f;
+        private int _dockVisibleCount = 0;
+        private bool _isDraggingDockApp = false;
+        private bool _dockSettleAnimating = false;
+        private readonly Dictionary<string, float> _dockVisualX = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+
         private bool _clickThroughActive = false;
         private bool _isHovered = false;
         private volatile bool _hiddenByFullscreen = false;
@@ -8211,7 +8228,7 @@ namespace DynamicIslandWin
             _collapseTimer = new System.Windows.Forms.Timer { Interval = _config.collapse_delay_ms };
             _collapseTimer.Tick += (s, e) =>
             {
-                if (_lctrlHeld || _isResizingWithLCtrl || _expandedPage == 1) return;
+                if (_lctrlHeld || _isResizingWithLCtrl || _expandedPage == 1 || _isDraggingDockApp || _ownDialogOrMenuDepth > 0) return;
                 _collapseTimer.Stop();
                 if (!_isHovered) CollapseToIdle();
             };
@@ -8420,6 +8437,19 @@ namespace DynamicIslandWin
 
                 _bgWakeEvent.Set();
                 WakeRenderLoop();
+                if ((evType == NativeWin32.EVENT_SYSTEM_FOREGROUND || evType == NativeWin32.EVENT_SYSTEM_MINIMIZEEND) &&
+                    hwnd != Handle && !_disposing && IsHandleCreated)
+                {
+                    AssertIslandTopMostSafe(false, true);
+                    ThreadPool.QueueUserWorkItem(_ =>
+                    {
+                        Thread.Sleep(95);
+                        if (!_disposing && IsHandleCreated)
+                        {
+                            try { BeginInvoke((MethodInvoker)delegate { AssertIslandTopMostSafe(false, false); }); } catch { }
+                        }
+                    });
+                }
             };
             try
             {
@@ -8471,6 +8501,24 @@ namespace DynamicIslandWin
                 m.Result = (IntPtr)NativeWin32.MA_NOACTIVATE;
                 return;
             }
+            if (m.Msg == NativeWin32.WM_WINDOWPOSCHANGING && m.LParam != IntPtr.Zero)
+            {
+                try
+                {
+                    var wp = (NativeWin32.WINDOWPOS)Marshal.PtrToStructure(m.LParam, typeof(NativeWin32.WINDOWPOS));
+                    wp.flags |= NativeWin32.SWP_NOACTIVATE;
+                    if (!ShouldSuppressTopMostAssertion() && (wp.flags & NativeWin32.SWP_NOZORDER) == 0)
+                    {
+                        bool allowAboveStream = (_expandedPage == 1 && _dwmOverlay != null && _dwmOverlay.IsHandleCreated && wp.hwndInsertAfter == _dwmOverlay.Handle);
+                        if (!allowAboveStream && wp.hwndInsertAfter != NativeWin32.HWND_TOPMOST)
+                        {
+                            wp.hwndInsertAfter = NativeWin32.HWND_TOPMOST;
+                        }
+                    }
+                    Marshal.StructureToPtr(wp, m.LParam, false);
+                }
+                catch { }
+            }
             if (m.Msg == NativeWin32.WM_CLIPBOARDUPDATE)
             {
                 if (_config.enable_screenshot_vault)
@@ -8520,6 +8568,66 @@ namespace DynamicIslandWin
                 ScheduleDisplayRelayout();
             }
             base.WndProc(ref m);
+        }
+
+        private bool ShouldSuppressTopMostAssertion()
+        {
+            if (_disposing || _isSystemSuspended || !IsHandleCreated) return true;
+            if (_ownDialogOrMenuDepth > 0) return true;
+            if (_updateDialog != null && !_updateDialog.IsDisposed && _updateDialog.Visible) return true;
+            if (NativeWin32.IsAltTabHeld() || SystemSensors.IsTransientShellForeground()) return true;
+            if (_hiddenByFullscreen || _hiddenByVideo) return true;
+            if (_config.hide_on_video_playback && _isVideoPlayingActive && _expandedPage != 1 && !_ghostUnlockedByUser) return true;
+            if (_isFullscreenAppActive && _expandedPage != 1)
+            {
+                // Respect fullscreen game exceptions: never pop above game in Auto-Hide or Click-Only modes
+                if (_config.hide_in_fullscreen || _config.fullscreen_mode == "Авто-скрытие" || _config.fullscreen_mode == "Только по клику")
+                    return true;
+            }
+            return false;
+        }
+
+        private bool IsIslandBelowAnyExternalWindow()
+        {
+            if (!IsHandleCreated) return false;
+            try
+            {
+                IntPtr cur = NativeWin32.GetWindow(Handle, NativeWin32.GW_HWNDPREV);
+                int steps = 0;
+                while (cur != IntPtr.Zero && steps < 45)
+                {
+                    steps++;
+                    if (NativeWin32.IsWindowVisible(cur) && !NativeWin32.IsIconic(cur))
+                    {
+                        uint pid;
+                        NativeWin32.GetWindowThreadProcessId(cur, out pid);
+                        if (pid != 0 && pid != _ourProcessId)
+                        {
+                            NativeWin32.RECT r;
+                            if (NativeWin32.GetWindowRect(cur, out r) && (r.Right - r.Left) > 4 && (r.Bottom - r.Top) > 4)
+                                return true;
+                        }
+                    }
+                    cur = NativeWin32.GetWindow(cur, NativeWin32.GW_HWNDPREV);
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private void AssertIslandTopMostSafe(bool force, bool asyncCrossThread = false)
+        {
+            if (ShouldSuppressTopMostAssertion()) return;
+            if (!force && !IsIslandBelowAnyExternalWindow()) return;
+
+            uint flags = NativeWin32.SWP_NOMOVE | NativeWin32.SWP_NOSIZE | NativeWin32.SWP_NOACTIVATE | NativeWin32.SWP_NOOWNERZORDER;
+            if (asyncCrossThread) flags |= NativeWin32.SWP_ASYNCWINDOWPOS;
+
+            NativeWin32.SetWindowPos(Handle, NativeWin32.HWND_TOPMOST, 0, 0, 0, 0, flags);
+            if (_expandedPage == 1 && _dwmOverlay != null && _dwmOverlay.IsHandleCreated && _dwmOverlay.Visible)
+            {
+                NativeWin32.SetWindowPos(_dwmOverlay.Handle, NativeWin32.HWND_TOPMOST, 0, 0, 0, 0, flags);
+            }
         }
 
         public void PositionOnMonitor(int monitorIdx)
@@ -8629,7 +8737,7 @@ namespace DynamicIslandWin
 
         public void CollapseToIdle()
         {
-            if (_isHovered || _lctrlHeld || _isResizingWithLCtrl || _expandedPage == 1) return;
+            if (_isHovered || _lctrlHeld || _isResizingWithLCtrl || _expandedPage == 1 || _isDraggingDockApp || _ownDialogOrMenuDepth > 0) return;
             _liveBannerText = "";
             _mode = IslandMode.Idle;
             StartSpringTransition(_config.idle_width, _config.idle_height, 0.0f, Math.Max(130, (int)(_config.anim_duration_ms * 0.80f)), false);
