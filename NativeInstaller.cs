@@ -19,8 +19,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("100% Self-Contained Single-File Installer for Dynamic Island Windows 10/11")]
 [assembly: AssemblyProduct("Dynamic Island Studio Setup")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
-[assembly: AssemblyVersion("3.1.2.0")]
-[assembly: AssemblyFileVersion("3.1.2.0")]
+[assembly: AssemblyVersion("3.1.3.0")]
+[assembly: AssemblyFileVersion("3.1.3.0")]
 
 namespace DynamicIslandSetup
 {
@@ -32,6 +32,39 @@ namespace DynamicIslandSetup
         [DllImport("shell32.dll")] public static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
         [DllImport("user32.dll")]
         public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern uint RegisterWindowMessageW(string lpString);
+        [DllImport("user32.dll")]
+        public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+        public static void GracefulStopRunningApp()
+        {
+            int myPid = Process.GetCurrentProcess().Id;
+            uint msg = RegisterWindowMessageW("DynamicIslandWin_GracefulShutdown_v3");
+            if (msg != 0)
+            {
+                IntPtr res;
+                SendMessageTimeout(new IntPtr(0xFFFF), msg, IntPtr.Zero, IntPtr.Zero, 0x0002, 500, out res);
+            }
+            int waited = 0;
+            while (waited < 1600)
+            {
+                bool alive = false;
+                foreach (Process p in Process.GetProcessesByName("DynamicIslandWin"))
+                {
+                    if (p.Id != myPid && !p.HasExited) { alive = true; break; }
+                }
+                if (!alive) return;
+                Thread.Sleep(80);
+                waited += 80;
+            }
+            foreach (Process p in Process.GetProcessesByName("DynamicIslandWin"))
+            {
+                if (p.Id != myPid)
+                {
+                    try { if (!p.HasExited) { p.Kill(); p.WaitForExit(800); } } catch { }
+                }
+            }
+        }
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -372,11 +405,11 @@ namespace DynamicIslandSetup
                 }
                 catch { }
 
-                if (oldVer != "3.1.2.0")
+                if (oldVer != "3.1.3.0")
                 {
                     var ans = MessageBox.Show(
                         this,
-                        string.Format("На вашем ПК уже установлена версия Dynamic Island v{0}.\n\nОбновить Dynamic Island с v{0} до v3.1.2 Studio Pro (с сохранением всех ваших настроек)?", oldVer),
+                        string.Format("На вашем ПК уже установлена версия Dynamic Island v{0}.\n\nОбновить Dynamic Island с v{0} до v3.1.3 Studio Pro (с сохранением всех ваших настроек)?", oldVer),
                         "Обновление Dynamic Island",
                         MessageBoxButtons.YesNo,
                         MessageBoxIcon.Question);
@@ -390,14 +423,7 @@ namespace DynamicIslandSetup
             {
                 StepProgress(0.20f, "Остановка запущенных экземпляров...", silent ? 5 : 90);
 
-                int myPid = Process.GetCurrentProcess().Id;
-                foreach (Process p in Process.GetProcessesByName("DynamicIslandWin"))
-                {
-                    if (p.Id != myPid)
-                    {
-                        try { p.Kill(); p.WaitForExit(1200); } catch { }
-                    }
-                }
+                NativeWin32.GracefulStopRunningApp();
 
                 if (!Directory.Exists(_installDir))
                     Directory.CreateDirectory(_installDir);
@@ -462,7 +488,7 @@ namespace DynamicIslandSetup
                         if (k != null)
                         {
                             k.SetValue("DisplayName", "Dynamic Island for Windows 10/11");
-                            k.SetValue("DisplayVersion", "3.1.2");
+                            k.SetValue("DisplayVersion", "3.1.3");
                             k.SetValue("Publisher", "DynamicIslandWin Studio");
                             k.SetValue("DisplayIcon", targetExe);
                             k.SetValue("InstallLocation", _installDir);
@@ -500,6 +526,7 @@ namespace DynamicIslandSetup
                     Process.Start(new ProcessStartInfo
                     {
                         FileName = targetExe,
+                        Arguments = "--replace",
                         WorkingDirectory = _installDir,
                         UseShellExecute = false
                     });
@@ -510,7 +537,7 @@ namespace DynamicIslandSetup
                     TopMost = false;
                     MessageBox.Show(
                         this,
-                        "Dynamic Island v3.1.2 Studio Pro успешно установлен!\n\n" +
+                        "Dynamic Island v3.1.3 Studio Pro успешно установлен!\n\n" +
                         "• Папка установки: " + _installDir + "\n" +
                         "• Ярлык «Dynamic Island» создан на Рабочем столе\n" +
                         "• Островок уже запущен в верхней части вашего экрана!",
@@ -538,10 +565,7 @@ namespace DynamicIslandSetup
         {
             try
             {
-                foreach (Process p in Process.GetProcessesByName("DynamicIslandWin"))
-                {
-                    try { p.Kill(); p.WaitForExit(1000); } catch { }
-                }
+                NativeWin32.GracefulStopRunningApp();
 
                 string desktopLnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Dynamic Island.lnk");
                 string startLnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Dynamic Island.lnk");

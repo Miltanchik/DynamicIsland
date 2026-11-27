@@ -33,8 +33,8 @@ using System.Reflection;
 [assembly: AssemblyProduct("Dynamic Island Studio")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("3.1.2.0")]
-[assembly: AssemblyFileVersion("3.1.2.0")]
+[assembly: AssemblyVersion("3.1.3.0")]
+[assembly: AssemblyFileVersion("3.1.3.0")]
 namespace DynamicIslandWin
 {
     // =========================================================================
@@ -831,42 +831,62 @@ namespace DynamicIslandWin
                         NativeWin32.GetWindowRect(target, out _parkedNormalRect);
                         _parkedWasZoomed = false;
                     }
+                    if (_parkedNormalRect.Right - _parkedNormalRect.Left < 400 || _parkedNormalRect.Bottom - _parkedNormalRect.Top < 300)
+                    {
+                        _parkedNormalRect = new NativeWin32.RECT
+                        {
+                            Left = work.Left + Math.Max(40, (work.Width - 1180) / 2),
+                            Top = work.Top + Math.Max(30, (work.Height - 720) / 2),
+                            Right = work.Left + Math.Max(40, (work.Width - 1180) / 2) + 1180,
+                            Bottom = work.Top + Math.Max(30, (work.Height - 720) / 2) + 720
+                        };
+                    }
                     _parkedHwnd = target;
                 }
 
                 _parkedTick = Environment.TickCount;
                 IntPtr prevFg = NativeWin32.GetForegroundWindow();
 
-                NativeWin32.ShowWindow(target, NativeWin32.SW_SHOWNOACTIVATE);
+                // Exit SW_MINIMIZE without stealing focus so Windows & Chromium resume WebRTC <video> swapchain rendering
+                if (NativeWin32.IsIconic(target))
+                    NativeWin32.ShowWindow(target, NativeWin32.SW_SHOWNOACTIVATE);
                 if (NativeWin32.IsIconic(target))
                     NativeWin32.ShowWindow(target, NativeWin32.SW_RESTORE);
                 if (NativeWin32.IsZoomed(target))
                     NativeWin32.ShowWindow(target, NativeWin32.SW_SHOWNOACTIVATE);
 
-                int parkW = _parkedWasZoomed
-                    ? Math.Max(960, work.Width)
-                    : Math.Max(820, _parkedNormalRect.Right - _parkedNormalRect.Left);
-                int parkH = _parkedWasZoomed
-                    ? Math.Max(600, work.Height)
-                    : Math.Max(540, _parkedNormalRect.Bottom - _parkedNormalRect.Top);
+                int maxParkW = Math.Max(640, bounds.Width - 32);
+                int maxParkH = Math.Max(480, bounds.Height - 32);
+                int desiredW = _parkedWasZoomed
+                    ? Math.Min(maxParkW, Math.Max(960, work.Width - 40))
+                    : Math.Min(maxParkW, Math.Max(860, _parkedNormalRect.Right - _parkedNormalRect.Left));
+                int desiredH = _parkedWasZoomed
+                    ? Math.Min(maxParkH, Math.Max(600, work.Height - 20))
+                    : Math.Min(maxParkH, Math.Max(560, _parkedNormalRect.Bottom - _parkedNormalRect.Top));
 
-                // Park at bottom-right seam (8px inside right edge, spanning 2px above & 46px behind WS_EX_LAYERED taskbar):
-                // 1) Completely invisible to the user (looks minimized)
-                // 2) Non-empty monitor intersection + unoccluded by maximized windows -> Chromium NativeWindowOcclusionTrackerWin keeps WebRTC <video> live at 60 FPS!
-                int parkX = bounds.Right - 8;
-                int parkY = work.Bottom - 2;
+                // CRITICAL DComp + Chromium Occlusion Fix:
+                // 1) Keep 100% of parkW x parkH INSIDE scr.Bounds so DirectComposition NEVER clips the hardware YUV <video> surface to black!
+                // 2) Align bottom edge with bounds.Bottom (extending behind the WS_EX_LAYERED Windows Taskbar) so even when a browser or
+                //    borderless game is maximized over 100% of WorkingArea, Chromium's NativeWindowOcclusionTrackerWin sees the taskbar-underlap
+                //    strip as unoccluded and keeps WebRTC decoding active at 60 FPS!
+                // 3) Place at HWND_BOTTOM with SWP_NOACTIVATE so it stays behind all user windows without stealing focus.
+                int parkX = bounds.Left + Math.Max(16, (bounds.Width - desiredW) / 2);
+                int parkY = Math.Max(bounds.Top + 16, bounds.Bottom - desiredH);
 
-                NativeWin32.SetWindowPos(target, NativeWin32.HWND_BOTTOM, parkX, parkY, parkW, parkH,
+                NativeWin32.SetWindowPos(target, NativeWin32.HWND_BOTTOM, parkX, parkY, desiredW, desiredH,
                     NativeWin32.SWP_NOACTIVATE | NativeWin32.SWP_SHOWWINDOW);
 
                 NativeWin32.PostMessage(target, NativeWin32.WM_NCACTIVATE, new IntPtr(1), IntPtr.Zero);
                 NativeWin32.PostMessage(target, NativeWin32.WM_ACTIVATE, new IntPtr(1), IntPtr.Zero);
 
-                if (prevFg != IntPtr.Zero && prevFg != target)
+                if (prevFg != IntPtr.Zero && prevFg != target && NativeWin32.IsWindow(prevFg))
                     NativeWin32.SetForegroundWindow(prevFg);
 
+                // Force DWM thumbnail re-registration because DWM invalidates/freezes the surface handle across iconic transitions!
+                UnregisterThumb();
                 _lastSrcW = -1;
                 _lastSrcH = -1;
+                _lastCropMode = -1;
             }
             catch { }
         }
@@ -919,11 +939,11 @@ namespace DynamicIslandWin
 
             if (_parkedHwnd == target && !NativeWin32.IsIconic(target))
             {
-                // If the user clicked Discord on the Taskbar or Alt+Tab to bring it back up, restore its original desktop rect immediately!
-                if ((Environment.TickCount - _parkedTick) > 650 && NativeWin32.GetForegroundWindow() == target)
+                // If user clicked Discord on the Taskbar or Alt+Tab to bring it to front, restore its original normal/maximized placement!
+                if (unchecked(Environment.TickCount - _parkedTick) > 650 && NativeWin32.GetForegroundWindow() == target)
                 {
                     RestoreParkedWindow(true);
-                    _lastSrcW = -1;
+                    UnregisterThumb();
                     if (_lastW > 30 && _lastH > 30)
                         SyncHardwareStream(ownerHwnd, _lastX, _lastY, _lastW, _lastH, src, cropModeIndex);
                     return;
@@ -936,13 +956,22 @@ namespace DynamicIslandWin
                 if (_lastW > 30 && _lastH > 30)
                     SyncHardwareStream(ownerHwnd, _lastX, _lastY, _lastW, _lastH, src, cropModeIndex);
             }
-            else if (_lastW > 30 && _lastH > 30 && _thumbId != IntPtr.Zero)
+            else if (_lastW > 30 && _lastH > 30)
             {
-                NativeWin32.SIZE curSz;
-                if (NativeWin32.DwmQueryThumbnailSourceSize(_thumbId, out curSz) == 0 &&
-                    (curSz.cx != _lastSrcW || curSz.cy != _lastSrcH))
+                if (_thumbId == IntPtr.Zero || _boundSourceHwnd != target)
                 {
                     SyncHardwareStream(ownerHwnd, _lastX, _lastY, _lastW, _lastH, src, cropModeIndex);
+                }
+                else
+                {
+                    NativeWin32.SIZE curSz;
+                    if (NativeWin32.DwmQueryThumbnailSourceSize(_thumbId, out curSz) != 0 ||
+                        curSz.cx < 40 || curSz.cy < 40 ||
+                        curSz.cx != _lastSrcW || curSz.cy != _lastSrcH)
+                    {
+                        if (curSz.cx < 40 || curSz.cy < 40) UnregisterThumb();
+                        SyncHardwareStream(ownerHwnd, _lastX, _lastY, _lastW, _lastH, src, cropModeIndex);
+                    }
                 }
             }
         }
@@ -3209,11 +3238,220 @@ namespace DynamicIslandWin
     }
     public static class SystemSensors
     {
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize);
+
         private static readonly string[] TransientShellClasses = new string[]
         {
             "MultitaskingViewFrame", "XamlExplorerHostIslandWindow", "TaskSwitcherWnd", "TaskSwitcherOverlayWnd",
             "ForegroundStaging", "TaskListThumbnailWnd", "TaskListOverlayWnd", "Shell_InputSwitchTopLevelWindow"
         };
+
+        // Explicit Non-Game Process Blacklist (Browsers, Messengers, Media/Video Players, Shells, IDEs, Office, Game Launchers)
+        private static readonly HashSet<string> NonGameProcessBlacklist = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            // Browsers
+            "chrome", "msedge", "opera", "opera_gx", "firefox", "yandex", "browser", "brave", "vivaldi",
+            "waterfox", "tor", "arc", "zen", "maxthon", "iexplore", "whale", "thorium", "librewolf", "floorp",
+            // Messengers, Voice & Streaming / Capture Apps
+            "discord", "discordptb", "discordcanary", "telegram", "ayugram", "kotatogram", "unigram",
+            "whatsapp", "viber", "skype", "slack", "teams", "ms-teams", "zoom", "obs64", "obs32", "streamlabs", "sharex",
+            // Video & Audio Players
+            "vlc", "mpv", "mpc-hc", "mpc-hc64", "mpc-be", "mpc-be64", "potplayer", "potplayermini", "potplayermini64",
+            "kmplayer", "gom", "gom64", "wmplayer", "video.ui", "music.ui", "zunemusic", "microsoft.media.player",
+            "yandexmusic", "яндекс музыка", "spotify", "aimp", "foobar2000", "itunes", "applemusic", "winamp", "musicbee",
+            // Windows Shell, Terminals, IDEs, Editors, Office & Viewers
+            "explorer", "searchhost", "searchapp", "shellexperiencehost", "startmenuexperiencehost", "lockapp",
+            "applicationframehost", "systemsettings", "taskmgr", "mmc", "regedit", "cmd", "powershell", "pwsh", "windowsterminal",
+            "conhost", "code", "cursor", "windsurf", "antigravity", "devenv", "rider64", "idea64", "pycharm64", "webstorm64",
+            "clion64", "goland64", "sublime_text", "notepad", "notepad++", "winword", "excel", "powerpnt", "onenote", "outlook",
+            "acrobat", "acrord32", "foxitreader", "sumatrapdf", "mspaint", "paintdotnet", "photoshop", "illustrator", "figma",
+            "canva", "blender", "obs", "nvidia share", "nvcontainer", "nvidia overlay", "amdow", "radeonsoftware",
+            // Game Storefront / Launcher Clients (menus themselves are not games; actual game binaries have their own .exe)
+            "steam", "steamwebhelper", "epicgameslauncher", "epicwebhelper", "riotclientux", "riotclientuxrender",
+            "riotclientservices", "battle.net", "agent", "galaxyclient", "eadesktop", "eabackgroundservice",
+            "ubisoftconnect", "upc", "playnite.desktopapp", "playnite.fullscreenapp",
+            // Editors & Self
+            "unrealeditor", "ue4editor", "unity", "unityhub", "godot", "dynamicislandwin", "dynamicislandwin_setup", "dinamicisland-setup"
+        };
+
+        private static readonly string[] GameInstallPathMarkers = new string[]
+        {
+            "\steamapps\common\", "\steamlibrary\", "\epic games\", "\riot games\",
+            "\xboxgames\", "\windowsapps\", "\gog galaxy\games\", "\gog games\",
+            "\ubisoft game launcher\games\", "\ea games\", "\origin games\",
+            "\battle.net\", "\battlenet\", "\games\", "\игры\", "\genshin impact\", "\honkai", "\wuthering waves\"
+        };
+
+        private static readonly string[] GameEngineWindowClasses = new string[]
+        {
+            "UnrealWindow", "UnityWndClass", "SDL_app", "GLFW30", "Valve001", "Source2",
+            "CryENGINE", "grcWindow", "RiotWindowClass", "LWJGL", "TankWindowClass",
+            "Respawn001", "ApexLegends", "CreationEngine", "SkyrimSpecialEdition", "prism", "D3D Window"
+        };
+
+        private static readonly string[] GameSiblingSignatures = new string[]
+        {
+            "UnityPlayer.dll", "GameAssembly.dll", "steam_api64.dll", "steam_api.dll",
+            "EOSSDK-Win64-Shipping.dll", "EOSSDK-Win32-Shipping.dll", "nvngx_dlss.dll",
+            "amd_fidelityfx_dx12.dll", "amd_fidelityfx_vk.dll", "libxess.dll",
+            "bink2w64.dll", "fmodstudio.dll", "AkSoundEngine.dll", "PhysX3_x64.dll",
+            "tier0.dll", "engine2.dll", "EasyAntiCheat", "BattlEye"
+        };
+
+        private struct CachedPidClassification
+        {
+            public bool IsKnownBlacklisted;
+            public bool HasPositiveGameTraits;
+            public string ExePathLower;
+            public int CachedAtTick;
+        }
+
+        private static readonly object _cacheLock = new object();
+        private static readonly Dictionary<uint, CachedPidClassification> _pidCache = new Dictionary<uint, CachedPidClassification>();
+
+        private static string TryQueryProcessPathFast(uint pid, out string procNameNoExt)
+        {
+            procNameNoExt = "";
+            string fullPath = "";
+            IntPtr hProc = IntPtr.Zero;
+            try
+            {
+                hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (hProc != IntPtr.Zero)
+                {
+                    var sb = new StringBuilder(1024);
+                    uint sz = (uint)sb.Capacity;
+                    if (QueryFullProcessImageNameW(hProc, 0, sb, ref sz) && sz > 0)
+                        fullPath = sb.ToString();
+                }
+            }
+            catch { }
+            finally
+            {
+                if (hProc != IntPtr.Zero) CloseHandle(hProc);
+            }
+
+            if (!string.IsNullOrEmpty(fullPath))
+            {
+                try { procNameNoExt = Path.GetFileNameWithoutExtension(fullPath) ?? ""; } catch { }
+                return fullPath;
+            }
+
+            try { procNameNoExt = Process.GetProcessById((int)pid).ProcessName ?? ""; } catch { }
+            return "";
+        }
+
+        private static bool HasGameFilesInDirectory(string exePath)
+        {
+            if (string.IsNullOrEmpty(exePath)) return false;
+            try
+            {
+                string fileName = Path.GetFileName(exePath) ?? "";
+                if (fileName.IndexOf("-Win64-Shipping", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    fileName.IndexOf("-WinGDK-Shipping", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+
+                string dir = Path.GetDirectoryName(exePath);
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return false;
+
+                for (int i = 0; i < GameSiblingSignatures.Length; i++)
+                {
+                    string sig = GameSiblingSignatures[i];
+                    string p1 = Path.Combine(dir, sig);
+                    if (File.Exists(p1) || Directory.Exists(p1)) return true;
+                }
+
+                // Unreal Engine / Unity subfolder layouts (e.g. Game\Binaries\Win64\Game.exe or Game_Data\)
+                string stem = Path.GetFileNameWithoutExtension(exePath) ?? "";
+                if (!string.IsNullOrEmpty(stem) && Directory.Exists(Path.Combine(dir, stem + "_Data")))
+                    return true;
+                if (dir.IndexOf("\binaries\win64", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    dir.IndexOf("\binaries\wingdk", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+            catch { }
+            return false;
+        }
+
+        private static CachedPidClassification ClassifyProcessCached(uint pid)
+        {
+            int now = Environment.TickCount;
+            lock (_cacheLock)
+            {
+                CachedPidClassification existing;
+                if (_pidCache.TryGetValue(pid, out existing) && unchecked(now - existing.CachedAtTick) < 45000)
+                    return existing;
+            }
+
+            string procName;
+            string exePath = TryQueryProcessPathFast(pid, out procName);
+            string pathLower = (exePath ?? "").ToLowerInvariant();
+            string nameTrim = (procName ?? "").Trim();
+
+            bool blacklisted = string.IsNullOrEmpty(nameTrim) || NonGameProcessBlacklist.Contains(nameTrim);
+            if (!blacklisted && !string.IsNullOrEmpty(pathLower))
+            {
+                if (pathLower.Contains("\windows\system32\") ||
+                    pathLower.Contains("\windows\explorer.exe") ||
+                    pathLower.Contains("\windows\immersivecontrolpanel\") ||
+                    pathLower.Contains("\program files\google\chrome\") ||
+                    pathLower.Contains("\program files (x86)\microsoft\edge\") ||
+                    pathLower.Contains("\appdata\local\discord\") ||
+                    pathLower.Contains("\appdata\local\programs\yandexmusic\") ||
+                    pathLower.Contains("\appdata\roaming\spotify\") ||
+                    pathLower.Contains("\appdata\roaming\telegram desktop\"))
+                {
+                    blacklisted = true;
+                }
+            }
+
+            bool positiveGame = false;
+            if (!blacklisted)
+            {
+                for (int i = 0; i < GameInstallPathMarkers.Length; i++)
+                {
+                    if (pathLower.Contains(GameInstallPathMarkers[i]))
+                    {
+                        positiveGame = true;
+                        break;
+                    }
+                }
+                if (!positiveGame && (nameTrim.Equals("javaw", StringComparison.OrdinalIgnoreCase) || nameTrim.Equals("java", StringComparison.OrdinalIgnoreCase)))
+                {
+                    // Minecraft / Java games
+                    if (pathLower.Contains("minecraft") || pathLower.Contains("curseforge") || pathLower.Contains("prismlauncher") || pathLower.Contains("modrinth") || pathLower.Contains("tlauncher") || pathLower.Contains("azul") || pathLower.Contains("adoptium") || pathLower.Contains("runtime"))
+                        positiveGame = true;
+                }
+                if (!positiveGame)
+                {
+                    positiveGame = HasGameFilesInDirectory(exePath);
+                }
+            }
+
+            var entry = new CachedPidClassification
+            {
+                IsKnownBlacklisted = blacklisted,
+                HasPositiveGameTraits = positiveGame,
+                ExePathLower = pathLower,
+                CachedAtTick = now
+            };
+
+            lock (_cacheLock)
+            {
+                if (_pidCache.Count > 256) _pidCache.Clear();
+                _pidCache[pid] = entry;
+            }
+            return entry;
+        }
 
         private static bool IsTransientShellClass(string cls, IntPtr hwnd)
         {
@@ -3243,24 +3481,80 @@ namespace DynamicIslandWin
             catch { return false; }
         }
 
-        public static bool IsForegroundAppFullscreen(IntPtr ourHwnd, Screen activeScreen)
+        public static bool IsForegroundFullscreenGame(IntPtr ourHwnd, Screen activeScreen, out bool definiteNonGameForeground)
         {
+            definiteNonGameForeground = false;
             try
             {
-                int quns;
-                if (NativeWin32.SHQueryUserNotificationState(out quns) == 0 && quns == NativeWin32.QUNS_RUNNING_D3D_FULL_SCREEN)
-                    return true;
-
                 IntPtr fg = NativeWin32.GetForegroundWindow();
                 if (fg == IntPtr.Zero || fg == ourHwnd) return false;
-                var cls = new StringBuilder(128);
-                NativeWin32.GetClassName(fg, cls, 128);
-                string c = cls.ToString();
-                if (c == "Progman" || c == "WorkerW" || c == "Shell_TrayWnd" || c == "Shell_SecondaryTrayWnd" || c == "Windows.UI.Core.CoreWindow" || IsTransientShellClass(c, fg)) return false;
+
+                // Minimized window can NEVER keep game metrics visible
+                if (NativeWin32.IsIconic(fg))
+                {
+                    definiteNonGameForeground = true;
+                    return false;
+                }
+
+                var clsSb = new StringBuilder(128);
+                NativeWin32.GetClassName(fg, clsSb, 128);
+                string cls = clsSb.ToString();
+
+                if (IsTransientShellClass(cls, fg)) return false;
+
+                if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd")
+                {
+                    definiteNonGameForeground = true;
+                    return false;
+                }
+
+                uint pid;
+                NativeWin32.GetWindowThreadProcessId(fg, out pid);
+                if (pid == 0) return false;
+
+                CachedPidClassification info = ClassifyProcessCached(pid);
+                if (info.IsKnownBlacklisted)
+                {
+                    definiteNonGameForeground = true;
+                    return false;
+                }
+
+                // Chromium / Electron / Firefox windows (browsers, web wrappers, messengers) are NOT games unless explicitly inside a game library folder
+                if ((cls.StartsWith("Chrome_WidgetWin", StringComparison.Ordinal) || cls == "MozillaWindowClass") && !info.HasPositiveGameTraits)
+                {
+                    definiteNonGameForeground = true;
+                    return false;
+                }
+
+                int quns = 0;
+                bool isExclusiveD3d = (NativeWin32.SHQueryUserNotificationState(out quns) == 0 && quns == NativeWin32.QUNS_RUNNING_D3D_FULL_SCREEN);
+
                 NativeWin32.RECT rc;
-                if (!NativeWin32.GetWindowRect(fg, out rc)) return false;
-                Rectangle b = activeScreen.Bounds;
-                return rc.Left <= b.Left && rc.Top <= b.Top && rc.Right >= b.Right && rc.Bottom >= b.Bottom;
+                bool coversMonitor = false;
+                if (NativeWin32.GetWindowRect(fg, out rc) && activeScreen != null)
+                {
+                    Rectangle b = activeScreen.Bounds;
+                    coversMonitor = (rc.Left <= b.Left + 2 && rc.Top <= b.Top + 2 && rc.Right >= b.Right - 2 && rc.Bottom >= b.Bottom - 2);
+                }
+
+                if (!coversMonitor && !isExclusiveD3d)
+                {
+                    definiteNonGameForeground = true;
+                    return false;
+                }
+
+                // Positive game match: known game engine window class, game library / engine directory, or exclusive D3D fullscreen on a non-blacklisted native app
+                for (int i = 0; i < GameEngineWindowClasses.Length; i++)
+                {
+                    if (cls.IndexOf(GameEngineWindowClasses[i], StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+
+                if (info.HasPositiveGameTraits || isExclusiveD3d)
+                    return true;
+
+                definiteNonGameForeground = true;
+                return false;
             }
             catch { return false; }
         }
@@ -3405,6 +3699,11 @@ namespace DynamicIslandWin
         [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
         public const uint WM_KEYUP = 0x0101;
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint RegisterWindowMessageW(string lpString);
+        public static readonly uint WM_DI_SHUTDOWN = RegisterWindowMessageW("DynamicIslandWin_GracefulShutdown_v3");
+        public static readonly uint WM_DI_ACTIVATE = RegisterWindowMessageW("DynamicIslandWin_ActivateExpand_v3");
         public const uint SWP_NOMOVE = 0x0002;
         public const uint SWP_NOSIZE = 0x0001;
         public const uint SWP_NOACTIVATE = 0x0010;
@@ -3659,6 +3958,8 @@ namespace DynamicIslandWin
         public string FilePath;
         public string TimeLabel;
         public Bitmap Thumbnail;
+        public int OrigWidth;
+        public int OrigHeight;
         public bool IsSelected;
         public long QuickHash;
     }
@@ -3818,12 +4119,31 @@ namespace DynamicIslandWin
                 string outPath = Path.Combine(_vaultDir, "Capture_" + stamp + ".png");
                 bmp.Save(outPath, ImageFormat.Png);
 
-                var thumb = new Bitmap(112, 64, PixelFormat.Format32bppPArgb);
-                using (Graphics g = Graphics.FromImage(thumb))
+                // High-DPI crisp lossless thumbnail (up to 512px long edge, exact original aspect ratio, WrapMode.TileFlipXY)
+                int srcW = Math.Max(1, bmp.Width);
+                int srcH = Math.Max(1, bmp.Height);
+                const int maxThumbEdge = 512;
+                int tw = srcW;
+                int th = srcH;
+                if (srcW > maxThumbEdge || srcH > maxThumbEdge)
                 {
+                    double scale = Math.Min((double)maxThumbEdge / srcW, (double)maxThumbEdge / srcH);
+                    tw = Math.Max(1, (int)Math.Round(srcW * scale));
+                    th = Math.Max(1, (int)Math.Round(srcH * scale));
+                }
+
+                var thumb = new Bitmap(tw, th, PixelFormat.Format32bppPArgb);
+                thumb.SetResolution(96f, 96f);
+                using (Graphics g = Graphics.FromImage(thumb))
+                using (var wrap = new ImageAttributes())
+                {
+                    wrap.SetWrapMode(WrapMode.TileFlipXY);
+                    g.CompositingMode = CompositingMode.SourceCopy;
+                    g.CompositingQuality = CompositingQuality.HighQuality;
                     g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    g.DrawImage(bmp, new Rectangle(0, 0, 112, 64));
+                    g.SmoothingMode = SmoothingMode.HighQuality;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.DrawImage(bmp, new Rectangle(0, 0, tw, th), 0, 0, srcW, srcH, GraphicsUnit.Pixel, wrap);
                 }
 
                 var item = new VaultCaptureItem
@@ -3831,6 +4151,8 @@ namespace DynamicIslandWin
                     FilePath = outPath,
                     TimeLabel = DateTime.Now.ToString("HH:mm:ss"),
                     Thumbnail = thumb,
+                    OrigWidth = srcW,
+                    OrigHeight = srcH,
                     IsSelected = false,
                     QuickHash = hash
                 };
@@ -4050,7 +4372,7 @@ namespace DynamicIslandWin
 
     public sealed class UpdateManager
     {
-        public const string CurrentVersionStr = "3.1.1";
+        public const string CurrentVersionStr = "3.1.3";
         public const string DefaultRepo = "Miltanchik/DynamicIsland";
 
         public string LatestVersionStr { get; private set; }
@@ -7004,6 +7326,7 @@ namespace DynamicIslandWin
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             _disposing = true;
+            Program.CleanupTrayIconSafe();
             try { _bgWakeEvent.Set(); } catch { }
             try { _frameTimer.Stop(); _collapseTimer.Stop(); _pomoTimer.Stop(); } catch { }
             try { SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged; } catch { }
@@ -7084,6 +7407,20 @@ namespace DynamicIslandWin
                         if (src != null && hwnd == src.Hwnd)
                         {
                             _dwmOverlay.EnsureStreamSourceAlive(Handle, src, _streamEngine.CropModeIndex);
+                            if (evType == NativeWin32.EVENT_SYSTEM_MINIMIZESTART)
+                            {
+                                ThreadPool.QueueUserWorkItem(_ =>
+                                {
+                                    Thread.Sleep(115);
+                                    if (!_disposing && IsHandleCreated)
+                                    {
+                                        try { BeginInvoke((MethodInvoker)delegate {
+                                            if (_mode == IslandMode.Expanded && _expandedPage == 1)
+                                                _dwmOverlay.EnsureStreamSourceAlive(Handle, _streamEngine.GetActiveSource(Handle), _streamEngine.CropModeIndex);
+                                        }); } catch { }
+                                    }
+                                });
+                            }
                         }
                     }
                     catch { }
@@ -7113,6 +7450,30 @@ namespace DynamicIslandWin
 
         protected override void WndProc(ref Message m)
         {
+            if (NativeWin32.WM_DI_SHUTDOWN != 0 && (uint)m.Msg == NativeWin32.WM_DI_SHUTDOWN)
+            {
+                m.Result = new IntPtr(1);
+                Program.CleanupTrayIconSafe();
+                try { Close(); } catch { }
+                try { Application.Exit(); } catch { }
+                return;
+            }
+            if (NativeWin32.WM_DI_ACTIVATE != 0 && (uint)m.Msg == NativeWin32.WM_DI_ACTIVATE)
+            {
+                m.Result = new IntPtr(1);
+                if (!_isFullscreenAppActive)
+                {
+                    _ghostModeActive = false;
+                    _ghostUnlockedByUser = true;
+                    _ghostOpacityFactor = 1.0f;
+                    _ghostLiftOffsetY = 0.0f;
+                    ExpandIsland();
+                    _collapseTimer.Interval = 2600;
+                    _collapseTimer.Start();
+                    RenderLayeredFrame();
+                }
+                return;
+            }
             if (m.Msg == NativeWin32.WM_MOUSEACTIVATE)
             {
                 m.Result = (IntPtr)NativeWin32.MA_NOACTIVATE;
@@ -7668,7 +8029,8 @@ namespace DynamicIslandWin
                         if (screens.Length > 0)
                         {
                             int idx = Math.Max(0, Math.Min(_config.monitor_index, screens.Length - 1));
-                            bool fsRaw = SystemSensors.IsForegroundAppFullscreen(Handle, screens[idx]);
+                            bool definiteNonGameFg;
+                            bool fsRaw = SystemSensors.IsForegroundFullscreenGame(Handle, screens[idx], out definiteNonGameFg);
                             int nowFs = Environment.TickCount;
                             bool fsNow;
                             if (fsRaw)
@@ -7677,9 +8039,11 @@ namespace DynamicIslandWin
                                 fsNow = true;
                             }
                             else if (_isFullscreenAppActive &&
-                                     (NativeWin32.IsAltTabHeld() || SystemSensors.IsTransientShellForeground() || unchecked(nowFs - _fsLastTrueTick) < 1800))
+                                     (NativeWin32.IsAltTabHeld() || SystemSensors.IsTransientShellForeground() ||
+                                      (!definiteNonGameFg && unchecked(nowFs - _fsLastTrueTick) < 450)))
                             {
-                                // Alt+Tab switcher / Win-key / transient shell windows must NOT end the game state (no un-hide, no expand)
+                                // Keep game state across Alt+Tab switcher overlay & brief D3D mode switches,
+                                // but drop IMMEDIATELY once user lands on desktop, browser, video player, or minimizes the game!
                                 fsNow = true;
                             }
                             else
@@ -9607,28 +9971,85 @@ namespace DynamicIslandWin
                 {
                     float thumbX = padX + 8f;
                     float thumbY = curY + 6f;
-                    float thumbH = galleryH - 12f;
-                    float thumbW = Math.Min(116f, (innerW - 24f) / 4f - 6f);
-                    int maxShow = Math.Min(items.Count, Math.Max(3, (int)((innerW - 12f) / (thumbW + 8f))));
+                    float thumbH = Math.Max(64f, galleryH - 12f);
+                    float idealCardW = Math.Min(162f, Math.Max(110f, thumbH * 1.38f));
+                    float slot4W = (innerW - 16f) / 4f - 6f;
+                    float slot3W = (innerW - 16f) / 3f - 6f;
+                    float thumbW = (thumbH > 105f && slot3W <= 172f) ? Math.Min(idealCardW, slot3W) : Math.Min(idealCardW, Math.Max(96f, slot4W));
+                    int maxShow = Math.Min(items.Count, Math.Max(2, (int)((innerW - 10f) / (thumbW + 8f))));
 
-                    for (int i = 0; i < maxShow; i++)
+                    InterpolationMode prevInterp = g.InterpolationMode;
+                    PixelOffsetMode prevPixOff = g.PixelOffsetMode;
+                    CompositingQuality prevCompQ = g.CompositingQuality;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.CompositingQuality = CompositingQuality.HighQuality;
+
+                    using (var thumbWrap = new ImageAttributes())
+                    using (var thumbMatte = new SolidBrush(Color.FromArgb((int)(alpha * 0.88f), 7, 9, 14)))
                     {
-                        var it = items[i];
-                        var tRc = new RectangleF(thumbX, thumbY, thumbW, thumbH);
-                        _vaultThumbRects.Add(new KeyValuePair<RectangleF, VaultCaptureItem>(tRc, it));
-
-                        using (GraphicsPath tp = CreateRoundedRectPath(tRc, 8f))
+                        thumbWrap.SetWrapMode(WrapMode.TileFlipXY);
+                        for (int i = 0; i < maxShow; i++)
                         {
-                            if (it.Thumbnail != null)
+                            var it = items[i];
+                            var tRc = new RectangleF(thumbX, thumbY, thumbW, thumbH);
+                            _vaultThumbRects.Add(new KeyValuePair<RectangleF, VaultCaptureItem>(tRc, it));
+
+                            using (GraphicsPath tp = CreateRoundedRectPath(tRc, 8f))
                             {
-                                Region prevC = g.Clip;
-                                g.SetClip(tp);
-                                SafeDrawImage(g, it.Thumbnail, tRc);
-                                g.Clip = prevC;
+                                g.FillPath(thumbMatte, tp);
+                                if (it.Thumbnail != null && it.Thumbnail.Width > 0 && it.Thumbnail.Height > 0)
+                                {
+                                    Region prevC = g.Clip;
+                                    g.SetClip(tp);
+                                    try
+                                    {
+                                        float bw = it.Thumbnail.Width;
+                                        float bh = it.Thumbnail.Height;
+                                        float imgAspect = bw / Math.Max(1f, bh);
+                                        float cardAspect = tRc.Width / Math.Max(1f, tRc.Height);
+                                        float ratioDiff = imgAspect / Math.Max(0.05f, cardAspect);
+
+                                        // Aspect-preserving render: NEVER stretch!
+                                        // Close aspect ratios (0.68x .. 1.48x) use crisp center-crop (aspect-fill);
+                                        // wide/tall snippets use centered aspect-fit so 100% of text/UI stays sharp & readable.
+                                        RectangleF dstRect = tRc;
+                                        RectangleF srcRect = new RectangleF(0, 0, bw, bh);
+                                        if (ratioDiff >= 0.68f && ratioDiff <= 1.48f)
+                                        {
+                                            if (imgAspect > cardAspect)
+                                            {
+                                                float cropW = bh * cardAspect;
+                                                srcRect = new RectangleF((bw - cropW) * 0.5f, 0f, cropW, bh);
+                                            }
+                                            else
+                                            {
+                                                float cropH = bw / cardAspect;
+                                                srcRect = new RectangleF(0f, (bh - cropH) * 0.5f, bw, cropH);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            float fitScale = Math.Min(tRc.Width / bw, tRc.Height / bh);
+                                            float dw = Math.Max(1f, bw * fitScale);
+                                            float dh = Math.Max(1f, bh * fitScale);
+                                            dstRect = new RectangleF(tRc.X + (tRc.Width - dw) * 0.5f, tRc.Y + (tRc.Height - dh) * 0.5f, dw, dh);
+                                        }
+
+                                        PointF[] dstPts = new PointF[]
+                                        {
+                                            new PointF(dstRect.Left, dstRect.Top),
+                                            new PointF(dstRect.Right, dstRect.Top),
+                                            new PointF(dstRect.Left, dstRect.Bottom)
+                                        };
+                                        g.DrawImage(it.Thumbnail, dstPts, srcRect, GraphicsUnit.Pixel, thumbWrap);
+                                    }
+                                    catch { }
+                                    finally { g.Clip = prevC; }
+                                }
+                                using (var tPen = new Pen(it.IsSelected ? Color.FromArgb(alpha, 56, 189, 248) : cardBorder, it.IsSelected ? 1.8f : 1f))
+                                    g.DrawPath(tPen, tp);
                             }
-                            using (var tPen = new Pen(it.IsSelected ? Color.FromArgb(alpha, 56, 189, 248) : cardBorder, it.IsSelected ? 1.8f : 1f))
-                                g.DrawPath(tPen, tp);
-                        }
 
                         // Checkbox in top-right of thumbnail
                         var chkRc = new RectangleF(tRc.Right - 20f, tRc.Y + 4f, 16f, 16f);
@@ -9648,8 +10069,12 @@ namespace DynamicIslandWin
                             g.FillPath(ttb, ttp);
                         DrawContrastText(g, it.TimeLabel, _fontMono, colWhite, timeTag, _sfCenter);
 
-                        thumbX += thumbW + 8f;
+                            thumbX += thumbW + 8f;
+                        }
                     }
+                    g.InterpolationMode = prevInterp;
+                    g.PixelOffsetMode = prevPixOff;
+                    g.CompositingQuality = prevCompQ;
                 }
 
                 curY += galleryH + 8f;
@@ -10141,48 +10566,180 @@ namespace DynamicIslandWin
 
     internal static class Program
     {
+        private const string SingleInstanceMutexName = @"Local\DynamicIslandWin_Standalone_SingleInstance";
         private static Mutex _singleInstanceMutex;
+        private static NotifyIcon _trayIcon;
+        private static Icon _extractedTrayIcon;
+        private static int _trayCleanedUp = 0;
+
+        public static void CleanupTrayIconSafe()
+        {
+            if (Interlocked.Exchange(ref _trayCleanedUp, 1) != 0) return;
+            var tray = _trayIcon;
+            _trayIcon = null;
+            if (tray != null)
+            {
+                try { tray.Visible = false; } catch { }
+                try { if (tray.ContextMenuStrip != null) tray.ContextMenuStrip.Dispose(); } catch { }
+                try { tray.Dispose(); } catch { }
+            }
+            var ico = _extractedTrayIcon;
+            _extractedTrayIcon = null;
+            if (ico != null)
+            {
+                try { ico.Dispose(); } catch { }
+            }
+        }
+
+        private static void RequestGracefulShutdownOfOtherInstances(int waitBudgetMs)
+        {
+            int myPid = Process.GetCurrentProcess().Id;
+            Process[] others = null;
+            try { others = Process.GetProcessesByName("DynamicIslandWin"); } catch { }
+            if (others == null || others.Length == 0) return;
+
+            bool anyOther = false;
+            foreach (Process p in others)
+            {
+                if (p.Id != myPid) { anyOther = true; break; }
+            }
+            if (!anyOther) return;
+
+            // 1) Broadcast WM_DI_SHUTDOWN so running instance executes CleanupTrayIconSafe() -> Shell_NotifyIcon(NIM_DELETE)!
+            if (NativeWin32.WM_DI_SHUTDOWN != 0)
+            {
+                IntPtr res;
+                NativeWin32.SendMessageTimeout(NativeWin32.HWND_BROADCAST, NativeWin32.WM_DI_SHUTDOWN, IntPtr.Zero, IntPtr.Zero, 0x0002 /* SMTO_ABORTIFHUNG */, 450, out res);
+
+                var targetPids = new HashSet<uint>();
+                foreach (Process p in others) if (p.Id != myPid) targetPids.Add((uint)p.Id);
+                NativeWin32.EnumWindows((hWnd, lParam) =>
+                {
+                    uint wPid;
+                    NativeWin32.GetWindowThreadProcessId(hWnd, out wPid);
+                    if (targetPids.Contains(wPid))
+                        NativeWin32.PostMessage(hWnd, NativeWin32.WM_DI_SHUTDOWN, IntPtr.Zero, IntPtr.Zero);
+                    return true;
+                }, IntPtr.Zero);
+            }
+
+            // 2) Wait for graceful exit; only terminate if completely hung past deadline
+            int elapsed = 0;
+            while (elapsed < waitBudgetMs)
+            {
+                bool stillAlive = false;
+                foreach (Process p in others)
+                {
+                    if (p.Id == myPid) continue;
+                    try { if (!p.HasExited) { stillAlive = true; break; } } catch { }
+                }
+                if (!stillAlive) return;
+                Thread.Sleep(60);
+                elapsed += 60;
+            }
+
+            foreach (Process p in others)
+            {
+                if (p.Id == myPid) continue;
+                try
+                {
+                    if (!p.HasExited)
+                    {
+                        p.CloseMainWindow();
+                        if (!p.WaitForExit(300)) { p.Kill(); p.WaitForExit(500); }
+                    }
+                }
+                catch { }
+            }
+        }
 
         [STAThread]
         private static void Main(string[] args)
         {
-            if (args != null && args.Length > 0 && args[0] == "--probe-players")
+            bool hasProbe = false;
+            bool hasShutdownOnly = false;
+            bool hasReplace = false;
+            if (args != null)
+            {
+                foreach (string a in args)
+                {
+                    string low = (a ?? "").Trim().ToLowerInvariant();
+                    if (low == "--probe-players") hasProbe = true;
+                    else if (low == "--shutdown" || low == "--quit") hasShutdownOnly = true;
+                    else if (low == "--replace" || low == "--restart") hasReplace = true;
+                }
+            }
+
+            if (hasProbe)
             {
                 string report = PlayerFavoriteEngine.RunDiagnosticProbe();
                 try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "di_player_probe.txt"), report, Encoding.UTF8); } catch { }
                 return;
             }
+
+            if (hasShutdownOnly)
+            {
+                RequestGracefulShutdownOfOtherInstances(1800);
+                return;
+            }
+
+            if (hasReplace)
+            {
+                RequestGracefulShutdownOfOtherInstances(1800);
+            }
+
+            // Strict Single-Instance Enforcement: NEVER create duplicate processes or duplicate tray icons!
+            bool ownsMutex = false;
             try
             {
-                int myPid = Process.GetCurrentProcess().Id;
-                foreach (Process p in Process.GetProcessesByName("DynamicIslandWin"))
+                _singleInstanceMutex = new Mutex(false, SingleInstanceMutexName);
+                try
                 {
-                    if (p.Id != myPid)
-                    {
-                        try { p.Kill(); p.WaitForExit(800); } catch { }
-                    }
+                    ownsMutex = _singleInstanceMutex.WaitOne(hasReplace ? 1500 : 0, false);
+                }
+                catch (AbandonedMutexException)
+                {
+                    ownsMutex = true;
                 }
             }
-            catch { }
+            catch { ownsMutex = true; }
 
-            bool createdNew;
-            _singleInstanceMutex = new Mutex(true, @"Local\DynamicIslandWin_Standalone_SingleInstance", out createdNew);
+            if (!ownsMutex)
+            {
+                // Another instance is already running: politely ask it to expand its Island and exit BEFORE creating NotifyIcon!
+                if (NativeWin32.WM_DI_ACTIVATE != 0)
+                {
+                    IntPtr res;
+                    NativeWin32.SendMessageTimeout(NativeWin32.HWND_BROADCAST, NativeWin32.WM_DI_ACTIVATE, IntPtr.Zero, IntPtr.Zero, 0x0002, 300, out res);
+                }
+                return;
+            }
 
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
             Application.ThreadException += (s, exArgs) => { };
-            AppDomain.CurrentDomain.UnhandledException += (s, exArgs) => { };
+            AppDomain.CurrentDomain.UnhandledException += (s, exArgs) => { CleanupTrayIconSafe(); };
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => { CleanupTrayIconSafe(); };
+            Application.ApplicationExit += (s, e) => { CleanupTrayIconSafe(); };
+            SystemEvents.SessionEnding += (s, e) => { CleanupTrayIconSafe(); };
 
             NativeWin32.EnablePerMonitorDpiV2();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            var mainForm = new DynamicIslandOverlayForm();
-            using (var tray = new NotifyIcon())
+            try
             {
-                try { tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
-                catch { tray.Icon = SystemIcons.Application; }
-                tray.Text = "Dynamic Island for Windows";
-                tray.Visible = true;
+                var mainForm = new DynamicIslandOverlayForm();
+                _trayIcon = new NotifyIcon();
+                try
+                {
+                    _extractedTrayIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                    _trayIcon.Icon = _extractedTrayIcon ?? SystemIcons.Application;
+                }
+                catch
+                {
+                    _trayIcon.Icon = SystemIcons.Application;
+                }
+                _trayIcon.Text = "Dynamic Island for Windows";
 
                 var trayMenu = new ContextMenuStrip();
                 trayMenu.Items.Add("Раскрыть островок", null, (s, e) => mainForm.ExpandIsland());
@@ -10200,21 +10757,29 @@ namespace DynamicIslandWin
                 trayMenu.Items.Add(new ToolStripSeparator());
                 trayMenu.Items.Add("Выйти из Dynamic Island", null, (s, e) =>
                 {
-                    tray.Visible = false;
+                    CleanupTrayIconSafe();
                     Application.Exit();
                 });
 
-                tray.ContextMenuStrip = trayMenu;
-                tray.MouseClick += (s, e) =>
+                _trayIcon.ContextMenuStrip = trayMenu;
+                _trayIcon.MouseClick += (s, e) =>
                 {
                     if (e.Button == MouseButtons.Left)
                         mainForm.ExpandIsland();
                 };
+                _trayIcon.Visible = true;
 
                 Application.Run(mainForm);
-                tray.Visible = false;
             }
-            GC.KeepAlive(_singleInstanceMutex);
+            finally
+            {
+                CleanupTrayIconSafe();
+                if (ownsMutex && _singleInstanceMutex != null)
+                {
+                    try { _singleInstanceMutex.ReleaseMutex(); } catch { }
+                    try { _singleInstanceMutex.Dispose(); } catch { }
+                }
+            }
         }
     }
 }
