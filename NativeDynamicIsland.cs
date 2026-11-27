@@ -1851,6 +1851,99 @@ namespace DynamicIslandWin
             catch { _micEndpoint = null; }
         }
 
+        private static readonly HashSet<string> VideoPlayerProcessStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "vlc", "mpv", "mpc-hc", "mpc-hc64", "mpc-be", "mpc-be64",
+            "potplayer", "potplayermini", "potplayermini64", "kmplayer",
+            "gom", "gom64", "video.ui", "zunevideo", "smplayer", "ACGPlayer"
+        };
+
+        private static readonly HashSet<string> BrowserProcessStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "chrome", "msedge", "firefox", "opera", "opera_gx", "yandex",
+            "browser", "brave", "vivaldi", "arc", "zen", "waterfox", "thorium", "librewolf", "floorp"
+        };
+
+        public void CheckActiveVideoAndBrowserAudio(out bool localVideoAudioActive, out bool browserAudioActive)
+        {
+            localVideoAudioActive = false;
+            browserAudioActive = false;
+            if (_sessionMgr == null) InitializeEndpoint();
+            if (_sessionMgr == null) return;
+            try
+            {
+                IAudioSessionEnumerator sesEnum;
+                if (_sessionMgr.GetSessionEnumerator(out sesEnum) != 0 || sesEnum == null) return;
+                int count;
+                if (sesEnum.GetCount(out count) != 0) return;
+
+                for (int i = 0; i < count; i++)
+                {
+                    object raw;
+                    if (sesEnum.GetSession(i, out raw) != 0 || raw == null) continue;
+                    var ctrl2 = raw as IAudioSessionControl2;
+                    if (ctrl2 == null) continue;
+
+                    int state;
+                    if (ctrl2.GetState(out state) != 0 || state != 1) continue; // 1 == AudioSessionStateActive
+
+                    uint pid;
+                    ctrl2.GetProcessId(out pid);
+                    if (pid == 0) continue;
+
+                    string pName = "";
+                    try { pName = Process.GetProcessById((int)pid).ProcessName ?? ""; } catch { }
+                    if (string.IsNullOrEmpty(pName)) continue;
+
+                    if (VideoPlayerProcessStems.Contains(pName))
+                        localVideoAudioActive = true;
+                    else if (BrowserProcessStems.Contains(pName))
+                        browserAudioActive = true;
+
+                    if (localVideoAudioActive && browserAudioActive) break;
+                }
+            }
+            catch { _sessionMgr = null; }
+        }
+
+        public bool IsAnyAudioSessionActiveForKeywords(string[] keywords)
+        {
+            if (keywords == null || keywords.Length == 0) return false;
+            if (_sessionMgr == null) InitializeEndpoint();
+            if (_sessionMgr == null) return false;
+            try
+            {
+                IAudioSessionEnumerator sesEnum;
+                if (_sessionMgr.GetSessionEnumerator(out sesEnum) != 0 || sesEnum == null) return false;
+                int count;
+                if (sesEnum.GetCount(out count) != 0) return false;
+                for (int i = 0; i < count; i++)
+                {
+                    object raw;
+                    if (sesEnum.GetSession(i, out raw) != 0 || raw == null) continue;
+                    var ctrl2 = raw as IAudioSessionControl2;
+                    if (ctrl2 == null) continue;
+                    int state;
+                    if (ctrl2.GetState(out state) != 0 || state != 1) continue;
+                    uint pid;
+                    ctrl2.GetProcessId(out pid);
+                    if (pid == 0) continue;
+                    string pName = "";
+                    try { pName = Process.GetProcessById((int)pid).ProcessName ?? ""; } catch { }
+                    string sesId = "";
+                    try { ctrl2.GetSessionIdentifier(out sesId); } catch { }
+                    string comb = (pName + " " + sesId).ToLowerInvariant();
+                    foreach (string kw in keywords)
+                    {
+                        if (!string.IsNullOrEmpty(kw) && comb.Contains(kw.ToLowerInvariant()))
+                            return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
         public void Dispose()
         {
             try { if (_endpoint != null && _renderSink != null) _endpoint.UnregisterControlChangeNotify(_renderSink); } catch { }
@@ -1871,6 +1964,7 @@ namespace DynamicIslandWin
         public string Artist = "Яндекс Музыка • Spotify • AIMP";
         public bool IsPlaying = false;
         public bool IsDedicatedPlayer = false;
+        public bool IsVideoPlayback = false;
         public double PositionSec = 0.0;
         public double DurationSec = 0.0;
         public DateTime SampledAtUtc = DateTime.UtcNow;
@@ -1894,6 +1988,41 @@ namespace DynamicIslandWin
         private static Bitmap _cachedCoverBmp = null;
         private static int _selectedPlayerIndex = 0;
         private static string _manualSelectedAppId = "";
+        public static volatile bool SmtcVideoPlayingNow = false;
+        public static volatile bool SmtcBrowserPlayingNow = false;
+
+        private static readonly string[] PureMusicOnlyKeywords = new string[]
+        {
+            "яндекс", "yandexmusic", "yandex.music", "spotify", "aimp", "foobar",
+            "itunes", "applemusic", "zunemusic", "music.ui", "deezer", "tidal",
+            "soundcloud", "vkmusic", "vk music", "winamp", "musicbee"
+        };
+
+        private static readonly string[] DedicatedVideoAppKeywords = new string[]
+        {
+            "vlc", "mpv", "mpc-hc", "mpc-be", "potplayer", "kmplayer",
+            "gom", "zunevideo", "video.ui", "smplayer"
+        };
+
+        public static bool IsPureMusicOnlyApp(string appIdOrName)
+        {
+            if (string.IsNullOrEmpty(appIdOrName)) return false;
+            string low = appIdOrName.ToLowerInvariant();
+            foreach (string b in BrowserKeywords)
+                if (low.Contains(b)) return false;
+            foreach (string m in PureMusicOnlyKeywords)
+                if (low.Contains(m)) return true;
+            return false;
+        }
+
+        public static bool IsDedicatedVideoApp(string appIdOrName)
+        {
+            if (string.IsNullOrEmpty(appIdOrName)) return false;
+            string low = appIdOrName.ToLowerInvariant();
+            foreach (string v in DedicatedVideoAppKeywords)
+                if (low.Contains(v)) return true;
+            return false;
+        }
         private static readonly Dictionary<string, string> _exePathCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         private static readonly string[] DedicatedPlayerKeywords = new string[]
