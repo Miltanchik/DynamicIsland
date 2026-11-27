@@ -2744,8 +2744,64 @@ namespace DynamicIslandWin
         public int GpuTempC { get; private set; }
         public int PingMs { get; private set; }
 
-        private long _lastSampleTick = 0;
+        private int _lastSampleTick = Environment.TickCount - 100000;
         private int _samplingFlag = 0;
+        private int _samplingStartTick = 0;
+
+        // ---- NVML (in-process, ~0.05 ms per query, zero child processes, zero blocking I/O) ----
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr LoadLibraryW(string lpFileName);
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)] private static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+        [StructLayout(LayoutKind.Sequential)] private struct NvmlUtilization { public uint gpu; public uint memory; }
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int NvmlInitFn();
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int NvmlGetHandleFn(uint index, out IntPtr device);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int NvmlGetUtilFn(IntPtr device, out NvmlUtilization util);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int NvmlGetTempFn(IntPtr device, int sensorType, out uint temp);
+
+        private bool _nvmlTried = false;
+        private bool _nvmlReady = false;
+        private IntPtr _nvmlDevice = IntPtr.Zero;
+        private NvmlGetUtilFn _nvmlGetUtil;
+        private NvmlGetTempFn _nvmlGetTemp;
+
+        private void TryInitNvml()
+        {
+            if (_nvmlTried) return;
+            _nvmlTried = true;
+            try
+            {
+                string[] candidates = new string[]
+                {
+                    "nvml.dll",
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"NVIDIA Corporation\NVSMI\nvml.dll"),
+                    @"C:\Windows\System32\nvml.dll"
+                };
+                IntPtr lib = IntPtr.Zero;
+                foreach (string c in candidates)
+                {
+                    lib = LoadLibraryW(c);
+                    if (lib != IntPtr.Zero) break;
+                }
+                if (lib == IntPtr.Zero) return;
+
+                IntPtr pInit = GetProcAddress(lib, "nvmlInit_v2");
+                IntPtr pHandle = GetProcAddress(lib, "nvmlDeviceGetHandleByIndex_v2");
+                IntPtr pUtil = GetProcAddress(lib, "nvmlDeviceGetUtilizationRates");
+                IntPtr pTemp = GetProcAddress(lib, "nvmlDeviceGetTemperature");
+                if (pInit == IntPtr.Zero || pHandle == IntPtr.Zero || pUtil == IntPtr.Zero || pTemp == IntPtr.Zero) return;
+
+                var init = (NvmlInitFn)Marshal.GetDelegateForFunctionPointer(pInit, typeof(NvmlInitFn));
+                var getHandle = (NvmlGetHandleFn)Marshal.GetDelegateForFunctionPointer(pHandle, typeof(NvmlGetHandleFn));
+                if (init() != 0) return;
+                IntPtr dev;
+                if (getHandle(0, out dev) != 0 || dev == IntPtr.Zero) return;
+
+                _nvmlDevice = dev;
+                _nvmlGetUtil = (NvmlGetUtilFn)Marshal.GetDelegateForFunctionPointer(pUtil, typeof(NvmlGetUtilFn));
+                _nvmlGetTemp = (NvmlGetTempFn)Marshal.GetDelegateForFunctionPointer(pTemp, typeof(NvmlGetTempFn));
+                _nvmlReady = true;
+            }
+            catch { _nvmlReady = false; }
+        }
 
         public MicroTelemetryService()
         {
@@ -2756,67 +2812,57 @@ namespace DynamicIslandWin
             PingMs = 19;
         }
 
-        public void SampleAsyncIfNeeded(int currentCpuLoad)
+        public void SampleAsyncIfNeeded(int currentCpuLoad, bool gameMode = false)
         {
             CpuLoadPct = Math.Max(1, Math.Min(100, currentCpuLoad));
-            long now = Environment.TickCount;
-            if (now - _lastSampleTick < 2200) return;
-            if (Interlocked.CompareExchange(ref _samplingFlag, 1, 0) != 0) return;
+            int now = Environment.TickCount;
+            int interval = gameMode ? 5000 : 2200;
+            if (unchecked(now - _lastSampleTick) < interval) return;
+
+            if (Interlocked.CompareExchange(ref _samplingFlag, 1, 0) != 0)
+            {
+                // Watchdog: a sampler stuck for >10s must never freeze telemetry forever
+                if (unchecked(now - _samplingStartTick) > 10000)
+                    Interlocked.Exchange(ref _samplingFlag, 0);
+                return;
+            }
             _lastSampleTick = now;
+            _samplingStartTick = now;
 
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 try
                 {
-                    // 1) Network Ping (ICMP to 1.1.1.1 / 8.8.8.8)
+                    // 1) Network ping (bounded 450ms, own pooled thread)
                     try
                     {
                         using (var ping = new Ping())
                         {
-                            PingReply rep = ping.Send("1.1.1.1", 550);
+                            PingReply rep = ping.Send("1.1.1.1", 450);
                             if (rep != null && rep.Status == IPStatus.Success)
                                 PingMs = (int)Math.Max(1, Math.Min(999, rep.RoundtripTime));
                         }
                     }
                     catch { }
 
-                    // 2) GPU Load & Temperature via nvidia-smi (if NVIDIA GPU present) or smooth thermal model
+                    // 2) GPU load & temperature via in-process NVML (NVIDIA) or smooth thermal model
                     bool gotGpu = false;
-                    try
+                    TryInitNvml();
+                    if (_nvmlReady)
                     {
-                        string smiPath = @"C:\Windows\System32\nvidia-smi.exe";
-                        if (File.Exists(smiPath))
+                        try
                         {
-                            var psi = new ProcessStartInfo
+                            NvmlUtilization util;
+                            uint temp;
+                            if (_nvmlGetUtil(_nvmlDevice, out util) == 0 && _nvmlGetTemp(_nvmlDevice, 0, out temp) == 0)
                             {
-                                FileName = smiPath,
-                                Arguments = "--query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits",
-                                CreateNoWindow = true,
-                                UseShellExecute = false,
-                                RedirectStandardOutput = true
-                            };
-                            using (var p = Process.Start(psi))
-                            {
-                                if (p != null)
-                                {
-                                    string line = p.StandardOutput.ReadLine();
-                                    p.WaitForExit(450);
-                                    if (!string.IsNullOrEmpty(line))
-                                    {
-                                        string[] parts = line.Split(',');
-                                        int gl, gt;
-                                        if (parts.Length >= 2 && int.TryParse(parts[0].Trim(), out gl) && int.TryParse(parts[1].Trim(), out gt))
-                                        {
-                                            GpuLoadPct = Math.Max(0, Math.Min(100, gl));
-                                            GpuTempC = Math.Max(25, Math.Min(110, gt));
-                                            gotGpu = true;
-                                        }
-                                    }
-                                }
+                                GpuLoadPct = (int)Math.Max(0, Math.Min(100, util.gpu));
+                                GpuTempC = (int)Math.Max(25, Math.Min(110, temp));
+                                gotGpu = true;
                             }
                         }
+                        catch { _nvmlReady = false; }
                     }
-                    catch { }
 
                     if (!gotGpu)
                     {
@@ -2840,7 +2886,6 @@ namespace DynamicIslandWin
                 CpuLoadPct, CpuTempC, GpuLoadPct, GpuTempC, PingMs);
         }
     }
-
     // =========================================================================
     // 4C. MODULE 4: INSTANT SCREENSHOT INTERCEPTOR & SESSION VAULT
     // =========================================================================
