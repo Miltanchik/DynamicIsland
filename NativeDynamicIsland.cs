@@ -133,7 +133,7 @@ namespace DynamicIslandWin
 
                 if (Math.Abs(primary.R - secondary.R) + Math.Abs(primary.G - secondary.G) + Math.Abs(primary.B - secondary.B) < 45)
                 {
-                    secondary = Color.FromArgb(255, Math.Min(255, primary.B + 45), Math.Max(40, primary.R), Math.Min(255, primary.G + 35));
+                    secondary = Color.FromArgb(255, Math.Min(255, (int)primary.B + 45), Math.Max(40, (int)primary.R), Math.Min(255, (int)primary.G + 35));
                 }
             }
             catch { }
