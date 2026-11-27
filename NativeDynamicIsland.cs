@@ -33,8 +33,8 @@ using System.Reflection;
 [assembly: AssemblyProduct("Dynamic Island Studio")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("3.1.1.0")]
-[assembly: AssemblyFileVersion("3.1.1.0")]
+[assembly: AssemblyVersion("3.1.2.0")]
+[assembly: AssemblyFileVersion("3.1.2.0")]
 namespace DynamicIslandWin
 {
     // =========================================================================
@@ -2127,48 +2127,60 @@ namespace DynamicIslandWin
             });
         }
 
-        public static IntPtr FindPlayerWindowSafe(MediaSessionSnapshot snap, bool isSpotify, bool isYandex, out string bestWindowTitle)
+        public static IntPtr FindRenderWidgetChild(IntPtr topHwnd)
+        {
+            if (topHwnd == IntPtr.Zero || !NativeWin32.IsWindow(topHwnd)) return IntPtr.Zero;
+            IntPtr foundRender = IntPtr.Zero;
+            int bestArea = -1;
+            try
+            {
+                NativeWin32.EnumChildWindows(topHwnd, (ch, lParam) =>
+                {
+                    var cls = new StringBuilder(128);
+                    NativeWin32.GetClassName(ch, cls, 128);
+                    if (cls.ToString().IndexOf("Chrome_RenderWidgetHostHWND", StringComparison.Ordinal) >= 0)
+                    {
+                        NativeWin32.RECT r;
+                        int area = 0;
+                        if (NativeWin32.GetWindowRect(ch, out r))
+                            area = Math.Max(0, r.Right - r.Left) * Math.Max(0, r.Bottom - r.Top);
+                        if (area > bestArea) { bestArea = area; foundRender = ch; }
+                    }
+                    return true;
+                }, IntPtr.Zero);
+            }
+            catch { }
+            return foundRender;
+        }
+
+        public static IntPtr FindPlayerWindowSafe(MediaSessionSnapshot snap, bool isSpotify, bool isYandex, out string bestWindowTitle, out IntPtr renderWidgetHwnd)
         {
             bestWindowTitle = "";
+            renderWidgetHwnd = IntPtr.Zero;
             if (snap == null) return IntPtr.Zero;
 
             string stem = snap.AppId ?? "";
-            if (stem.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                stem = stem.Substring(0, stem.Length - 4);
-            if (stem.Contains("!"))
-            {
-                string[] parts = stem.Split('!');
-                stem = parts[0];
-            }
+            if (stem.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) stem = stem.Substring(0, stem.Length - 4);
+            if (stem.Contains("!")) stem = stem.Split('!')[0];
 
             var pidSet = new HashSet<uint>();
             try
             {
                 if (!string.IsNullOrEmpty(stem))
+                    foreach (Process p in Process.GetProcessesByName(stem)) pidSet.Add((uint)p.Id);
+                if (isYandex)
                 {
-                    foreach (Process p in Process.GetProcessesByName(stem))
-                        pidSet.Add((uint)p.Id);
+                    foreach (Process p in Process.GetProcessesByName("Яндекс Музыка")) pidSet.Add((uint)p.Id);
+                    foreach (Process p in Process.GetProcessesByName("YandexMusic")) pidSet.Add((uint)p.Id);
                 }
-                if (pidSet.Count == 0 && isYandex)
-                {
-                    foreach (Process p in Process.GetProcessesByName("Яндекс Музыка"))
-                        pidSet.Add((uint)p.Id);
-                    foreach (Process p in Process.GetProcessesByName("YandexMusic"))
-                        pidSet.Add((uint)p.Id);
-                }
-                if (pidSet.Count == 0 && isSpotify)
-                {
-                    foreach (Process p in Process.GetProcessesByName("Spotify"))
-                        pidSet.Add((uint)p.Id);
-                }
+                if (isSpotify)
+                    foreach (Process p in Process.GetProcessesByName("Spotify")) pidSet.Add((uint)p.Id);
             }
             catch { }
 
-            IntPtr bestVisible = IntPtr.Zero;
-            string bestVisTitle = "";
-            IntPtr bestAny = IntPtr.Zero;
-            string bestAnyTitle = "";
-            int largestArea = 0;
+            IntPtr bestHwnd = IntPtr.Zero, bestRender = IntPtr.Zero;
+            string bestTitle = "";
+            int bestScore = int.MinValue;
 
             if (pidSet.Count > 0)
             {
@@ -2181,6 +2193,7 @@ namespace DynamicIslandWin
                     var cls = new StringBuilder(256);
                     NativeWin32.GetClassName(hWnd, cls, 256);
                     string clsName = cls.ToString();
+                    if (clsName == "Chrome_WidgetWin_0" || clsName == "IME" || clsName == "MSCTFIME UI") return true;
 
                     var sbTitle = new StringBuilder(256);
                     NativeWin32.GetWindowText(hWnd, sbTitle, 256);
@@ -2188,32 +2201,31 @@ namespace DynamicIslandWin
 
                     NativeWin32.RECT rc;
                     NativeWin32.GetWindowRect(hWnd, out rc);
-                    int w = rc.Right - rc.Left;
-                    int h = rc.Bottom - rc.Top;
-                    int area = Math.Max(0, w) * Math.Max(0, h);
+                    int w = rc.Right - rc.Left, h = rc.Bottom - rc.Top;
+                    bool vis = NativeWin32.IsWindowVisible(hWnd);
+                    bool iconic = NativeWin32.IsIconic(hWnd);
+                    IntPtr childRender = FindRenderWidgetChild(hWnd);
 
-                    if (NativeWin32.IsWindowVisible(hWnd) && !NativeWin32.IsIconic(hWnd) && w >= 180 && h >= 120 && area >= largestArea)
+                    int sc = 0;
+                    if (childRender != IntPtr.Zero) sc += 5000;
+                    if (clsName == "Chrome_WidgetWin_1" || clsName.Contains("Qt") || clsName.Contains("AIMP")) sc += 2000;
+                    else if (clsName.Contains("Chrome_WidgetWin")) sc += 600;
+                    if (!string.IsNullOrWhiteSpace(wTitle)) sc += 1200;
+                    if (vis && !iconic && w >= 180 && h >= 120) sc += 1500 + Math.Min(900, (w * h) / 2500);
+                    else if (iconic) sc += 800;
+                    else if (!vis && (w >= 160 || childRender != IntPtr.Zero)) sc += 500;
+
+                    if (sc > bestScore && sc >= 1200)
                     {
-                        largestArea = area;
-                        bestVisible = hWnd;
-                        bestVisTitle = wTitle;
-                    }
-                    else if (bestAny == IntPtr.Zero && (clsName.Contains("Chrome_WidgetWin") || clsName.Contains("Qt") || clsName.Contains("AIMP")) && (w >= 160 || NativeWin32.IsIconic(hWnd)))
-                    {
-                        bestAny = hWnd;
-                        bestAnyTitle = wTitle;
+                        bestScore = sc; bestHwnd = hWnd; bestRender = childRender; bestTitle = wTitle;
                     }
                     return true;
                 }, IntPtr.Zero);
             }
 
-            if (bestVisible != IntPtr.Zero)
-            {
-                bestWindowTitle = bestVisTitle;
-                return bestVisible;
-            }
-            bestWindowTitle = bestAnyTitle;
-            return bestAny;
+            bestWindowTitle = bestTitle;
+            renderWidgetHwnd = bestRender;
+            return bestHwnd;
         }
         public static void ActivatePlayerWindowAsync(MediaSessionSnapshot snap)
         {
@@ -2452,21 +2464,22 @@ namespace DynamicIslandWin
         [PreserveSig] int put_TransactionTimeout(uint timeout);
     }
 
-    public enum PlayerFavoriteSupport { Unsupported = 0, SupportedUiaAndShortcut = 1, SupportedUiaOnly = 2 }
+    public enum PlayerFavoriteSupport { Unsupported = 0, SupportedUiaAndBgKey = 1, SupportedUiaOnly = 2 }
 
     public sealed class PlayerFavoriteSyncResult
     {
         public string TrackKey = "";
+        public int Generation = 0;
         public bool SyncedFromPlayer = false;
         public bool IsLiked = false;
         public bool PlayerSupported = true;
         public string StatusMessage = "";
     }
+
     public static class PlayerFavoriteEngine
     {
         private const int UIA_TreeScope_Descendants = 4;
         private const int UIA_ControlTypePropertyId = 30003;
-        private const int UIA_IsTogglePatternAvailablePropertyId = 30041;
         private const int UIA_ButtonControlTypeId = 50000;
         private const int UIA_CheckBoxControlTypeId = 50002;
         private const int UIA_TogglePatternId = 10015;
@@ -2479,11 +2492,25 @@ namespace DynamicIslandWin
         private sealed class FavWorkItem
         {
             public bool IsToggleAction;
+            public int Generation;
             public MediaSessionSnapshot Snapshot;
             public string TrackKey;
             public bool ExpectedTargetLiked;
-            public bool FullscreenGameActive;
             public Action<PlayerFavoriteSyncResult> Callback;
+        }
+
+        private sealed class CandidateMeta
+        {
+            public IUIAutomationElement Element;
+            public string NameLower;
+            public string HelpLower;
+            public string AriaProps;
+            public int ControlType;
+            public bool HasToggle;
+            public int ToggleVal;
+            public int Enabled;
+            public NativeWin32.RECT Bounds;
+            public bool HasBounds;
         }
 
         private static FavWorkItem _pendingToggle = null;
@@ -2504,8 +2531,7 @@ namespace DynamicIslandWin
                     if (File.Exists(old)) File.Delete(old);
                     File.Move(logPath, old);
                 }
-                string line = string.Format("[{0:yyyy-MM-dd HH:mm:ss.fff}] [{1}] {2}{3}", DateTime.Now, level, msg, Environment.NewLine);
-                File.AppendAllText(logPath, line, Encoding.UTF8);
+                File.AppendAllText(logPath, string.Format("[{0:yyyy-MM-dd HH:mm:ss.fff}] [{1}] {2}{3}", DateTime.Now, level, msg, Environment.NewLine), Encoding.UTF8);
             }
             catch { }
         }
@@ -2516,11 +2542,7 @@ namespace DynamicIslandWin
             lock (_queueLock)
             {
                 if (_staThread != null) return;
-                _staThread = new Thread(StaWorkerLoop)
-                {
-                    IsBackground = true,
-                    Name = "DynamicIslandPlayerFavSTA"
-                };
+                _staThread = new Thread(StaWorkerLoop) { IsBackground = true, Name = "DynamicIslandPlayerFavSTA" };
                 _staThread.SetApartmentState(ApartmentState.STA);
                 _staThread.Start();
             }
@@ -2537,66 +2559,41 @@ namespace DynamicIslandWin
 
         public static PlayerFavoriteSupport ClassifyPlayerSupport(MediaSessionSnapshot snap, out bool isSpotify, out bool isYandex, out bool isBrowser)
         {
-            isSpotify = false;
-            isYandex = false;
-            isBrowser = false;
+            isSpotify = false; isYandex = false; isBrowser = false;
             if (snap == null) return PlayerFavoriteSupport.Unsupported;
-
             string combined = ((snap.AppId ?? "") + " " + (snap.DisplayAppName ?? "")).ToLowerInvariant();
             isSpotify = combined.Contains("spotify");
             isYandex = combined.Contains("яндекс") || combined.Contains("yandex");
             isBrowser = combined.Contains("chrome") || combined.Contains("msedge") || combined.Contains("opera") ||
                         combined.Contains("brave") || combined.Contains("firefox") || combined.Contains("vivaldi");
-
-            if (isYandex || isSpotify)
-                return PlayerFavoriteSupport.SupportedUiaAndShortcut;
-
-            if (combined.Contains("aimp") || combined.Contains("itunes") || combined.Contains("applemusic") ||
-                combined.Contains("deezer") || combined.Contains("tidal") || combined.Contains("musicbee") || combined.Contains("foobar"))
+            if (isYandex) return PlayerFavoriteSupport.SupportedUiaAndBgKey;
+            if (isSpotify || combined.Contains("aimp") || combined.Contains("itunes") || combined.Contains("applemusic") ||
+                combined.Contains("deezer") || combined.Contains("tidal") || combined.Contains("musicbee") || combined.Contains("foobar") || isBrowser)
                 return PlayerFavoriteSupport.SupportedUiaOnly;
-
-            if (isBrowser)
-                return PlayerFavoriteSupport.SupportedUiaOnly;
-
             return PlayerFavoriteSupport.Unsupported;
         }
 
-        public static void RequestSyncStateAsync(MediaSessionSnapshot snap, Action<PlayerFavoriteSyncResult> onCompleted)
+        public static void RequestSyncStateAsync(MediaSessionSnapshot snap, int generation, Action<PlayerFavoriteSyncResult> onCompleted, bool forceImmediate = false)
         {
             if (snap == null || string.IsNullOrEmpty(BuildTrackKey(snap))) return;
-            // Suppress passive sync for 1.6s right after user clicked Heart so player network round-trip settles first
-            if (unchecked(Environment.TickCount - _lastManualToggleTick) < 1600) return;
-
+            if (!forceImmediate && _lastManualToggleTick != 0 && unchecked(Environment.TickCount - _lastManualToggleTick) < 1100) return;
             EnsureStaWorkerStarted();
             lock (_queueLock)
             {
-                _pendingSync = new FavWorkItem
-                {
-                    IsToggleAction = false,
-                    Snapshot = snap,
-                    TrackKey = BuildTrackKey(snap),
-                    Callback = onCompleted
-                };
+                if (_pendingToggle != null) return;
+                _pendingSync = new FavWorkItem { IsToggleAction = false, Generation = generation, Snapshot = snap, TrackKey = BuildTrackKey(snap), Callback = onCompleted };
             }
             _wakeEvt.Set();
         }
 
-        public static void RequestToggleFavoriteAsync(MediaSessionSnapshot snap, bool targetLiked, bool isFullscreenGameActive, Action<PlayerFavoriteSyncResult> onCompleted)
+        public static void RequestToggleFavoriteAsync(MediaSessionSnapshot snap, bool targetLiked, int generation, Action<PlayerFavoriteSyncResult> onCompleted)
         {
             if (snap == null) return;
             _lastManualToggleTick = Environment.TickCount;
             EnsureStaWorkerStarted();
             lock (_queueLock)
             {
-                _pendingToggle = new FavWorkItem
-                {
-                    IsToggleAction = true,
-                    Snapshot = snap,
-                    TrackKey = BuildTrackKey(snap),
-                    ExpectedTargetLiked = targetLiked,
-                    FullscreenGameActive = isFullscreenGameActive,
-                    Callback = onCompleted
-                };
+                _pendingToggle = new FavWorkItem { IsToggleAction = true, Generation = generation, Snapshot = snap, TrackKey = BuildTrackKey(snap), ExpectedTargetLiked = targetLiked, Callback = onCompleted };
                 _pendingSync = null;
             }
             _wakeEvt.Set();
@@ -2604,267 +2601,254 @@ namespace DynamicIslandWin
 
         private static void ReleaseCom(object comObj)
         {
-            if (comObj != null && Marshal.IsComObject(comObj))
-            {
-                try { Marshal.ReleaseComObject(comObj); } catch { }
-            }
+            if (comObj != null && Marshal.IsComObject(comObj)) { try { Marshal.ReleaseComObject(comObj); } catch { } }
         }
 
         private static bool IsWindowResponsive(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero || !NativeWin32.IsWindow(hwnd)) return false;
             IntPtr res;
-            // WM_NULL (0x0000) safely verifies window message pump responsiveness without side effects or MSAA hooks!
-            IntPtr ok = NativeWin32.SendMessageTimeout(hwnd, 0x0000, IntPtr.Zero, IntPtr.Zero, 0x0002 /* SMTO_ABORTIFHUNG */, 140, out res);
-            return ok != IntPtr.Zero;
+            return NativeWin32.SendMessageTimeout(hwnd, 0x0000, IntPtr.Zero, IntPtr.Zero, 0x0002, 160, out res) != IntPtr.Zero;
         }
 
-        private static bool EvaluateLikeButtonSemantics(string rawName, string rawHelp, string rawAriaProps, bool hasToggleState, int toggleStateVal, out bool resolvedLiked)
+        private static string Norm(string s)
+        {
+            return string.IsNullOrEmpty(s) ? "" : s.Trim().ToLowerInvariant().Replace('\u2019', '\'').Replace('ё', 'е');
+        }
+
+        private static bool IsStrongAnchor(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return false;
+            return n.Contains("следующ") || n.Contains("предыдущ") || n.Contains("next song") || n.Contains("previous song") ||
+                   n.Contains("next track") || n.Contains("previous track") || n == "next" || n == "previous" ||
+                   n.Contains("не нравится") || n.Contains("don't like") || n.Contains("dont like") ||
+                   n.Contains("ұнамайды") || n.Contains("yoqmaydi") || n.Contains("келесі ән") || n.Contains("алдыңғы ән") ||
+                   n.Contains("keyingi tarona") || n.Contains("avvalgi tarona");
+        }
+
+        private static bool IsPlayAnchor(string n)
+        {
+            return n == "пауза" || n == "воспроизведение" || n == "pause" || n == "play" || n == "playback";
+        }
+        private static bool EvaluateSemantics(CandidateMeta m, bool nearStrong, out bool resolvedLiked)
         {
             resolvedLiked = false;
-            string n = ((rawName ?? "") + " | " + (rawHelp ?? "")).Trim().ToLowerInvariant();
-            if (n.Length <= 2) return false;
+            string nm = m.NameLower;
+            string n = string.IsNullOrEmpty(m.HelpLower) ? nm : (nm + " | " + m.HelpLower);
+            if (n.Length < 2) return false;
 
-            // Strictly reject Dislike, Block, Repeat, Shuffle, Queue, Pin, Share, Mute
             if (n.Contains("не нравится") || n.Contains("не рекомендовать") || n.Contains("дизлайк") ||
-                n.Contains("dislike") || n.Contains("thumbs down") || n.Contains("don't like") || n.Contains("do not like") ||
+                n.Contains("dislike") || n.Contains("thumbs down") || n.Contains("don't like") || n.Contains("dont like") ||
+                n.Contains("do not like") || n.Contains("ұнамайды") || n.Contains("yoqmaydi") ||
                 n.Contains("скрыть") || n.Contains("закрепить") || n.Contains("открепить") || n.Contains("pin") ||
-                n.Contains("повтор") || n.Contains("случайн") || n.Contains("перемеш") || n.Contains("очеред"))
-            {
+                n.Contains("повтор") || n.Contains("случайн") || n.Contains("перемеш") || n.Contains("очеред") ||
+                n.Contains("контекстное меню") || n.Contains("поделиться") || n.Contains("share"))
                 return false;
-            }
 
-            bool explicitUnlikeLabel =
+            bool explicitRemove =
                 n.Contains("удалить из") || n.Contains("убрать из") || n.Contains("убрать отметку") ||
-                n.Contains("снять лайк") || n.Contains("убрать лайк") || n.Contains("в любимом") ||
-                n.Contains("в коллекции") || n.Contains("добавлено в") ||
-                n.Contains("remove from") || n.Contains("saved to") || n.Contains("unlike");
+                n.Contains("снять лайк") || n.Contains("убрать лайк") || n.Contains("remove from") || n.Contains("unlike");
 
-            bool explicitLikeLabel =
-                explicitUnlikeLabel ||
-                n.Contains("нравится") || n.Contains("лайк") || n.Contains("любить") || n.Contains("любимое") ||
-                n.Contains("любимые") || n.Contains("в коллекцию") || n.Contains("в мою коллекцию") ||
-                n.Contains("в медиатеку") || n.Contains("в избранное") ||
-                n == "like | " || n.StartsWith("like |") || n.EndsWith("| like") ||
-                n.Contains("like ") || n.Contains("save to your library") || n.Contains("add to liked") ||
-                n.Contains("add to favorites") || n.Contains("favorite");
+            bool spotifyCheckedBox = nearStrong && m.ControlType == UIA_CheckBoxControlTypeId && m.HasToggle && m.ToggleVal == 1 &&
+                                     (n.Contains("добавить в плейлист") || n.Contains("add to playlist"));
 
-            if (!explicitLikeLabel) return false;
+            bool isLikeCtrl =
+                explicitRemove || spotifyCheckedBox ||
+                nm == "нравится" || nm == "like" || nm == "ұнайды" || nm == "yoqadi" ||
+                n.Contains("нравится") || n.Contains("лайк") || n.Contains("любить") || n.Contains("любимое") || n.Contains("любимые") ||
+                n.Contains("в коллекцию") || n.Contains("в мою коллекцию") || n.Contains("добавить в коллекцию") ||
+                n.Contains("в медиатеку") || n.Contains("добавить в медиатеку") || n.Contains("в избранное") ||
+                n == "like" || n.StartsWith("like |") || n.EndsWith("| like") ||
+                n.Contains("save to your library") || n.Contains("add to liked") || n.Contains("add to favorites") || n.Contains("favorite");
 
-            // 1) TogglePattern (maps directly to Chromium/Electron aria-pressed="true"/"false")
-            if (hasToggleState && (toggleStateVal == 0 || toggleStateVal == 1))
+            if (!isLikeCtrl) return false;
+
+            if (m.HasToggle && (m.ToggleVal == 0 || m.ToggleVal == 1))
             {
-                resolvedLiked = (toggleStateVal == 1) || explicitUnlikeLabel;
+                resolvedLiked = (m.ToggleVal == 1) ? true : explicitRemove;
                 return true;
             }
-
-            // 2) AriaProperties fallback ("pressed=true;")
-            if (!string.IsNullOrEmpty(rawAriaProps))
+            if (!string.IsNullOrEmpty(m.AriaProps))
             {
-                string ap = rawAriaProps.ToLowerInvariant();
-                if (ap.Contains("pressed=true") || ap.Contains("checked=true"))
-                {
-                    resolvedLiked = true;
-                    return true;
-                }
-                if (ap.Contains("pressed=false") || ap.Contains("checked=false"))
-                {
-                    resolvedLiked = explicitUnlikeLabel;
-                    return true;
-                }
+                string ap = m.AriaProps.ToLowerInvariant();
+                if (ap.Contains("pressed=true") || ap.Contains("checked=true")) { resolvedLiked = true; return true; }
+                if (ap.Contains("pressed=false") || ap.Contains("checked=false")) { resolvedLiked = explicitRemove; return true; }
             }
-
-            resolvedLiked = explicitUnlikeLabel;
+            resolvedLiked = explicitRemove;
             return true;
         }
 
-        private static IUIAutomationElement FindPlayerBarLikeElement(
-            IUIAutomation2 uia,
-            IntPtr playerHwnd,
-            bool isBrowser,
-            string windowTitle,
-            out bool isCurrentlyLiked)
+        private static IUIAutomationElement ScanRoot(
+            IUIAutomation2 uia, IntPtr hwnd, NativeWin32.RECT topWinRc, bool topIconic,
+            IUIAutomationCondition condInteractive, out bool resolvedLiked, out int totalBtns, out string dbg)
         {
-            isCurrentlyLiked = false;
-            if (uia == null || playerHwnd == IntPtr.Zero || !NativeWin32.IsWindowVisible(playerHwnd) || NativeWin32.IsIconic(playerHwnd))
-                return null;
-            if (!IsWindowResponsive(playerHwnd))
-                return null;
-
-            // For browsers, only inspect UIA if the visible tab actually looks like a music web player
-            if (isBrowser)
-            {
-                string tl = (windowTitle ?? "").ToLowerInvariant();
-                bool musicTab = tl.Contains("музык") || tl.Contains("music") || tl.Contains("spotify") ||
-                                tl.Contains("яндекс") || tl.Contains("deezer") || tl.Contains("soundcloud") || tl.Contains("vk");
-                if (!musicTab) return null;
-            }
-
-            NativeWin32.RECT winRc;
-            if (!NativeWin32.GetWindowRect(playerHwnd, out winRc)) return null;
-            int winW = winRc.Right - winRc.Left;
-            int winH = winRc.Bottom - winRc.Top;
-            if (winW < 200 || winH < 120) return null;
+            resolvedLiked = false; totalBtns = 0; dbg = "";
+            if (uia == null || hwnd == IntPtr.Zero || !IsWindowResponsive(hwnd)) return null;
 
             IUIAutomationElement root = null;
-            IUIAutomationCondition condBtn = null;
-            IUIAutomationCondition condChk = null;
-            IUIAutomationCondition condInteractive = null;
-            IUIAutomationCondition condToggle = null;
-            IUIAutomationCondition condFast = null;
-            IUIAutomationElement bestEl = null;
-            int bestScore = int.MinValue;
-            bool bestLiked = false;
-
+            IUIAutomationElementArray arr = null;
+            var items = new List<CandidateMeta>();
             try
             {
-                if (uia.ElementFromHandle(playerHwnd, out root) != 0 || root == null)
-                    return null;
+                if (uia.ElementFromHandle(hwnd, out root) != 0 || root == null) return null;
+                if (root.FindAll(UIA_TreeScope_Descendants, condInteractive, out arr) != 0 || arr == null) return null;
+                int len;
+                if (arr.get_Length(out len) != 0 || len <= 0) return null;
+                totalBtns = len;
 
-                uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out condBtn);
-                uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_CheckBoxControlTypeId, out condChk);
-                uia.CreateOrCondition(condBtn, condChk, out condInteractive);
-                uia.CreatePropertyCondition(UIA_IsTogglePatternAvailablePropertyId, true, out condToggle);
-                uia.CreateAndCondition(condInteractive, condToggle, out condFast);
+                int limit = Math.Min(len, 650);
+                int skipStart = (len > limit) ? 80 : len;
+                int resumeAt = (len > limit) ? (len - (limit - 80)) : len;
+                var strongAnchors = new List<int>();
+                var playAnchors = new List<int>();
 
-                // Pass 1 (Ultra-fast, <5ms, ~4-8 elements total): Buttons/CheckBoxes with TogglePattern (aria-pressed in Yandex Music, YouTube Music, Spotify)
-                // Pass 2 (Fallback if player uses plain Invoke Button without aria-pressed): Buttons/CheckBoxes only (NEVER ControlType.Custom!)
-                IUIAutomationCondition[] passes = new IUIAutomationCondition[] { condFast, condInteractive };
-
-                for (int pass = 0; pass < passes.Length; pass++)
+                for (int i = 0; i < len; i++)
                 {
-                    if (passes[pass] == null) continue;
-                    IUIAutomationElementArray arr = null;
-                    try
+                    if (i >= skipStart && i < resumeAt) continue;
+                    IUIAutomationElement el = null;
+                    if (arr.GetElement(i, out el) != 0 || el == null) continue;
+
+                    string rawNm = null, rawHelp = null, rawAria = null;
+                    int en = 1, ct = UIA_ButtonControlTypeId;
+                    el.get_CurrentIsEnabled(out en);
+                    el.get_CurrentControlType(out ct);
+                    el.get_CurrentName(out rawNm);
+                    el.get_CurrentHelpText(out rawHelp);
+                    el.get_CurrentAriaProperties(out rawAria);
+
+                    string nmNorm = Norm(rawNm), helpNorm = Norm(rawHelp);
+                    if (IsStrongAnchor(nmNorm) || IsStrongAnchor(helpNorm)) strongAnchors.Add(items.Count);
+                    else if (IsPlayAnchor(nmNorm) || IsPlayAnchor(helpNorm)) playAnchors.Add(items.Count);
+
+                    bool hasTog = false; int togVal = -1; object patObj = null;
+                    if (el.GetCurrentPattern(UIA_TogglePatternId, out patObj) == 0 && patObj != null)
                     {
-                        if (root.FindAll(UIA_TreeScope_Descendants, passes[pass], out arr) == 0 && arr != null)
-                        {
-                            int len;
-                            if (arr.get_Length(out len) == 0 && len > 0)
-                            {
-                                int maxInspect = Math.Min(len, 180);
-                                // Scan from bottom of DOM upward (PlayerBar footer is rendered at the end of the DOM!)
-                                for (int i = len - 1; i >= Math.Max(0, len - maxInspect); i--)
-                                {
-                                    IUIAutomationElement cand = null;
-                                    try
-                                    {
-                                        if (arr.GetElement(i, out cand) != 0 || cand == null) continue;
-
-                                        int enabled = 1, offscreen = 0;
-                                        cand.get_CurrentIsEnabled(out enabled);
-                                        cand.get_CurrentIsOffscreen(out offscreen);
-                                        if (enabled == 0 || offscreen != 0) { ReleaseCom(cand); cand = null; continue; }
-
-                                        string nm = null, help = null, ariaProps = null;
-                                        cand.get_CurrentName(out nm);
-                                        cand.get_CurrentHelpText(out help);
-                                        cand.get_CurrentAriaProperties(out ariaProps);
-
-                                        bool hasToggle = false;
-                                        int togVal = -1;
-                                        object patObj = null;
-                                        if (cand.GetCurrentPattern(UIA_TogglePatternId, out patObj) == 0 && patObj != null)
-                                        {
-                                            var tp = patObj as IUIAutomationTogglePattern;
-                                            if (tp != null && tp.get_CurrentToggleState(out togVal) == 0)
-                                                hasToggle = true;
-                                            ReleaseCom(patObj);
-                                        }
-
-                                        bool candLiked;
-                                        if (!EvaluateLikeButtonSemantics(nm, help, ariaProps, hasToggle, togVal, out candLiked))
-                                        {
-                                            ReleaseCom(cand); cand = null;
-                                            continue;
-                                        }
-
-                                        NativeWin32.RECT brc;
-                                        if (cand.get_CurrentBoundingRectangle(out brc) != 0)
-                                        {
-                                            ReleaseCom(cand); cand = null;
-                                            continue;
-                                        }
-
-                                        int bw = brc.Right - brc.Left;
-                                        int bh = brc.Bottom - brc.Top;
-                                        if (bw < 10 || bw > 140 || bh < 10 || bh > 90)
-                                        {
-                                            ReleaseCom(cand); cand = null;
-                                            continue;
-                                        }
-
-                                        float cy = (brc.Top + brc.Bottom) * 0.5f;
-                                        float relY = (cy - winRc.Top) / Math.Max(1f, (float)winH);
-
-                                        // Score strictly in favor of the persistent bottom PlayerBar (bottom 22% of window)
-                                        // or top Apple Music transport bar (top 14%), rejecting mid-page playlist rows!
-                                        int score = 0;
-                                        if (cy >= winRc.Bottom - Math.Max(138, (int)(winH * 0.22f)) && cy <= winRc.Bottom + 6)
-                                        {
-                                            score = 1000 + (int)(relY * 200f);
-                                        }
-                                        else if (relY >= 0.72f)
-                                        {
-                                            // Fullscreen Vibe / expanded mini-player controls in lower third
-                                            score = 600 + (int)(relY * 100f);
-                                        }
-                                        else if (relY <= 0.14f)
-                                        {
-                                            // Top bar player (iTunes / Apple Music / AIMP compact skin)
-                                            score = 450;
-                                        }
-                                        else
-                                        {
-                                            // Mid-window scrollable tracklist row — skip so we never like the wrong track!
-                                            ReleaseCom(cand); cand = null;
-                                            continue;
-                                        }
-
-                                        if (hasToggle) score += 80;
-
-                                        if (score > bestScore)
-                                        {
-                                            ReleaseCom(bestEl);
-                                            bestEl = cand;
-                                            cand = null;
-                                            bestScore = score;
-                                            bestLiked = candLiked;
-                                        }
-                                    }
-                                    catch { }
-                                    finally
-                                    {
-                                        if (cand != null) ReleaseCom(cand);
-                                    }
-                                }
-                            }
-                        }
+                        var tp = patObj as IUIAutomationTogglePattern;
+                        if (tp != null && tp.get_CurrentToggleState(out togVal) == 0) hasTog = true;
+                        ReleaseCom(patObj);
                     }
-                    finally
-                    {
-                        ReleaseCom(arr);
-                    }
-
-                    if (bestEl != null) break;
+                    NativeWin32.RECT brc;
+                    bool hasBounds = (el.get_CurrentBoundingRectangle(out brc) == 0);
+                    items.Add(new CandidateMeta { Element = el, NameLower = nmNorm, HelpLower = helpNorm, AriaProps = rawAria, ControlType = ct, HasToggle = hasTog, ToggleVal = togVal, Enabled = en, Bounds = brc, HasBounds = hasBounds });
                 }
+
+                int winW = topWinRc.Right - topWinRc.Left, winH = topWinRc.Bottom - topWinRc.Top;
+                bool validWin = !topIconic && winW >= 200 && winH >= 120;
+                int bestIdx = -1, bestScore = int.MinValue;
+                bool bestLiked = false;
+
+                for (int k = 0; k < items.Count; k++)
+                {
+                    var m = items[k];
+                    if (m.Enabled == 0) continue;
+
+                    int minStrong = int.MaxValue, minPlay = int.MaxValue;
+                    for (int s = 0; s < strongAnchors.Count; s++) { int d = Math.Abs(k - strongAnchors[s]); if (d < minStrong) minStrong = d; }
+                    for (int p = 0; p < playAnchors.Count; p++) { int d = Math.Abs(k - playAnchors[p]); if (d < minPlay) minPlay = d; }
+
+                    bool nearStrong = minStrong <= 14;
+                    bool nearPlay = minPlay <= 10;
+                    bool candLiked;
+                    if (!EvaluateSemantics(m, nearStrong, out candLiked)) continue;
+
+                    int score = 0;
+                    if (nearStrong) score += 3200 - minStrong * 50;
+                    else if (nearPlay) score += 1100 - minPlay * 35;
+
+                    int bw = m.Bounds.Right - m.Bounds.Left, bh = m.Bounds.Bottom - m.Bounds.Top;
+                    bool validBtn = m.HasBounds && bw >= 8 && bw <= 180 && bh >= 8 && bh <= 110;
+
+                    if (validWin && validBtn)
+                    {
+                        float cy = (m.Bounds.Top + m.Bounds.Bottom) * 0.5f;
+                        float relY = (cy - topWinRc.Top) / Math.Max(1f, (float)winH);
+                        if (cy >= topWinRc.Bottom - Math.Max(148, (int)(winH * 0.25f)) && cy <= topWinRc.Bottom + 16)
+                            score += 1400 + (int)(relY * 200f);
+                        else if (relY >= 0.70f) score += 750 + (int)(relY * 100f);
+                        else if (relY <= 0.15f) score += 480;
+                        else if (!nearStrong) continue;
+                    }
+                    else
+                    {
+                        if (!nearStrong && !nearPlay && k < items.Count - 24) continue;
+                        if (k >= items.Count - 24) score += 400 + (k - (items.Count - 24)) * 10;
+                    }
+
+                    if (m.HasToggle) score += 120;
+                    if (score > bestScore) { bestScore = score; bestIdx = k; bestLiked = candLiked; }
+                }
+
+                IUIAutomationElement winner = null;
+                for (int k = 0; k < items.Count; k++)
+                {
+                    if (k == bestIdx)
+                    {
+                        winner = items[k].Element;
+                        dbg = string.Format("name='{0}', tog={1}:{2}, score={3}, btns={4}", items[k].NameLower, items[k].HasToggle ? 1 : 0, items[k].ToggleVal, bestScore, len);
+                    }
+                    else ReleaseCom(items[k].Element);
+                    items[k].Element = null;
+                }
+                resolvedLiked = bestLiked;
+                return winner;
             }
             catch (Exception ex)
             {
-                LogDiagnostic("WARN", "CUIAutomation8 lookup skipped safely: " + ex.Message);
+                for (int k = 0; k < items.Count; k++) if (items[k].Element != null) { ReleaseCom(items[k].Element); items[k].Element = null; }
+                LogDiagnostic("WARN", "CUIAutomation8 scan skipped safely: " + ex.Message);
+                return null;
             }
-            finally
+            finally { ReleaseCom(arr); ReleaseCom(root); }
+        }
+        private static IUIAutomationElement FindPlayerBarLikeElement(
+            IUIAutomation2 uia, IntPtr topHwnd, IntPtr renderHwnd, bool isBrowser, string windowTitle,
+            bool allowColdWakeRetry, out bool isCurrentlyLiked, out string debugSummary)
+        {
+            isCurrentlyLiked = false; debugSummary = "";
+            if (uia == null || topHwnd == IntPtr.Zero) return null;
+
+            if (isBrowser)
             {
-                ReleaseCom(condFast);
-                ReleaseCom(condToggle);
-                ReleaseCom(condInteractive);
-                ReleaseCom(condChk);
-                ReleaseCom(condBtn);
-                ReleaseCom(root);
+                string tl = (windowTitle ?? "").ToLowerInvariant();
+                if (!(tl.Contains("музык") || tl.Contains("music") || tl.Contains("spotify") || tl.Contains("яндекс") || tl.Contains("deezer") || tl.Contains("soundcloud") || tl.Contains("vk")))
+                    return null;
             }
 
-            isCurrentlyLiked = bestLiked;
-            return bestEl;
+            NativeWin32.RECT winRc;
+            if (!NativeWin32.GetWindowRect(topHwnd, out winRc)) winRc = new NativeWin32.RECT();
+            bool isIconic = NativeWin32.IsIconic(topHwnd);
+
+            IUIAutomationCondition condBtn = null, condChk = null, condInteractive = null;
+            try
+            {
+                uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out condBtn);
+                uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_CheckBoxControlTypeId, out condChk);
+                uia.CreateOrCondition(condBtn, condChk, out condInteractive);
+                if (condInteractive == null) return null;
+
+                int maxAttempts = allowColdWakeRetry ? 3 : 1;
+                for (int attempt = 0; attempt < maxAttempts; attempt++)
+                {
+                    int rBtns = 0, tBtns = 0;
+                    if (renderHwnd != IntPtr.Zero)
+                    {
+                        var hitR = ScanRoot(uia, renderHwnd, winRc, isIconic, condInteractive, out isCurrentlyLiked, out rBtns, out debugSummary);
+                        if (hitR != null) return hitR;
+                    }
+                    var hitT = ScanRoot(uia, topHwnd, winRc, isIconic, condInteractive, out isCurrentlyLiked, out tBtns, out debugSummary);
+                    if (hitT != null) return hitT;
+
+                    if (attempt + 1 < maxAttempts && Math.Max(rBtns, tBtns) <= 5)
+                    {
+                        Thread.Sleep(185);
+                        if (renderHwnd == IntPtr.Zero) renderHwnd = MultiPlayerMediaController.FindRenderWidgetChild(topHwnd);
+                        continue;
+                    }
+                    break;
+                }
+            }
+            finally { ReleaseCom(condInteractive); ReleaseCom(condChk); ReleaseCom(condBtn); }
+            return null;
         }
 
         private static bool InvokeUiaButtonSafe(IUIAutomationElement btn)
@@ -2880,7 +2864,6 @@ namespace DynamicIslandWin
                     if (hr == 0) return true;
                 }
                 ReleaseCom(patObj); patObj = null;
-
                 if (btn.GetCurrentPattern(UIA_InvokePatternId, out patObj) == 0 && patObj is IUIAutomationInvokePattern)
                 {
                     int hr = ((IUIAutomationInvokePattern)patObj).Invoke();
@@ -2888,82 +2871,31 @@ namespace DynamicIslandWin
                     if (hr == 0) return true;
                 }
             }
-            catch (Exception ex)
-            {
-                LogDiagnostic("WARN", "UIA pattern invoke failed safely: " + ex.Message);
-            }
-            finally
-            {
-                ReleaseCom(patObj);
-            }
+            catch (Exception ex) { LogDiagnostic("WARN", "UIA invoke failed safely: " + ex.Message); }
+            finally { ReleaseCom(patObj); }
             return false;
         }
 
-        private static bool SendScanCodeShortcutFallback(IntPtr playerHwnd, bool isSpotify, bool isYandex, bool fullscreenGameActive)
+        private static bool SendSilentBackgroundKeyYandex(IntPtr topHwnd, IntPtr renderHwnd)
         {
-            if (playerHwnd == IntPtr.Zero || !NativeWin32.IsWindow(playerHwnd)) return false;
-            if (!isSpotify && !isYandex) return false;
-
+            IntPtr target = (renderHwnd != IntPtr.Zero && NativeWin32.IsWindow(renderHwnd)) ? renderHwnd : topHwnd;
+            if (target == IntPtr.Zero || !NativeWin32.IsWindow(target)) return false;
             try
             {
-                // 1) Zero-focus direct window message with real hardware scan code (0x21 = physical KeyF) for Yandex Music
-                if (isYandex)
+                uint scanF = 0x21;
+                IntPtr lDown = new IntPtr((int)((scanF << 16) | 1));
+                IntPtr lUp = new IntPtr(unchecked((int)(0xC0000001u | (scanF << 16))));
+                if (topHwnd != IntPtr.Zero && NativeWin32.GetForegroundWindow() != topHwnd)
                 {
-                    uint scanF = 0x21;
-                    IntPtr lParamDown = new IntPtr((int)((scanF << 16) | 1));
-                    IntPtr lParamUp = new IntPtr(unchecked((int)(0xC0000001u | (scanF << 16))));
-                    NativeWin32.PostMessage(playerHwnd, NativeWin32.WM_KEYDOWN, new IntPtr(0x46), lParamDown);
-                    Thread.Sleep(25);
-                    NativeWin32.PostMessage(playerHwnd, NativeWin32.WM_KEYUP, new IntPtr(0x46), lParamUp);
-                    if (!fullscreenGameActive && NativeWin32.GetForegroundWindow() == playerHwnd)
-                        return true;
+                    NativeWin32.PostMessage(topHwnd, NativeWin32.WM_ACTIVATE, new IntPtr(1), IntPtr.Zero);
+                    Thread.Sleep(12);
                 }
-
-                // Never disturb foreground during a fullscreen game!
-                if (fullscreenGameActive) return isYandex;
-
-                // 2) If minimized/hidden to tray on desktop, perform a quick hardware scan-code SendInput pulse
-                IntPtr prevFg = NativeWin32.GetForegroundWindow();
-                bool wasIconic = NativeWin32.IsIconic(playerHwnd);
-                bool wasVisible = NativeWin32.IsWindowVisible(playerHwnd);
-                if (!wasVisible) return isYandex;
-
-                if (wasIconic)
-                    NativeWin32.ShowWindow(playerHwnd, NativeWin32.SW_RESTORE);
-
-                NativeWin32.ForceForegroundWindow(playerHwnd);
-                Thread.Sleep(45);
-
-                if (isSpotify)
-                {
-                    // Spotify Desktop: Alt (0x38) + Shift (0x2A) + B (vk=0x42, scan=0x30)
-                    NativeWin32.SendHardwareKey(NativeWin32.VK_MENU, 0x38, false);
-                    NativeWin32.SendHardwareKey(NativeWin32.VK_SHIFT, 0x2A, false);
-                    NativeWin32.SendHardwareKey(0x42, 0x30, false);
-                    NativeWin32.SendHardwareKey(0x42, 0x30, true);
-                    NativeWin32.SendHardwareKey(NativeWin32.VK_SHIFT, 0x2A, true);
-                    NativeWin32.SendHardwareKey(NativeWin32.VK_MENU, 0x38, true);
-                }
-                else if (isYandex)
-                {
-                    // Yandex Music v5: physical KeyF (vk=0x46, hardware scan=0x21 — works on both EN and RU layouts!)
-                    NativeWin32.SendHardwareKey(0x46, 0x21, false);
-                    NativeWin32.SendHardwareKey(0x46, 0x21, true);
-                }
-
-                Thread.Sleep(35);
-                if (wasIconic)
-                    NativeWin32.ShowWindow(playerHwnd, NativeWin32.SW_SHOWMINNOACTIVE);
-                if (prevFg != IntPtr.Zero && prevFg != playerHwnd && NativeWin32.IsWindow(prevFg))
-                    NativeWin32.ForceForegroundWindow(prevFg);
-
+                NativeWin32.PostMessage(target, NativeWin32.WM_KEYDOWN, new IntPtr(0x46), lDown);
+                Thread.Sleep(20);
+                NativeWin32.PostMessage(target, NativeWin32.WM_KEYUP, new IntPtr(0x46), lUp);
                 return true;
             }
-            catch (Exception ex)
-            {
-                LogDiagnostic("WARN", "Shortcut fallback failed safely: " + ex.Message);
-                return false;
-            }
+            catch (Exception ex) { LogDiagnostic("WARN", "Silent background key failed: " + ex.Message); return false; }
         }
 
         private static void StaWorkerLoop()
@@ -2972,169 +2904,124 @@ namespace DynamicIslandWin
             try
             {
                 uia = (IUIAutomation2)(new CUIAutomation8ComObject());
-                uia.put_AutoSetFocus(0);           // NEVER call SetFocus inside target player!
-                uia.put_ConnectionTimeout(600);    // Hard 600ms IPC connection ceiling
-                uia.put_TransactionTimeout(900);   // Hard 900ms cross-process call ceiling
+                uia.put_AutoSetFocus(0);
+                uia.put_ConnectionTimeout(750);
+                uia.put_TransactionTimeout(1100);
             }
-            catch (Exception ex)
-            {
-                LogDiagnostic("ERROR", "CUIAutomation8 init failed (shortcut/local mode active): " + ex.Message);
-                uia = null;
-            }
+            catch (Exception ex) { LogDiagnostic("ERROR", "CUIAutomation8 init failed: " + ex.Message); uia = null; }
 
             while (true)
             {
                 _wakeEvt.WaitOne(2500);
-
                 FavWorkItem job = null;
                 lock (_queueLock)
                 {
-                    if (_pendingToggle != null)
-                    {
-                        job = _pendingToggle;
-                        _pendingToggle = null;
-                    }
-                    else if (_pendingSync != null)
-                    {
-                        job = _pendingSync;
-                        _pendingSync = null;
-                    }
+                    if (_pendingToggle != null) { job = _pendingToggle; _pendingToggle = null; }
+                    else if (_pendingSync != null) { job = _pendingSync; _pendingSync = null; }
                 }
                 if (job == null) continue;
-
-                try
-                {
-                    ExecuteJobOnSta(uia, job);
-                }
-                catch (Exception ex)
-                {
-                    LogDiagnostic("ERROR", "Unhandled STA favorite job error: " + ex.Message);
-                }
+                try { ExecuteJobOnSta(uia, job); }
+                catch (Exception ex) { LogDiagnostic("ERROR", "Unhandled STA job error: " + ex.Message); }
             }
         }
 
         private static void ExecuteJobOnSta(IUIAutomation2 uia, FavWorkItem job)
         {
-            var res = new PlayerFavoriteSyncResult { TrackKey = job.TrackKey };
+            var res = new PlayerFavoriteSyncResult { TrackKey = job.TrackKey, Generation = job.Generation };
             bool isSpotify, isYandex, isBrowser;
             PlayerFavoriteSupport sup = ClassifyPlayerSupport(job.Snapshot, out isSpotify, out isYandex, out isBrowser);
 
             if (sup == PlayerFavoriteSupport.Unsupported)
             {
-                res.PlayerSupported = false;
-                res.SyncedFromPlayer = false;
-                res.IsLiked = job.ExpectedTargetLiked;
-                res.StatusMessage = "Плеер не поддерживает API избранного — сохранено локально";
-                if (job.IsToggleAction)
-                    LogDiagnostic("INFO", "Unsupported player '" + (job.Snapshot.DisplayAppName ?? job.Snapshot.AppId) + "' — stored favorite locally without touching process.");
+                res.PlayerSupported = false; res.SyncedFromPlayer = false; res.IsLiked = job.ExpectedTargetLiked;
+                if (job.IsToggleAction) LogDiagnostic("INFO", "Unsupported player '" + (job.Snapshot.DisplayAppName ?? job.Snapshot.AppId) + "' — stored locally.");
                 if (job.Callback != null) job.Callback(res);
                 return;
             }
 
-            string winTitle;
-            IntPtr hwnd = MultiPlayerMediaController.FindPlayerWindowSafe(job.Snapshot, isSpotify, isYandex, out winTitle);
+            string winTitle; IntPtr renderHwnd;
+            IntPtr topHwnd = MultiPlayerMediaController.FindPlayerWindowSafe(job.Snapshot, isSpotify, isYandex, out winTitle, out renderHwnd);
 
             if (!job.IsToggleAction)
             {
-                // PASSIVE 2-WAY SYNC FROM PLAYER -> DYNAMIC ISLAND
-                if (hwnd == IntPtr.Zero) return;
-                bool playerLiked;
-                IUIAutomationElement btn = FindPlayerBarLikeElement(uia, hwnd, isBrowser, winTitle, out playerLiked);
+                if (topHwnd == IntPtr.Zero) return;
+                bool playerLiked; string dbg;
+                var btn = FindPlayerBarLikeElement(uia, topHwnd, renderHwnd, isBrowser, winTitle, true, out playerLiked, out dbg);
                 if (btn != null)
                 {
                     ReleaseCom(btn);
-                    res.SyncedFromPlayer = true;
-                    res.IsLiked = playerLiked;
+                    res.SyncedFromPlayer = true; res.IsLiked = playerLiked;
+                    LogDiagnostic("SYNC", "Read player favorite state for '" + job.TrackKey + "' -> IsLiked=" + playerLiked + " [" + dbg + "]");
                     if (job.Callback != null) job.Callback(res);
                 }
                 return;
             }
 
-            // ACTIVE TOGGLE COMMAND: DYNAMIC ISLAND -> PLAYER (with post-toggle verification)
-            if (hwnd == IntPtr.Zero)
+            if (topHwnd == IntPtr.Zero)
             {
-                res.PlayerSupported = false;
-                res.IsLiked = job.ExpectedTargetLiked;
-                res.StatusMessage = "Окно плеера свёрнуто в трей — отметка сохранена локально";
-                LogDiagnostic("INFO", "Player window unavailable for '" + job.Snapshot.DisplayAppName + "' — kept local favorite.");
+                res.PlayerSupported = false; res.SyncedFromPlayer = false; res.IsLiked = job.ExpectedTargetLiked;
+                LogDiagnostic("INFO", "Player window unavailable for '" + job.Snapshot.DisplayAppName + "' — kept local state.");
                 if (job.Callback != null) job.Callback(res);
                 return;
             }
 
-            bool curLikedBefore;
-            IUIAutomationElement likeBtn = FindPlayerBarLikeElement(uia, hwnd, isBrowser, winTitle, out curLikedBefore);
+            bool curLikedBefore; string beforeDbg;
+            var likeBtn = FindPlayerBarLikeElement(uia, topHwnd, renderHwnd, isBrowser, winTitle, true, out curLikedBefore, out beforeDbg);
             if (likeBtn != null)
             {
+                bool alreadyMatched = (curLikedBefore == job.ExpectedTargetLiked);
                 bool invoked = false;
-                try
-                {
-                    // Only click if player's current state differs from user's desired target state (prevents accidental double-toggle!)
-                    if (curLikedBefore != job.ExpectedTargetLiked)
-                    {
-                        invoked = InvokeUiaButtonSafe(likeBtn);
-                    }
-                    else
-                    {
-                        invoked = true;
-                    }
-                }
-                finally
-                {
-                    ReleaseCom(likeBtn);
-                }
+                try { invoked = alreadyMatched ? true : InvokeUiaButtonSafe(likeBtn); }
+                finally { ReleaseCom(likeBtn); }
 
                 if (invoked)
                 {
-                    Thread.Sleep(240);
-                    bool verifiedLiked;
-                    IUIAutomationElement checkBtn = FindPlayerBarLikeElement(uia, hwnd, isBrowser, winTitle, out verifiedLiked);
-                    if (checkBtn != null)
+                    if (alreadyMatched)
                     {
-                        ReleaseCom(checkBtn);
-                        res.SyncedFromPlayer = true;
-                        res.IsLiked = verifiedLiked;
+                        res.SyncedFromPlayer = true; res.IsLiked = curLikedBefore;
+                        LogDiagnostic("INFO", "Aligned phase without redundant toggle for '" + job.TrackKey + "' -> IsLiked=" + res.IsLiked + " [" + beforeDbg + "]");
+                        if (job.Callback != null) job.Callback(res);
+                        return;
                     }
-                    else
+
+                    bool verifiedLiked = job.ExpectedTargetLiked;
+                    bool gotVerify = false;
+                    int[] waits = new int[] { 90, 140, 220 };
+                    for (int w = 0; w < waits.Length; w++)
                     {
-                        res.SyncedFromPlayer = true;
-                        res.IsLiked = job.ExpectedTargetLiked;
+                        Thread.Sleep(waits[w]);
+                        bool vLiked; string vDbg;
+                        var checkBtn = FindPlayerBarLikeElement(uia, topHwnd, renderHwnd, isBrowser, winTitle, false, out vLiked, out vDbg);
+                        if (checkBtn != null)
+                        {
+                            ReleaseCom(checkBtn);
+                            verifiedLiked = vLiked; gotVerify = true;
+                            if (vLiked == job.ExpectedTargetLiked) break;
+                        }
                     }
-                    LogDiagnostic("INFO", "Synced favorite via CUIAutomation8 for '" + job.TrackKey + "' -> IsLiked=" + res.IsLiked);
+
+                    res.SyncedFromPlayer = true;
+                    res.IsLiked = gotVerify ? verifiedLiked : job.ExpectedTargetLiked;
+                    LogDiagnostic("INFO", "Toggled favorite in background via CUIAutomation8 for '" + job.TrackKey + "' (" + curLikedBefore + " -> " + res.IsLiked + ") [" + beforeDbg + "]");
                     if (job.Callback != null) job.Callback(res);
                     return;
                 }
             }
 
-            // Safe scan-code shortcut fallback ONLY for Yandex Music / Spotify
-            if (sup == PlayerFavoriteSupport.SupportedUiaAndShortcut)
+            if (sup == PlayerFavoriteSupport.SupportedUiaAndBgKey && SendSilentBackgroundKeyYandex(topHwnd, renderHwnd))
             {
-                bool sent = SendScanCodeShortcutFallback(hwnd, isSpotify, isYandex, job.FullscreenGameActive);
-                if (sent)
-                {
-                    Thread.Sleep(240);
-                    bool afterShortcutLiked;
-                    IUIAutomationElement verifyBtn = FindPlayerBarLikeElement(uia, hwnd, isBrowser, winTitle, out afterShortcutLiked);
-                    if (verifyBtn != null)
-                    {
-                        ReleaseCom(verifyBtn);
-                        res.SyncedFromPlayer = true;
-                        res.IsLiked = afterShortcutLiked;
-                    }
-                    else
-                    {
-                        res.SyncedFromPlayer = true;
-                        res.IsLiked = job.ExpectedTargetLiked;
-                    }
-                    LogDiagnostic("INFO", "Toggled favorite via hardware scan-code shortcut for '" + job.Snapshot.DisplayAppName + "' -> IsLiked=" + res.IsLiked);
-                    if (job.Callback != null) job.Callback(res);
-                    return;
-                }
+                Thread.Sleep(180);
+                bool afterLiked; string afterDbg;
+                var verifyBtn = FindPlayerBarLikeElement(uia, topHwnd, renderHwnd, isBrowser, winTitle, false, out afterLiked, out afterDbg);
+                if (verifyBtn != null) { ReleaseCom(verifyBtn); res.SyncedFromPlayer = true; res.IsLiked = afterLiked; }
+                else { res.SyncedFromPlayer = false; res.IsLiked = job.ExpectedTargetLiked; }
+                LogDiagnostic("INFO", "Sent silent background KeyF for hidden '" + job.Snapshot.DisplayAppName + "' -> IsLiked=" + res.IsLiked);
+                if (job.Callback != null) job.Callback(res);
+                return;
             }
 
-            res.PlayerSupported = false;
-            res.IsLiked = job.ExpectedTargetLiked;
-            res.StatusMessage = "Кнопка избранного недоступна — сохранено локально";
-            LogDiagnostic("INFO", "Like button not exposed in '" + job.Snapshot.DisplayAppName + "' — kept local state.");
+            res.PlayerSupported = false; res.SyncedFromPlayer = false; res.IsLiked = job.ExpectedTargetLiked;
+            LogDiagnostic("INFO", "Like button unreachable in background for '" + job.Snapshot.DisplayAppName + "' — kept local state without window activation.");
             if (job.Callback != null) job.Callback(res);
         }
     }
@@ -3311,6 +3198,7 @@ namespace DynamicIslandWin
         [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
         [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
         [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
         [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
@@ -6709,6 +6597,10 @@ namespace DynamicIslandWin
         private System.Windows.Forms.Timer _relayoutTimer = null;
         private string _lastLikeSyncSig = "";
         private int _lastLikeSyncTick = 0;
+        private int _likeActionGeneration = 0;
+        private volatile bool _livePlayerLikedKnown = false;
+        private string _livePlayerLikedTrackKey = "";
+        private volatile bool _livePlayerLikedValue = false;
 
         private bool _ghostModeActive = false;
         private bool _ghostUnlockedByUser = false;
@@ -7187,6 +7079,12 @@ namespace DynamicIslandWin
         {
             _collapseTimer.Stop();
             _liveBannerText = "";
+            if (_expandedPage == 0 && !_isFullscreenAppActive)
+            {
+                MediaSessionSnapshot snapNow;
+                lock (_stateLock) { snapNow = _currentMedia; }
+                PlayerFavoriteEngine.RequestSyncStateAsync(snapNow, Volatile.Read(ref _likeActionGeneration), ApplySyncedFavoriteResult);
+            }
             if (_mode == IslandMode.Expanded && !_isAnimating) return;
             _mode = IslandMode.Expanded;
             StartSpringTransition(_config.expanded_width, _config.expanded_height, 1.0f, _config.anim_duration_ms, true);
@@ -7661,15 +7559,19 @@ namespace DynamicIslandWin
                             _currentPlayerIdx = activeIdx;
                         }
 
-                        // 2-Way Favorite Sync (on every track change + every 2.8s while Expanded on Page 0 outside fullscreen games)
+                        // 2-Way Favorite Sync (Single Source of Truth: immediate on startup/track change + retry until synced + every 2.0s while Expanded)
                         int nowSync = Environment.TickCount;
+                        string activeTrackKey = PlayerFavoriteEngine.BuildTrackKey(activeSnap);
                         bool trackChangedForLike = !string.Equals(sig, _lastLikeSyncSig, StringComparison.Ordinal);
-                        bool periodicExpandedSync = (_mode == IslandMode.Expanded && _expandedPage == 0 && !_isFullscreenAppActive && unchecked(nowSync - _lastLikeSyncTick) >= 2800);
-                        if ((trackChangedForLike || periodicExpandedSync) && !string.IsNullOrEmpty(PlayerFavoriteEngine.BuildTrackKey(activeSnap)))
+                        bool needsInitialSync = !_livePlayerLikedKnown || !string.Equals(_livePlayerLikedTrackKey, activeTrackKey, StringComparison.OrdinalIgnoreCase);
+                        bool periodicSync = !_isFullscreenAppActive && (
+                            (_mode == IslandMode.Expanded && _expandedPage == 0 && unchecked(nowSync - _lastLikeSyncTick) >= 2000) ||
+                            (needsInitialSync && unchecked(nowSync - _lastLikeSyncTick) >= 2200));
+                        if ((trackChangedForLike || periodicSync) && !string.IsNullOrEmpty(activeTrackKey))
                         {
                             _lastLikeSyncSig = sig;
                             _lastLikeSyncTick = nowSync;
-                            PlayerFavoriteEngine.RequestSyncStateAsync(activeSnap, ApplySyncedFavoriteResult);
+                            PlayerFavoriteEngine.RequestSyncStateAsync(activeSnap, Volatile.Read(ref _likeActionGeneration), ApplySyncedFavoriteResult, trackChangedForLike);
                         }
                     }
 
@@ -8436,9 +8338,19 @@ namespace DynamicIslandWin
 
         private bool IsCurrentTrackLiked()
         {
-            if (_config.liked_tracks == null) return false;
             string key = CurrentTrackFavoriteKey();
-            if (string.IsNullOrWhiteSpace(key) || key == " — ") return false;
+            if (string.IsNullOrWhiteSpace(key) || key == " — " || (_currentMedia.Title ?? "") == "Не воспроизводится")
+                return false;
+
+            if (_livePlayerLikedKnown && string.Equals(_livePlayerLikedTrackKey, key, StringComparison.OrdinalIgnoreCase))
+                return _livePlayerLikedValue;
+
+            bool isSpotify, isYandex, isBrowser;
+            PlayerFavoriteSupport sup = PlayerFavoriteEngine.ClassifyPlayerSupport(_currentMedia, out isSpotify, out isYandex, out isBrowser);
+            if (sup != PlayerFavoriteSupport.Unsupported)
+                return false;
+
+            if (_config.liked_tracks == null) return false;
             foreach (string s in _config.liked_tracks)
                 if (string.Equals(s, key, StringComparison.OrdinalIgnoreCase)) return true;
             return false;
@@ -8447,45 +8359,47 @@ namespace DynamicIslandWin
         private void ApplySyncedFavoriteResult(PlayerFavoriteSyncResult res)
         {
             if (res == null || string.IsNullOrWhiteSpace(res.TrackKey) || _disposing) return;
+            if (res.Generation < Volatile.Read(ref _likeActionGeneration)) return;
+
             if (InvokeRequired)
             {
                 try { BeginInvoke((MethodInvoker)delegate { ApplySyncedFavoriteResult(res); }); } catch { }
                 return;
             }
+            if (res.Generation < Volatile.Read(ref _likeActionGeneration)) return;
+
+            bool uiChanged = false;
+            if (res.SyncedFromPlayer || !res.PlayerSupported)
+            {
+                if (!_livePlayerLikedKnown ||
+                    !string.Equals(_livePlayerLikedTrackKey, res.TrackKey, StringComparison.OrdinalIgnoreCase) ||
+                    _livePlayerLikedValue != res.IsLiked)
+                {
+                    uiChanged = true;
+                }
+                _livePlayerLikedTrackKey = res.TrackKey;
+                _livePlayerLikedValue = res.IsLiked;
+                _livePlayerLikedKnown = true;
+            }
 
             if (_config.liked_tracks == null) _config.liked_tracks = new List<string>();
-            bool changed = false;
-
+            bool cfgChanged = false;
             if (res.IsLiked)
             {
                 bool exists = false;
                 foreach (string s in _config.liked_tracks)
-                {
                     if (string.Equals(s, res.TrackKey, StringComparison.OrdinalIgnoreCase)) { exists = true; break; }
-                }
-                if (!exists)
-                {
-                    _config.liked_tracks.Add(res.TrackKey);
-                    changed = true;
-                }
+                if (!exists) { _config.liked_tracks.Add(res.TrackKey); cfgChanged = true; }
             }
             else
             {
                 for (int i = _config.liked_tracks.Count - 1; i >= 0; i--)
-                {
                     if (string.Equals(_config.liked_tracks[i], res.TrackKey, StringComparison.OrdinalIgnoreCase))
-                    {
-                        _config.liked_tracks.RemoveAt(i);
-                        changed = true;
-                    }
-                }
+                    { _config.liked_tracks.RemoveAt(i); cfgChanged = true; }
             }
 
-            if (changed)
-            {
-                ConfigManager.Save(_config);
-                RenderLayeredFrame();
-            }
+            if (cfgChanged) ConfigManager.Save(_config);
+            if (uiChanged || cfgChanged) RenderLayeredFrame();
         }
 
         private void ToggleCurrentTrackFavorite()
@@ -8496,24 +8410,29 @@ namespace DynamicIslandWin
 
             bool wasLiked = IsCurrentTrackLiked();
             bool targetLiked = !wasLiked;
+            int gen = Interlocked.Increment(ref _likeActionGeneration);
+
+            _livePlayerLikedTrackKey = key;
+            _livePlayerLikedValue = targetLiked;
+            _livePlayerLikedKnown = true;
 
             if (!targetLiked)
             {
                 for (int i = _config.liked_tracks.Count - 1; i >= 0; i--)
-                {
                     if (string.Equals(_config.liked_tracks[i], key, StringComparison.OrdinalIgnoreCase))
                         _config.liked_tracks.RemoveAt(i);
-                }
             }
             else
             {
-                _config.liked_tracks.Add(key);
+                bool exists = false;
+                foreach (string s in _config.liked_tracks)
+                    if (string.Equals(s, key, StringComparison.OrdinalIgnoreCase)) { exists = true; break; }
+                if (!exists) _config.liked_tracks.Add(key);
             }
 
             ConfigManager.Save(_config);
             RenderLayeredFrame();
-
-            PlayerFavoriteEngine.RequestToggleFavoriteAsync(_currentMedia, targetLiked, _isFullscreenAppActive, ApplySyncedFavoriteResult);
+            PlayerFavoriteEngine.RequestToggleFavoriteAsync(_currentMedia, targetLiked, gen, ApplySyncedFavoriteResult);
         }
 
         private void PromptAddAppViaExplorer()
