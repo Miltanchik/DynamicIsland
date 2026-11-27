@@ -8790,11 +8790,18 @@ namespace DynamicIslandWin
             bool gameThrottle = _isFullscreenAppActive && _mode == IslandMode.Idle && !_isAnimating && !_isHovered &&
                                 _expandedPage != 1 && !_isResizingWithLCtrl && !_lctrlHeld;
 
-            // MODULE 1: Smooth Fullscreen Auto-Hide fade & upward slide
+            // MODULE 1 & VIDEO HIDE: Smooth Fullscreen / Video Playback Auto-Hide fade & upward slide
             bool wantAutoHideFs = _isFullscreenAppActive && (_expandedPage != 1) &&
                                   (_config.fullscreen_mode == "Авто-скрытие" || _config.hide_in_fullscreen);
-            float targetFsAlpha = wantAutoHideFs ? 0.0f : 1.0f;
-            float targetFsLift = wantAutoHideFs ? -42.0f : 0.0f;
+            bool wantAutoHideVideo = _config.hide_on_video_playback && _isVideoPlayingActive &&
+                                     (_expandedPage != 1) && !_ghostUnlockedByUser;
+            if (wantAutoHideVideo && _mode == IslandMode.Expanded && !_isHovered && !_isDraggingDockApp && _ownDialogOrMenuDepth == 0)
+            {
+                CollapseToIdle();
+            }
+            bool wantAutoHideAny = wantAutoHideFs || wantAutoHideVideo;
+            float targetFsAlpha = wantAutoHideAny ? 0.0f : 1.0f;
+            float targetFsLift = wantAutoHideAny ? -42.0f : 0.0f;
             if (Math.Abs(_fullscreenAutoHideFactor - targetFsAlpha) > 0.008f || Math.Abs(_fullscreenLiftOffsetY - targetFsLift) > 0.2f)
             {
                 _fullscreenAutoHideFactor += (targetFsAlpha - _fullscreenAutoHideFactor) * 0.22f;
@@ -8806,10 +8813,27 @@ namespace DynamicIslandWin
                 _fullscreenAutoHideFactor = targetFsAlpha;
                 _fullscreenLiftOffsetY = targetFsLift;
             }
-            _hiddenByFullscreen = (_fullscreenAutoHideFactor < 0.03f);
+            bool fullyHiddenFade = (_fullscreenAutoHideFactor < 0.03f);
+            _hiddenByFullscreen = wantAutoHideFs && fullyHiddenFade;
+            _hiddenByVideo = wantAutoHideVideo && fullyHiddenFade;
+
+            // STRICT Z-ORDER GUARD: Keep Island strictly HWND_TOPMOST above normal & topmost windows, respecting exceptions & zero focus steal
+            bool nowSuppressedZ = ShouldSuppressTopMostAssertion();
+            int nowZTick = Environment.TickCount;
+            if (_wasSuppressedTopMost && !nowSuppressedZ)
+            {
+                _lastZOrderCheckTick = nowZTick;
+                AssertIslandTopMostSafe(true, false);
+            }
+            else if (!nowSuppressedZ && unchecked(nowZTick - _lastZOrderCheckTick) >= 380)
+            {
+                _lastZOrderCheckTick = nowZTick;
+                AssertIslandTopMostSafe(false, false);
+            }
+            _wasSuppressedTopMost = nowSuppressedZ;
 
             // MODULE 3: Ghost Mode & Smart Cursor Reaction (35px proximity buffer, 20% opacity, -5px lift, click-through until 500ms center dwell / Alt+Space / LCtrl/LAlt)
-            if (_config.enable_ghost_mode && _mode != IslandMode.Expanded && !_lctrlHeld && !_isResizingWithLCtrl && !wantAutoHideFs)
+            if (_config.enable_ghost_mode && _mode != IslandMode.Expanded && !_lctrlHeld && !_isResizingWithLCtrl && !wantAutoHideAny)
             {
                 RectangleF basePill = new RectangleF((CanvasW - pill.Width) / 2f, Math.Max(0, _config.top_margin), pill.Width, pill.Height);
                 RectangleF proxZone = RectangleF.Inflate(basePill, 35f, 35f);
@@ -8876,9 +8900,9 @@ namespace DynamicIslandWin
                 _ghostLiftOffsetY = targetGhostLift;
             }
 
-            bool inside = !_hiddenByFullscreen && !_ghostModeActive && hitBox.Contains(localPt.X, localPt.Y);
+            bool inside = !fullyHiddenFade && !wantAutoHideAny && !_ghostModeActive && hitBox.Contains(localPt.X, localPt.Y);
 
-            SetWin32ClickThrough((!inside || _ghostModeActive || wantAutoHideFs) && !_isResizingWithLCtrl);
+            SetWin32ClickThrough((!inside || _ghostModeActive || wantAutoHideAny) && !_isResizingWithLCtrl);
 
             if (inside && !_isHovered)
             {
@@ -9067,9 +9091,12 @@ namespace DynamicIslandWin
                 }
             }
 
-            if (_hiddenByFullscreen && !_isAnimating)
+            if (_dockSettleAnimating)
+                needsRedraw = true;
+
+            if ((_hiddenByFullscreen || _hiddenByVideo) && !_isAnimating)
             {
-                if (_frameTimer.Interval != 450) _frameTimer.Interval = 450;
+                if (_frameTimer.Interval != 380) _frameTimer.Interval = 380;
                 return;
             }
 
@@ -9153,19 +9180,11 @@ namespace DynamicIslandWin
                             bool fsChanged = (fsNow != _isFullscreenAppActive);
                             _isFullscreenAppActive = fsNow;
                             // Page 2 (Screen Share Viewer) ALWAYS stays visible and strictly expanded even over fullscreen games/apps!
-                            _hiddenByFullscreen = (_expandedPage != 1) && _config.hide_in_fullscreen && fsNow;
-                            if ((fsNow || _expandedPage == 1) && !_hiddenByFullscreen &&
-                                (fsChanged || unchecked(nowFs - _lastTopmostAssertTick) > 4000))
+                            _hiddenByFullscreen = (_expandedPage != 1) && (_config.hide_in_fullscreen || _config.fullscreen_mode == "Авто-скрытие") && fsNow;
+                            if (!ShouldSuppressTopMostAssertion() && (fsChanged || unchecked(nowFs - _lastTopmostAssertTick) > 2500))
                             {
                                 _lastTopmostAssertTick = nowFs;
-                                // SWP_ASYNCWINDOWPOS: never block this worker on the UI thread (cross-thread SetWindowPos is a synchronous SendMessage)
-                                NativeWin32.SetWindowPos(Handle, NativeWin32.HWND_TOPMOST, 0, 0, 0, 0,
-                                    NativeWin32.SWP_NOMOVE | NativeWin32.SWP_NOSIZE | NativeWin32.SWP_NOACTIVATE | NativeWin32.SWP_ASYNCWINDOWPOS);
-                                if (_expandedPage == 1 && _dwmOverlay != null && _dwmOverlay.IsHandleCreated && _dwmOverlay.Visible)
-                                {
-                                    NativeWin32.SetWindowPos(_dwmOverlay.Handle, NativeWin32.HWND_TOPMOST, 0, 0, 0, 0,
-                                        NativeWin32.SWP_NOMOVE | NativeWin32.SWP_NOSIZE | NativeWin32.SWP_NOACTIVATE | NativeWin32.SWP_ASYNCWINDOWPOS);
-                                }
+                                AssertIslandTopMostSafe(fsChanged, true);
                             }
                         }
                     }
@@ -9206,6 +9225,7 @@ namespace DynamicIslandWin
                             _currentMedia = activeSnap;
                             _currentPlayerIdx = activeIdx;
                         }
+                        InstalledMusicPlayerDiscovery.RememberFromActiveSession(_config, activeSnap);
 
                         // 2-Way Favorite Sync (Single Source of Truth: immediate on startup/track change + up to 2 cold retries + every 2.0s while Expanded)
                         int nowSync = Environment.TickCount;
@@ -9274,11 +9294,31 @@ namespace DynamicIslandWin
                         _audio.RefreshMicrophoneState();
                     }
 
-                    // MODULE 6: Unobtrusive GitHub Releases check (12s after start, then every 6 hours, deferred during fullscreen games)
+                    // Universal Video Playback Auto-Hide detection (SMTC MediaPlaybackType.Video + Local Video Players + Fullscreen Browser Video)
+                    bool videoPlayingNow = false;
+                    if (_config.hide_on_video_playback && IsHandleCreated)
+                    {
+                        Screen[] vScreens = Screen.AllScreens;
+                        Screen monScr = vScreens.Length > 0 ? vScreens[Math.Max(0, Math.Min(_config.monitor_index, vScreens.Length - 1))] : Screen.PrimaryScreen;
+                        videoPlayingNow = SystemSensors.IsUniversalVideoPlaying(Handle, monScr, _audio);
+                    }
+                    else
+                    {
+                        videoPlayingNow = false;
+                    }
+                    if (videoPlayingNow != _isVideoPlayingActive)
+                    {
+                        _isVideoPlayingActive = videoPlayingNow;
+                        if (!videoPlayingNow) _ghostUnlockedByUser = false;
+                        _bgStateDirty = true;
+                        WakeRenderLoop();
+                    }
+
+                    // MODULE 6: Unobtrusive main/release/version.json check (4.5s after start, then every 6 hours, deferred during fullscreen games)
                     long nowTick = Environment.TickCount;
                     if (!_isFullscreenAppActive)
                     {
-                        if (!_initialUpdateCheckDone && (nowTick - _startupTick >= 12000))
+                        if (!_initialUpdateCheckDone && (nowTick - _startupTick >= 4500))
                         {
                             _initialUpdateCheckDone = true;
                             _lastAutoUpdateCheckTick = nowTick;
@@ -9316,7 +9356,7 @@ namespace DynamicIslandWin
                 }
                 catch { }
 
-                int waitMs = _hiddenByFullscreen ? 3500 : ((_isFullscreenAppActive && _mode == IslandMode.Idle) ? 1500 : ((_mode == IslandMode.Idle && !_watchdog.IsWatchdogArmed && !_currentMedia.IsPlaying) ? 1800 : 1000));
+                int waitMs = (_config.hide_on_video_playback && (_isVideoPlayingActive || _hiddenByVideo)) ? 600 : (_hiddenByFullscreen ? 3500 : ((_isFullscreenAppActive && _mode == IslandMode.Idle) ? 1500 : ((_mode == IslandMode.Idle && !_watchdog.IsWatchdogArmed && !_currentMedia.IsPlaying && !_config.hide_on_video_playback) ? 1800 : 900)));
                 _bgWakeEvent.WaitOne(waitMs);
             }
             if (cpuCounter != null) { try { cpuCounter.Dispose(); } catch { } }
@@ -10490,7 +10530,7 @@ namespace DynamicIslandWin
 
             try
             {
-            if (!_hiddenByFullscreen)
+            if (!_hiddenByFullscreen && !_hiddenByVideo)
             {
                 RectangleF pill = CurrentPillRect();
                 float compactRadius = pill.Height / 2f;
@@ -10666,7 +10706,7 @@ namespace DynamicIslandWin
             }
 
             // Sync hardware DWM 60/144 FPS thumbnail overlay for Page 2
-            if (!_hiddenByFullscreen && _mode == IslandMode.Expanded && _expandedPage == 1 && _curProg > 0.72f)
+            if (!_hiddenByFullscreen && !_hiddenByVideo && _mode == IslandMode.Expanded && _expandedPage == 1 && _curProg > 0.72f)
             {
                 var activeSrc = _streamEngine.GetActiveSource(Handle);
                 if (activeSrc != null && _rcStreamViewport.Width > 30 && _rcStreamViewport.Height > 30)
