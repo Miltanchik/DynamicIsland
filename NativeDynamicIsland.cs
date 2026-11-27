@@ -7954,17 +7954,17 @@ namespace DynamicIslandWin
 
             DrawModuleCartridgeSlot(g, new RectangleF(cx + cW + 8f, cy, cW, cH),
                 "MOD-08", "ТЕЛЕМЕТРИЯ & VAULT", _cfg.show_telemetry ? ("CPU/RAM + " + (_cfg.watchdog_action ?? "Сон")) : "СКРЫТА",
-                _cfg.show_telemetry, true, _inspectorSubMode == 2,
-                () => _cfg.show_telemetry = !_cfg.show_telemetry, () => _inspectorSubMode = 2);
+                _cfg.show_telemetry, true, _inspectorSubMode == 3,
+                () => _cfg.show_telemetry = !_cfg.show_telemetry, () => _inspectorSubMode = 3);
 
             var insp = new RectangleF(536f, 308f, 330f, 318f);
-            string[] subTabs = { "ТАЙМЕР/ЗВУК", "ПЛЕЕР/EQ", "СКРИНЫ/СОН" };
+            string[] subTabs = { "ТАЙМЕР", "ПЛЕЕР", "ЭКВАЛАЙЗЕР", "СКРИНЫ" };
             DrawBentoCell(g, insp, "02.B", "ИНСПЕКТОР МОДУЛЯ", "SLOT TUNER");
 
             float sx = insp.X + 10f;
             float sy = insp.Y + 30f;
-            float stW = (insp.Width - 28f) / 3f;
-            for (int i = 0; i < 3; i++)
+            float stW = (insp.Width - 32f) / 4f;
+            for (int i = 0; i < 4; i++)
             {
                 var stRc = new RectangleF(sx + i * (stW + 4f), sy, stW, 22f);
                 bool act = (_inspectorSubMode == i);
@@ -8050,11 +8050,10 @@ namespace DynamicIslandWin
                     "LIVE-БАННЕР СМЕНЫ ТРЕКА", _cfg.enable_live_activities, v => _cfg.enable_live_activities = v);
                 iy += 35f;
 
-                string[] eqVals = { "5 Полос", "7 Полос", "Выкл" };
-                DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 46f),
-                    "РЕЖИМ АУДИО-ЭКВАЛАЙЗЕРА", eqVals, eqVals, _cfg.eq_style ?? "5 Полос", 3,
-                    val => _cfg.eq_style = val);
-                iy += 52f;
+                DrawHardwareButton(g, new RectangleF(sx, iy, iw, 26f),
+                    "≋ КАСТОМНЫЙ ЭКВАЛАЙЗЕР (" + (_cfg.eq_style ?? "Столбики") + ") → НАСТРОИТЬ", true, false,
+                    () => { _inspectorSubMode = 2; _stageMode = StagePreviewMode.Media; SyncStageTargetsFromMode(true); Invalidate(); });
+                iy += 34f;
 
                 var defP = InstalledMusicPlayerDiscovery.ResolveDefaultPlayer(_cfg);
                 string defLbl = defP != null ? ("♫ АВТОЗАПУСК PLAY: " + defP.DisplayName + " ▾") : "♫ АВТОЗАПУСК PLAY: СПРАШИВАТЬ (МЕНЮ) ▾";
@@ -8084,6 +8083,53 @@ namespace DynamicIslandWin
                     }
                     menu.Show(PointToScreen(new Point((int)defBtnRc.X, (int)defBtnRc.Bottom + 2)));
                 });
+            }
+            else if (_inspectorSubMode == 2)
+            {
+                string[] eqStyles = { "Столбики", "Точки", "Волна", "Зеркальный", "Выкл" };
+                string[] eqShort = { "Столбики", "Точки", "Волна", "Зеркало", "Выкл" };
+                DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 64f),
+                    "СТИЛЬ ВИЗУАЛИЗАТОРА (4 ВИДА + ВЫКЛ)", eqStyles, eqShort, _cfg.eq_style ?? "Столбики", 3,
+                    val => { _cfg.eq_style = val; if (val != "Выкл") _stageMode = StagePreviewMode.Media; SyncStageTargetsFromMode(true); });
+                iy += 70f;
+
+                string[] colModes = { "Градиент темы", "Обложка трека", "Один цвет" };
+                string[] colShort = { "Градиент", "Под обложку", "Один цвет" };
+                DrawChipSelectorMatrix(g, new RectangleF(sx, iy, iw, 40f),
+                    "РЕЖИМ ЦВЕТА ЭКВАЛАЙЗЕРА", colModes, colShort, _cfg.eq_color_mode ?? "Градиент темы", 3,
+                    val => _cfg.eq_color_mode = val);
+                iy += 44f;
+
+                Color curEqCol = ColorThemeUtils.ParseHex(_cfg.eq_custom_color_hex, Color.FromArgb(34, 211, 238));
+                var swRc = new RectangleF(sx, iy + 2f, 22f, 20f);
+                using (GraphicsPath swp = SharpRoundRect(swRc, 4f))
+                using (var swb = new SolidBrush(curEqCol))
+                using (var swPen = new Pen(ColBorderHi, 1f))
+                {
+                    g.FillPath(swb, swp);
+                    g.DrawPath(swPen, swp);
+                }
+                DrawHardwareButton(g, new RectangleF(sx + 26f, iy, iw - 26f, 23f),
+                    "🎨 ВЫБРАТЬ СВОЙ ЦВЕТ ЭКВАЛАЙЗЕРА (" + (_cfg.eq_custom_color_hex ?? "#22D3EE") + ")", _cfg.eq_color_mode == "Один цвет", false,
+                    () => PickColorInteractive(curEqCol, picked =>
+                    {
+                        _cfg.eq_custom_color_hex = ColorThemeUtils.ToHex(picked);
+                        _cfg.eq_color_mode = "Один цвет";
+                    }));
+                iy += 28f;
+
+                float halfEqW = (iw - 6f) * 0.5f;
+                DrawPrecisionTickSlider(g, new RectangleF(sx, iy, halfEqW, 52f),
+                    "ПОЛОСЫ / ТОЧКИ", _cfg.eq_bar_count, 4, 12, _cfg.eq_bar_count.ToString(), 8,
+                    () => _cfg.eq_bar_count, v => _cfg.eq_bar_count = v);
+                DrawPrecisionTickSlider(g, new RectangleF(sx + halfEqW + 6f, iy, halfEqW, 52f),
+                    "ЧУВСТВИТЕЛЬНОСТЬ", _cfg.eq_sensitivity_pct, 40, 220, _cfg.eq_sensitivity_pct + "%", 9,
+                    () => _cfg.eq_sensitivity_pct, v => _cfg.eq_sensitivity_pct = v);
+                iy += 58f;
+
+                DrawPrecisionTickSlider(g, new RectangleF(sx, iy, iw, 52f),
+                    "ПЛАВНОСТЬ АНИМАЦИИ (ИНЕРЦИЯ СПАДА)", _cfg.eq_smoothing_pct, 10, 95, _cfg.eq_smoothing_pct + "%", 14,
+                    () => _cfg.eq_smoothing_pct, v => _cfg.eq_smoothing_pct = v);
             }
             else
             {
@@ -8242,28 +8288,82 @@ namespace DynamicIslandWin
                 Color.FromArgb(245, 245, 247)
             };
 
-            DrawChipSelectorMatrix(g, new RectangleF(px, py, pw, 108f),
+            DrawChipSelectorMatrix(g, new RectangleF(px, py, pw, 92f),
                 "АКЦЕНТНАЯ ПАЛИТРА ОСТРОВА (9 СТУДИЙНЫХ ПРОФИЛЕЙ)",
                 themes, themeShort, _cfg.theme_preset ?? "Dinasmic Neon", 3,
                 val => _cfg.theme_preset = val, swatches);
-            py += 116f;
+            py += 98f;
 
-            string[] eqVals = { "5 Полос", "7 Полос", "Выкл" };
-            DrawChipSelectorMatrix(g, new RectangleF(px, py, pw, 48f),
-                "ВИЗУАЛИЗАЦИЯ СПЕКТРА (ЭКВАЛАЙЗЕР)", eqVals, eqVals, _cfg.eq_style ?? "5 Полос", 3,
-                val => _cfg.eq_style = val);
-            py += 56f;
+            string[] uiPresets = { "Kinetic Dark", "Daylight Light", "Cyber Neon", "Monochrome", "Custom" };
+            string[] uiLabels = { "Тёмная", "Светлая", "Неон", "Монохром", "Своя" };
+            Color[] uiSwatches =
+            {
+                Color.FromArgb(255, 85, 0),
+                Color.FromArgb(240, 244, 252),
+                Color.FromArgb(34, 211, 238),
+                Color.FromArgb(212, 212, 218),
+                ColorThemeUtils.ParseHex(_cfg.settings_custom_accent_hex, ColAccent)
+            };
+            DrawChipSelectorMatrix(g, new RectangleF(px, py, pw, 42f),
+                "ЦВЕТОВАЯ ГАММА ОКНА НАСТРОЕК (ПРИМЕНЯЕТСЯ НА ЛЕТУ)",
+                uiPresets, uiLabels, _cfg.settings_theme_preset ?? "Kinetic Dark", 5,
+                val =>
+                {
+                    _cfg.settings_theme_preset = val;
+                    if (val != "Custom") _cfg.settings_custom_bg_hex = "";
+                }, uiSwatches);
+            py += 46f;
+
+            float bSyncW = pw * 0.42f - 4f;
+            float bAccW = pw * 0.30f - 2f;
+            float bBgW = pw - bSyncW - bAccW - 8f;
+            DrawHardwareButton(g, new RectangleF(px, py, bSyncW, 24f),
+                _cfg.settings_sync_island_accent ? "● СИНХР. С ОСТРОВОМ: ВКЛ" : "○ СИНХР. С ОСТРОВОМ",
+                _cfg.settings_sync_island_accent, false,
+                () =>
+                {
+                    _cfg.settings_sync_island_accent = !_cfg.settings_sync_island_accent;
+                    ApplyLive();
+                });
+
+            DrawHardwareButton(g, new RectangleF(px + bSyncW + 4f, py, bAccW, 24f),
+                "🎨 АКЦЕНТ UI", _cfg.settings_theme_preset == "Custom" && !_cfg.settings_sync_island_accent, false,
+                () => PickColorInteractive(ColAccent, picked =>
+                {
+                    if (_cfg.settings_theme_preset != "Custom" && string.IsNullOrEmpty(_cfg.settings_custom_bg_hex))
+                        _cfg.settings_custom_bg_hex = ColorThemeUtils.ToHex(ColChassis);
+                    _cfg.settings_custom_accent_hex = ColorThemeUtils.ToHex(picked);
+                    _cfg.settings_sync_island_accent = false;
+                    _cfg.settings_theme_preset = "Custom";
+                }));
+
+            DrawHardwareButton(g, new RectangleF(px + bSyncW + bAccW + 8f, py, bBgW, 24f),
+                "🎨 ФОН UI", !string.IsNullOrEmpty(_cfg.settings_custom_bg_hex), false,
+                () => PickColorInteractive(ColChassis, picked =>
+                {
+                    _cfg.settings_custom_bg_hex = ColorThemeUtils.ToHex(picked);
+                    if (string.IsNullOrEmpty(_cfg.settings_custom_accent_hex))
+                        _cfg.settings_custom_accent_hex = ColorThemeUtils.ToHex(ColAccent);
+                    _cfg.settings_theme_preset = "Custom";
+                }));
+            py += 30f;
 
             int opPct = (int)Math.Round(_cfg.bg_opacity / 2.55f);
             float halfW = (pw - 8f) * 0.5f;
-            DrawPrecisionTickSlider(g, new RectangleF(px, py, halfW, 104f),
+            DrawPrecisionTickSlider(g, new RectangleF(px, py, halfW, 74f),
                 "ПЛОТНОСТЬ ФОНА", opPct, 25, 100, opPct + "%", 14,
                 () => (int)Math.Round(_cfg.bg_opacity / 2.55f),
                 v => _cfg.bg_opacity = Math.Max(64, Math.Min(255, (int)Math.Round(v * 2.55f))));
 
-            DrawPrecisionTickSlider(g, new RectangleF(px + halfW + 8f, py, halfW, 104f),
+            DrawPrecisionTickSlider(g, new RectangleF(px + halfW + 8f, py, halfW, 74f),
                 "КОНТУРНЫЙ БЛИК", _cfg.border_glow, 0, 140, _cfg.border_glow.ToString(), 14,
                 () => _cfg.border_glow, v => _cfg.border_glow = v);
+            py += 80f;
+
+            DrawHardwareButton(g, new RectangleF(px, py, pw, 23f),
+                "≋ СТУДИЯ ЭКВАЛАЙЗЕРА: " + (_cfg.eq_style ?? "Столбики").ToUpperInvariant() + " • " + (_cfg.eq_color_mode ?? "Градиент темы").ToUpperInvariant() + " → ОТКРЫТЬ",
+                false, false,
+                () => { _activeTab = 1; _inspectorSubMode = 2; _stageMode = StagePreviewMode.Media; SyncStageTargetsFromMode(true); Invalidate(); });
 
             var skinCell = new RectangleF(478f, 308f, 388f, 204f);
             string bgName = string.IsNullOrEmpty(_cfg.custom_bg_path) ? "PURE #000000" : Path.GetFileName(_cfg.custom_bg_path);
