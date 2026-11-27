@@ -2526,16 +2526,15 @@ namespace DynamicIslandWin
 
         [DllImport("oleacc.dll")] private static extern int AccessibleChildren([MarshalAs(UnmanagedType.Interface)] object paccContainer, int iChildStart, int cChildren, [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 2)] object[] rgvarChildren, out int pcObtained);
 
-        private static void DumpAccTree(object acc, int depth, StringBuilder sb, ref int btnCount)
+        private static object FindLikeAccRecursive(object acc, int depth, List<string> recentNames, ref object bestBtn, ref int bestScore, ref bool bestLiked, ref string bestDbg)
         {
-            if (acc == null || depth > 18 || btnCount > 80) return;
+            if (acc == null || depth > 22) return null;
             object vSelf = 0;
             int role = 0, state = 0, childCount = 0;
             string name = "";
             try
             {
-                // Query IA2 on every container up to depth 6 to wake WebView's BrowserAccessibilityManagerWin!
-                if (depth <= 7)
+                if (depth <= 8)
                 {
                     var sp = acc as IComServiceProvider;
                     if (sp != null)
@@ -2554,35 +2553,64 @@ namespace DynamicIslandWin
                 if (sObj is int) state = (int)sObj;
                 object cObj = t.InvokeMember("accChildCount", System.Reflection.BindingFlags.GetProperty, null, acc, null);
                 if (cObj is int) childCount = (int)cObj;
-                if (role == 43 || role == 44 || role == 15 || depth <= 6)
+                if (role == 43 || role == 44 || role == 62)
                 {
                     object nObj = t.InvokeMember("accName", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
-                    name = nObj as string ?? "";
+                    name = Norm(nObj as string ?? "");
+                    recentNames.Add(name);
+                    if ((state & 0x01) == 0 && !string.IsNullOrEmpty(name))
+                    {
+                        var cm = new CandidateMeta
+                        {
+                            NameLower = name,
+                            HelpLower = "",
+                            ControlType = (role == 44) ? UIA_CheckBoxControlTypeId : UIA_ButtonControlTypeId,
+                            HasToggle = true,
+                            ToggleVal = ((state & 0x08) != 0 || (state & 0x10) != 0) ? 1 : 0,
+                            Enabled = 1
+                        };
+                        bool candLiked;
+                        if (EvaluateSemantics(cm, true, out candLiked))
+                        {
+                            // Score higher when right next to Dislike / Prev / Next in PlayerBar
+                            int sc = 1000 + recentNames.Count * 2;
+                            for (int back = Math.Max(0, recentNames.Count - 8); back < recentNames.Count - 1; back++)
+                            {
+                                if (IsStrongAnchor(recentNames[back]) || IsPlayAnchor(recentNames[back]))
+                                    sc += 3000;
+                            }
+                            if (sc >= bestScore)
+                            {
+                                if (bestBtn != null) ReleaseCom(bestBtn);
+                                bestBtn = acc;
+                                bestScore = sc;
+                                bestLiked = candLiked;
+                                bestDbg = string.Format("name='{0}' state=0x{1:X} liked={2} sc={3}", name, state, candLiked, sc);
+                                return bestBtn; // caller must NOT release bestBtn!
+                            }
+                        }
+                    }
                 }
             }
-            catch { return; }
+            catch { return null; }
 
-            if (depth <= 6 || role == 15 || role == 43 || role == 44)
-            {
-                if (role == 43 || role == 44) btnCount++;
-                sb.AppendLine(string.Format("{0}d={1} role={2} state=0x{3:X} ch={4} name='{5}'",
-                    new string(' ', depth * 2), depth, role, state, childCount, name));
-            }
-
-            if (childCount <= 0 || childCount > 400) return;
+            if (childCount <= 0 || childCount > 500) return null;
             object[] kids = new object[childCount];
             int got;
             if (AccessibleChildren(acc, 0, childCount, kids, out got) == 0 && got > 0)
             {
                 for (int i = 0; i < got; i++)
                 {
-                    if (kids[i] != null && !(kids[i] is int))
+                    object k = kids[i];
+                    if (k != null && !(k is int))
                     {
-                        DumpAccTree(kids[i], depth + 1, sb, ref btnCount);
-                        ReleaseCom(kids[i]);
+                        FindLikeAccRecursive(k, depth + 1, recentNames, ref bestBtn, ref bestScore, ref bestLiked, ref bestDbg);
+                        if (!ReferenceEquals(k, bestBtn))
+                            ReleaseCom(k);
                     }
                 }
             }
+            return bestBtn;
         }
 
         public static string RunDiagnosticProbe()
@@ -2590,30 +2618,32 @@ namespace DynamicIslandWin
             var sb = new StringBuilder();
             try
             {
+                IntPtr fgBefore = NativeWin32.GetForegroundWindow();
                 var dummyYm = new MediaSessionSnapshot { AppId = "YandexMusic", DisplayAppName = "Яндекс Музыка", Title = "Probe", Artist = "Probe" };
                 string wt; IntPtr rw;
                 IntPtr top = MultiPlayerMediaController.FindPlayerWindowSafe(dummyYm, false, true, out wt, out rw);
-                sb.AppendLine("YM top=" + top + " title='" + wt + "'");
-                if (top != IntPtr.Zero)
+                Guid iidAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+
+                for (int step = 0; step < 3; step++)
                 {
-                    Guid iidAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
-                    object accObj = null;
-                    if (NativeWin32.AccessibleObjectFromWindow(top, 0xFFFFFFFCu, ref iidAcc, out accObj) == 0 && accObj != null)
+                    object accRoot = null;
+                    if (NativeWin32.AccessibleObjectFromWindow(top, 0xFFFFFFFCu, ref iidAcc, out accRoot) == 0 && accRoot != null)
                     {
-                        int bc1 = 0;
-                        sb.AppendLine("=== PASS 1 (WAKE) ===");
-                        DumpAccTree(accObj, 0, sb, ref bc1);
-                        ReleaseCom(accObj);
-                    }
-                    Thread.Sleep(550);
-                    if (NativeWin32.AccessibleObjectFromWindow(top, 0xFFFFFFFCu, ref iidAcc, out accObj) == 0 && accObj != null)
-                    {
-                        int bc2 = 0;
-                        sb.AppendLine("=== PASS 2 (AFTER 550ms) ===");
-                        DumpAccTree(accObj, 0, sb, ref bc2);
-                        ReleaseCom(accObj);
+                        object best = null; int sc = int.MinValue; bool liked = false; string dbg = "";
+                        FindLikeAccRecursive(accRoot, 0, new List<string>(), ref best, ref sc, ref liked, ref dbg);
+                        if (!ReferenceEquals(accRoot, best)) ReleaseCom(accRoot);
+
+                        sb.AppendLine(string.Format("Step {0}: found={1} liked={2} [{3}] fg={4}", step, best != null, liked, dbg, NativeWin32.GetForegroundWindow()));
+                        if (best != null && step < 2)
+                        {
+                            best.GetType().InvokeMember("accDoDefaultAction", System.Reflection.BindingFlags.InvokeMethod, null, best, new object[] { 0 });
+                            ReleaseCom(best);
+                            Thread.Sleep(350);
+                        }
+                        else if (best != null) ReleaseCom(best);
                     }
                 }
+                sb.AppendLine("FG unchanged: " + (fgBefore == NativeWin32.GetForegroundWindow()));
             }
             catch (Exception ex) { sb.AppendLine("ERR: " + ex); }
             return sb.ToString();
