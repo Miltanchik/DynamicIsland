@@ -3423,7 +3423,6 @@ namespace DynamicIslandWin
         private float _stageStartW = 310f, _stageStartH = 36f, _stageStartExp = 0f;
         private float _stageCurW = 310f, _stageCurH = 36f, _stageCurExp = 0f;
         private float _stageTargetW = 310f, _stageTargetH = 36f, _stageTargetExp = 0f;
-        private float _stagePulseScale = 1.0f;
         private long _stagePulseStartMs = -9999;
         private float _stageWavePhase = 0f;
         private long _lastModifiedTick = 0;
