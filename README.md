@@ -1,7 +1,42 @@
 <div align="center">
-  <img src="assets/icon.png" alt="Dinasmic Island Logo" width="128" height="128" />
-  <h1>Dynamic Island for Windows 10 / 11</h1>
-  <p><b>Нативный 60 FPS оверлей на C# (.NET Framework 4.8 + Win32 Layered DIB + DWM) без внешних зависимостей</b></p>
+
+<img src="assets/hero.svg" alt="Dynamic Island for Windows 10 / 11" width="100%" />
+
+<br /><br />
+
+<p>
+  <b>Бесплатный нативный 60 FPS оверлей для Windows 10 / 11 x64.</b><br />
+  Мульти-плеер, аппаратные DWM-стримы, полка скриншотов и умный игровой режим.
+</p>
+
+<br />
+
+<a href="https://github.com/YOUR_USERNAME/DynamicIsland/releases/latest/download/DynamicIslandWin_Setup.exe">
+  <img src="assets/download-button.svg" alt="Скачать Dynamic Island" width="340" />
+</a>
+
+<br /><br />
+
+<p>
+  <a href="https://github.com/YOUR_USERNAME/DynamicIsland/releases/latest/download/DynamicIslandWin.exe">Скачать только приложение для Windows x64</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/YOUR_USERNAME/DynamicIsland/releases/latest">Что нового</a>
+  &nbsp;·&nbsp;
+  <a href="#-быстрая-установка-и-запуск">Как запустить</a>
+  &nbsp;·&nbsp;
+  <a href="#-краткая-инструкция-по-управлению">Управление</a>
+  &nbsp;·&nbsp;
+  <a href="#вариант-2--сборка-из-исходников-встроенным-компилятором-windows">Сборка</a>
+</p>
+
+<p>
+  <img src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D6?style=flat&logo=windows&logoColor=white" alt="Windows 10 / 11 x64" />
+  <img src="https://img.shields.io/badge/.NET%20Framework-4.8-512BD4?style=flat" alt=".NET Framework 4.8" />
+  <img src="https://img.shields.io/badge/Dependencies-None-2ea44f?style=flat" alt="No Dependencies" />
+</p>
+
+<sub>C# Win32 Layered DIB + DWM · исходники доступны · без внешних зависимостей</sub>
+
 </div>
 
 ---
@@ -18,7 +53,7 @@
 ## 🚀 Быстрая установка и запуск
 
 ### Вариант 1 — Готовый установщик (рекомендуется)
-1. Скачайте **`DynamicIslandWin_Setup.exe`** (или `DinamicIsland-Setup.exe`) из раздела **Releases** (или из папки `release/`).
+1. Нажмите большую кнопку **«Скачать DYNAMIC ISLAND»** вверху страницы или скачайте **`DynamicIslandWin_Setup.exe`** из раздела [Releases](https://github.com/YOUR_USERNAME/DynamicIsland/releases/latest).
 2. Запустите установщик и нажмите **«Установить Dynamic Island»** — приложение распакуется в `%LOCALAPPDATA%\Programs\DynamicIslandWin`, создаст ярлыки и сразу запустится.
 
 ### Вариант 2 — Сборка из исходников (встроенным компилятором Windows)
@@ -33,7 +68,8 @@ $wm  = "C:\Windows\System32\WinMetadata"
   /win32icon:"DynamicIslandWin.ico" `
   /out:"release\DynamicIslandWin.exe" `
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
-  /r:System.Web.Extensions.dll /r:System.Management.dll ` `
+  /r:System.Web.Extensions.dll /r:System.Management.dll `
+  /r:"$wpf\UIAutomationClient.dll" /r:"$wpf\UIAutomationTypes.dll" `
   /r:"$fw\System.Runtime.dll" /r:"$fw\System.Runtime.WindowsRuntime.dll" `
   /r:"$wm\Windows.Foundation.winmd" /r:"$wm\Windows.Media.winmd" /r:"$wm\Windows.Storage.winmd" `
   "NativeDynamicIsland.cs"
