@@ -2588,6 +2588,51 @@ namespace DynamicIslandWin
                         }
                         ReleaseCom(btnArr1);
 
+                        // Safe COM AccessibleObjectFromWindow(OBJID_CLIENT) + IAccessible::get_accChildCount wakeup!
+                        Guid iidAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+                        object accObj = null;
+                        int hrAcc = NativeWin32.AccessibleObjectFromWindow(top, 0xFFFFFFFCu, ref iidAcc, out accObj);
+                        sb.AppendLine("AccessibleObjectFromWindow(OBJID_CLIENT) hr=0x" + hrAcc.ToString("X8") + " null=" + (accObj == null));
+                        if (accObj != null)
+                        {
+                            try
+                            {
+                                // Invoke DISPID_ACC_CHILDCOUNT (-5001) or Type.InvokeMember to trigger Chromium OnScreenReaderDetected!
+                                object cc = accObj.GetType().InvokeMember("accChildCount", System.Reflection.BindingFlags.GetProperty, null, accObj, null);
+                                object nm = accObj.GetType().InvokeMember("accName", System.Reflection.BindingFlags.GetProperty, null, accObj, new object[] { 0 });
+                                sb.AppendLine("IAccessible accChildCount=" + cc + " accName='" + nm + "'");
+                            }
+                            catch (Exception exAcc) { sb.AppendLine("IAcc invoke: " + exAcc.Message); }
+                            finally { ReleaseCom(accObj); }
+                        }
+
+                        Thread.Sleep(450);
+
+                        IUIAutomationElement root2;
+                        if (uia.ElementFromHandle(top, out root2) == 0 && root2 != null)
+                        {
+                            IUIAutomationElementArray btnArr2;
+                            int hrB2 = root2.FindAll(4 /* Descendants */, cBtn, out btnArr2);
+                            int bLen2 = -1;
+                            if (btnArr2 != null) btnArr2.get_Length(out bLen2);
+                            sb.AppendLine("After Wake Buttons hr=0x" + hrB2.ToString("X8") + " len=" + bLen2);
+                            for (int i = 0; i < Math.Min(Math.Max(0, bLen2), 45); i++)
+                            {
+                                IUIAutomationElement be;
+                                if (btnArr2.GetElement(i, out be) == 0 && be != null)
+                                {
+                                    string bn; be.get_CurrentName(out bn);
+                                    object pat; int tv = -1;
+                                    if (be.GetCurrentPattern(UIA_TogglePatternId, out pat) == 0 && pat is IUIAutomationTogglePattern)
+                                    { ((IUIAutomationTogglePattern)pat).get_CurrentToggleState(out tv); ReleaseCom(pat); }
+                                    sb.AppendLine(string.Format("  Btn2[{0}] tog={1} name='{2}'", i, tv, bn));
+                                    ReleaseCom(be);
+                                }
+                            }
+                            ReleaseCom(btnArr2);
+                            ReleaseCom(root2);
+                        }
+
                         ReleaseCom(cBtn);
                         ReleaseCom(cTrue);
                         ReleaseCom(root);
