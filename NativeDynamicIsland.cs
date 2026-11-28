@@ -4859,7 +4859,7 @@ namespace DynamicIslandWin
 
         private static string Norm(string s)
         {
-            return string.IsNullOrEmpty(s) ? "" : s.Trim().ToLowerInvariant().Replace('’', ''').Replace(' ', ' ').Replace('ё', 'е');
+            return string.IsNullOrEmpty(s) ? "" : s.Trim().ToLowerInvariant().Replace('\u2019', '\'').Replace('\u00A0', ' ').Replace('ё', 'е');
         }
 
         private static bool IsStrongAnchor(string n, string aid = "")
