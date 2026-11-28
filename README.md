@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./assets/hero.svg" alt="Dynamic Island for Windows 10 / 11" width="100%" />
+<img src="./assets/hero_banner.svg" alt="Dynamic Island for Windows 10 / 11" width="100%" />
 
 <br /><br />
 
@@ -11,14 +11,14 @@
 
 <br />
 
-<a href="https://github.com/Miltanchik/DynamicIsland/releases/latest/download/DynamicIslandWin_Setup.exe">
-  <img src="./assets/download-button.svg" alt="Скачать Dynamic Island" width="340" />
+<a href="https://github.com/Miltanchik/DynamicIsland/raw/main/release/DynamicIslandWin_Setup.exe">
+  <img src="./assets/download_button.svg" alt="Скачать Dynamic Island" width="340" />
 </a>
 
 <br /><br />
 
 <p>
-  <a href="https://github.com/Miltanchik/DynamicIsland/releases/latest/download/DynamicIslandWin.exe">Скачать только приложение для Windows x64</a>
+  <a href="https://github.com/Miltanchik/DynamicIsland/raw/main/release/DynamicIslandWin.exe">Скачать только приложение для Windows x64</a>
   &nbsp;·&nbsp;
   <a href="https://github.com/Miltanchik/DynamicIsland/releases">Что нового</a>
   &nbsp;·&nbsp;
