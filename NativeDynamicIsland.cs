@@ -18,12 +18,17 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Security.Cryptography;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.WindowsRuntime;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using Windows.Foundation;
+using Windows.Graphics;
+using Windows.Graphics.Capture;
+using Windows.Graphics.DirectX;
+using Windows.Graphics.DirectX.Direct3D11;
 using Windows.Media;
 using Windows.Media.Control;
 using Windows.Storage.Streams;
@@ -34,8 +39,8 @@ using System.Reflection;
 [assembly: AssemblyProduct("Dynamic Island Studio")]
 [assembly: AssemblyCompany("DynamicIslandWin")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("3.4.0.0")]
-[assembly: AssemblyFileVersion("3.4.0.0")]
+[assembly: AssemblyVersion("3.4.1.0")]
+[assembly: AssemblyFileVersion("3.4.1.0")]
 namespace DynamicIslandWin
 {
     public static class ColorThemeUtils
@@ -786,8 +791,21 @@ namespace DynamicIslandWin
     }
 
     // =========================================================================
-    // 1C. LIVE SCREEN-SHARE & VIDEO STREAM CAPTURE ENGINE (Discord / YouTube / Web)
+    // 1C. LIVE SCREEN-SHARE & VIDEO STREAM CAPTURE ENGINE (WGC D3D11 + DWM Fallback)
     // =========================================================================
+    [ComImport, Guid("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IGraphicsCaptureItemInterop
+    {
+        [PreserveSig] int CreateForWindow(IntPtr window, ref Guid iid, [MarshalAs(UnmanagedType.IUnknown)] out object result);
+        [PreserveSig] int CreateForMonitor(IntPtr monitor, ref Guid iid, [MarshalAs(UnmanagedType.IUnknown)] out object result);
+    }
+
+    [ComImport, Guid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IDirect3DDxgiInterfaceAccess
+    {
+        [PreserveSig] int GetInterface(ref Guid iid, out IntPtr p);
+    }
+
     public sealed class StreamSourceInfo
     {
         public IntPtr Hwnd;
@@ -795,6 +813,7 @@ namespace DynamicIslandWin
         public string CategoryLabel = "Экран";
         public string WindowTitle = "";
         public int PriorityScore = 0;
+        public bool IsDiscordPopout = false;
 
         public string DisplayHeader
         {
@@ -807,8 +826,417 @@ namespace DynamicIslandWin
         }
     }
 
+    internal sealed class WgcWindowCaptureBridge : IDisposable
+    {
+        [DllImport("d3d11.dll")]
+        private static extern int D3D11CreateDevice(
+            IntPtr pAdapter, int DriverType, IntPtr Software, uint Flags,
+            IntPtr pFeatureLevels, uint FeatureLevels, uint SDKVersion,
+            out IntPtr ppDevice, out int pFeatureLevel, out IntPtr ppImmediateContext);
+
+        [DllImport("d3d11.dll")]
+        private static extern int CreateDirect3D11DeviceFromDXGIDevice(
+            IntPtr dxgiDevice, [MarshalAs(UnmanagedType.IUnknown)] out object graphicsDevice);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct D3D11_TEXTURE2D_DESC
+        {
+            public uint Width, Height, MipLevels, ArraySize;
+            public uint Format;
+            public uint SampleCount, SampleQuality;
+            public uint Usage, BindFlags, CPUAccessFlags, MiscFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct D3D11_MAPPED_SUBRESOURCE
+        {
+            public IntPtr pData;
+            public uint RowPitch;
+            public uint DepthPitch;
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int CreateTexture2DDel(IntPtr device, ref D3D11_TEXTURE2D_DESC desc, IntPtr initData, out IntPtr ppTex);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate void GetDescDel(IntPtr tex, out D3D11_TEXTURE2D_DESC desc);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int MapDel(IntPtr ctx, IntPtr res, uint sub, uint mapType, uint mapFlags, out D3D11_MAPPED_SUBRESOURCE mapped);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate void UnmapDel(IntPtr ctx, IntPtr res, uint sub);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate void CopyResourceDel(IntPtr ctx, IntPtr dst, IntPtr src);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int PutBorderRequiredDel(IntPtr session3, byte value);
+
+        private IntPtr _d3dDevice = IntPtr.Zero;
+        private IntPtr _d3dContext = IntPtr.Zero;
+        private IDirect3DDevice _winrtDevice = null;
+        private IntPtr _stagingTex = IntPtr.Zero;
+        private uint _stagingW = 0, _stagingH = 0, _stagingFmt = 0;
+
+        private CreateTexture2DDel _fnCreateTex;
+        private MapDel _fnMap;
+        private UnmapDel _fnUnmap;
+        private CopyResourceDel _fnCopyResource;
+
+        private GraphicsCaptureItem _item;
+        private Direct3D11CaptureFramePool _pool;
+        private GraphicsCaptureSession _session;
+        private SizeInt32 _poolSize;
+        private IntPtr _targetHwnd = IntPtr.Zero;
+
+        private int[] _srcRowA = new int[4096];
+        private int[] _srcRowB = new int[4096];
+        private int[] _dstPixels = new int[0];
+
+        public IntPtr TargetHwnd { get { return _targetHwnd; } }
+        public int SourceWidth { get; private set; }
+        public int SourceHeight { get; private set; }
+        public bool IsActive { get { return _session != null && _pool != null && _targetHwnd != IntPtr.Zero; } }
+        public bool LastCenterRegionUniformDark { get; private set; }
+
+        private bool EnsureD3DDevice()
+        {
+            if (_d3dDevice != IntPtr.Zero && _d3dContext != IntPtr.Zero && _winrtDevice != null) return true;
+            DisposeD3D();
+            try
+            {
+                if (!GraphicsCaptureSession.IsSupported()) return false;
+                int fl;
+                int hr = D3D11CreateDevice(IntPtr.Zero, 1 /* HARDWARE */, IntPtr.Zero, 0x20 /* BGRA_SUPPORT */, IntPtr.Zero, 0, 7, out _d3dDevice, out fl, out _d3dContext);
+                if (hr != 0 || _d3dDevice == IntPtr.Zero || _d3dContext == IntPtr.Zero) return false;
+
+                Guid iidDxgi = new Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
+                IntPtr dxgiDev;
+                if (Marshal.QueryInterface(_d3dDevice, ref iidDxgi, out dxgiDev) != 0 || dxgiDev == IntPtr.Zero) return false;
+                try
+                {
+                    object winrtObj;
+                    if (CreateDirect3D11DeviceFromDXGIDevice(dxgiDev, out winrtObj) != 0 || winrtObj == null) return false;
+                    _winrtDevice = (IDirect3DDevice)winrtObj;
+                }
+                finally { Marshal.Release(dxgiDev); }
+
+                IntPtr devVtbl = Marshal.ReadIntPtr(_d3dDevice);
+                _fnCreateTex = (CreateTexture2DDel)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(devVtbl, 5 * IntPtr.Size), typeof(CreateTexture2DDel));
+
+                IntPtr ctxVtbl = Marshal.ReadIntPtr(_d3dContext);
+                _fnMap = (MapDel)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(ctxVtbl, 14 * IntPtr.Size), typeof(MapDel));
+                _fnUnmap = (UnmapDel)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(ctxVtbl, 15 * IntPtr.Size), typeof(UnmapDel));
+                _fnCopyResource = (CopyResourceDel)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(ctxVtbl, 47 * IntPtr.Size), typeof(CopyResourceDel));
+                return true;
+            }
+            catch
+            {
+                DisposeD3D();
+                return false;
+            }
+        }
+
+        private static void TryDisableYellowCaptureBorder(GraphicsCaptureSession session)
+        {
+            if (session == null) return;
+            try
+            {
+                var prop = typeof(GraphicsCaptureSession).GetProperty("IsBorderRequired");
+                if (prop != null) { prop.SetValue(session, false, null); return; }
+            }
+            catch { }
+            IntPtr unk = IntPtr.Zero;
+            IntPtr ses3 = IntPtr.Zero;
+            try
+            {
+                unk = Marshal.GetIUnknownForObject(session);
+                Guid iidSes3 = new Guid("F2CDD966-22AE-5EA1-9596-3A289344C3BE"); // IGraphicsCaptureSession3
+                if (Marshal.QueryInterface(unk, ref iidSes3, out ses3) == 0 && ses3 != IntPtr.Zero)
+                {
+                    IntPtr vtbl = Marshal.ReadIntPtr(ses3);
+                    // IInspectable has 6 base slots (0..5); slot 6 = get_IsBorderRequired, slot 7 = put_IsBorderRequired
+                    var putBorder = (PutBorderRequiredDel)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(vtbl, 7 * IntPtr.Size), typeof(PutBorderRequiredDel));
+                    putBorder(ses3, 0);
+                }
+            }
+            catch { }
+            finally
+            {
+                if (ses3 != IntPtr.Zero) Marshal.Release(ses3);
+                if (unk != IntPtr.Zero) Marshal.Release(unk);
+            }
+        }
+
+        public bool StartOrAttach(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero || !NativeWin32.IsWindow(hwnd)) { StopSession(); return false; }
+            if (_targetHwnd == hwnd && IsActive) return true;
+
+            StopSession();
+            if (!EnsureD3DDevice()) return false;
+
+            try
+            {
+                var factory = WindowsRuntimeMarshal.GetActivationFactory(typeof(GraphicsCaptureItem));
+                var interop = (IGraphicsCaptureItemInterop)factory;
+                Guid iidItem = new Guid("79C3F95B-31F7-4EC2-A464-632EF5D30760");
+                object itemObj;
+                if (interop.CreateForWindow(hwnd, ref iidItem, out itemObj) != 0 || itemObj == null)
+                    return false;
+
+                _item = (GraphicsCaptureItem)itemObj;
+                SizeInt32 sz = _item.Size;
+                if (sz.Width < 32 || sz.Height < 32)
+                {
+                    NativeWin32.RECT r;
+                    if (NativeWin32.GetWindowRect(hwnd, out r))
+                    {
+                        sz.Width = Math.Max(128, r.Right - r.Left);
+                        sz.Height = Math.Max(128, r.Bottom - r.Top);
+                    }
+                    else { sz.Width = 1280; sz.Height = 720; }
+                }
+
+                _poolSize = sz;
+                SourceWidth = sz.Width;
+                SourceHeight = sz.Height;
+                _pool = Direct3D11CaptureFramePool.CreateFreeThreaded(_winrtDevice, DirectXPixelFormat.B8G8R8A8UIntNormalized, 2, _poolSize);
+                _session = _pool.CreateCaptureSession(_item);
+                try { _session.IsCursorCaptureEnabled = false; } catch { }
+                TryDisableYellowCaptureBorder(_session);
+                _session.StartCapture();
+                _targetHwnd = hwnd;
+                LastCenterRegionUniformDark = false;
+                return true;
+            }
+            catch
+            {
+                StopSession();
+                return false;
+            }
+        }
+
+        public bool TryRenderLatestFrame(Bitmap targetBmp, StreamSourceInfo srcInfo, int cropModeIndex)
+        {
+            if (!IsActive || targetBmp == null || _pool == null) return false;
+
+            Direct3D11CaptureFrame latest = null;
+            try
+            {
+                // Drain 2-frame ring buffer so we always render the freshest GPU frame with zero latency
+                for (int i = 0; i < 3; i++)
+                {
+                    Direct3D11CaptureFrame next = _pool.TryGetNextFrame();
+                    if (next == null) break;
+                    if (latest != null) latest.Dispose();
+                    latest = next;
+                }
+                if (latest == null) return false;
+
+                SizeInt32 csz = latest.ContentSize;
+                if (csz.Width >= 40 && csz.Height >= 40 &&
+                    (Math.Abs(csz.Width - _poolSize.Width) > 4 || Math.Abs(csz.Height - _poolSize.Height) > 4))
+                {
+                    _poolSize = csz;
+                    try { _pool.Recreate(_winrtDevice, DirectXPixelFormat.B8G8R8A8UIntNormalized, 2, _poolSize); } catch { }
+                }
+
+                var access = latest.Surface as IDirect3DDxgiInterfaceAccess;
+                if (access == null) return false;
+                Guid iidTex2D = new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
+                IntPtr srcTex;
+                if (access.GetInterface(ref iidTex2D, out srcTex) != 0 || srcTex == IntPtr.Zero) return false;
+
+                try
+                {
+                    IntPtr texVtbl = Marshal.ReadIntPtr(srcTex);
+                    var getDesc = (GetDescDel)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(texVtbl, 10 * IntPtr.Size), typeof(GetDescDel));
+                    D3D11_TEXTURE2D_DESC desc;
+                    getDesc(srcTex, out desc);
+                    if (desc.Width < 32 || desc.Height < 32) return false;
+
+                    int fullW = (int)desc.Width;
+                    int fullH = (int)desc.Height;
+                    int srcW = (csz.Width >= 32 && csz.Width <= fullW) ? csz.Width : fullW;
+                    int srcH = (csz.Height >= 32 && csz.Height <= fullH) ? csz.Height : fullH;
+                    SourceWidth = srcW;
+                    SourceHeight = srcH;
+
+                    if (_stagingTex == IntPtr.Zero || _stagingW != desc.Width || _stagingH != desc.Height || _stagingFmt != desc.Format)
+                    {
+                        if (_stagingTex != IntPtr.Zero) { Marshal.Release(_stagingTex); _stagingTex = IntPtr.Zero; }
+                        D3D11_TEXTURE2D_DESC stDesc = desc;
+                        stDesc.MipLevels = 1;
+                        stDesc.ArraySize = 1;
+                        stDesc.SampleCount = 1;
+                        stDesc.SampleQuality = 0;
+                        stDesc.Usage = 3; // D3D11_USAGE_STAGING
+                        stDesc.BindFlags = 0;
+                        stDesc.CPUAccessFlags = 0x20000; // D3D11_CPU_ACCESS_READ
+                        stDesc.MiscFlags = 0;
+                        if (_fnCreateTex(_d3dDevice, ref stDesc, IntPtr.Zero, out _stagingTex) != 0 || _stagingTex == IntPtr.Zero)
+                            return false;
+                        _stagingW = desc.Width;
+                        _stagingH = desc.Height;
+                        _stagingFmt = desc.Format;
+                    }
+
+                    _fnCopyResource(_d3dContext, _stagingTex, srcTex);
+
+                    D3D11_MAPPED_SUBRESOURCE mapped;
+                    if (_fnMap(_d3dContext, _stagingTex, 0, 1 /* D3D11_MAP_READ */, 0, out mapped) != 0 || mapped.pData == IntPtr.Zero)
+                        return false;
+
+                    try
+                    {
+                        NativeWin32.RECT rcSrc = DwmStreamOverlayForm.ComputeSourceCropRect(srcW, srcH, srcInfo, cropModeIndex);
+                        int cropX = Math.Max(0, Math.Min(srcW - 8, rcSrc.Left));
+                        int cropY = Math.Max(0, Math.Min(srcH - 8, rcSrc.Top));
+                        int cropW = Math.Max(8, Math.Min(srcW - cropX, rcSrc.Right - cropX));
+                        int cropH = Math.Max(8, Math.Min(srcH - cropY, rcSrc.Bottom - cropY));
+
+                        int viewW = targetBmp.Width;
+                        int viewH = targetBmp.Height;
+                        NativeWin32.RECT rcDst = DwmStreamOverlayForm.ComputeDestViewportRect(viewW, viewH, cropW, cropH, cropModeIndex);
+                        int dstX = Math.Max(0, Math.Min(viewW - 1, rcDst.Left));
+                        int dstY = Math.Max(0, Math.Min(viewH - 1, rcDst.Top));
+                        int dstW = Math.Max(1, Math.Min(viewW - dstX, rcDst.Right - dstX));
+                        int dstH = Math.Max(1, Math.Min(viewH - dstY, rcDst.Bottom - dstY));
+
+                        int totalDst = viewW * viewH;
+                        if (_dstPixels.Length != totalDst) _dstPixels = new int[totalDst];
+                        int bgPixel = unchecked((int)0xFF06070B);
+                        for (int i = 0; i < totalDst; i++) _dstPixels[i] = bgPixel;
+
+                        if (_srcRowA.Length < cropW + 2) _srcRowA = new int[cropW + 64];
+                        if (_srcRowB.Length < cropW + 2) _srcRowB = new int[cropW + 64];
+
+                        int pitch = (int)mapped.RowPitch;
+                        int cachedSyA = -1, cachedSyB = -1;
+
+                        // Sample center 50% of video box to detect pure-black / frozen dark pause surface when 100% occluded
+                        int cx0 = dstW / 4, cx1 = (dstW * 3) / 4;
+                        int cy0 = dstH / 4, cy1 = (dstH * 3) / 4;
+                        int centerSamples = 0, brightOrVariedSamples = 0;
+                        int refCenterRgb = -1;
+
+                        for (int y = 0; y < dstH; y++)
+                        {
+                            int sy0 = cropY + (y * cropH) / dstH;
+                            int sy1 = Math.Min(cropY + cropH - 1, sy0 + Math.Max(1, cropH / (dstH * 2)));
+                            if (sy0 != cachedSyA)
+                            {
+                                IntPtr rowPtrA = IntPtr.Add(mapped.pData, sy0 * pitch + cropX * 4);
+                                Marshal.Copy(rowPtrA, _srcRowA, 0, cropW);
+                                cachedSyA = sy0;
+                            }
+                            if (sy1 != cachedSyB)
+                            {
+                                if (sy1 == cachedSyA)
+                                    Array.Copy(_srcRowA, 0, _srcRowB, 0, cropW);
+                                else
+                                {
+                                    IntPtr rowPtrB = IntPtr.Add(mapped.pData, sy1 * pitch + cropX * 4);
+                                    Marshal.Copy(rowPtrB, _srcRowB, 0, cropW);
+                                }
+                                cachedSyB = sy1;
+                            }
+
+                            int dstRowBase = (dstY + y) * viewW + dstX;
+                            bool inCenterY = (y >= cy0 && y <= cy1 && (y & 3) == 0);
+                            int stepX = Math.Max(1, cropW / (dstW * 2));
+
+                            for (int x = 0; x < dstW; x++)
+                            {
+                                int sx0 = (x * cropW) / dstW;
+                                int sx1 = Math.Min(cropW - 1, sx0 + stepX);
+                                uint p00 = (uint)_srcRowA[sx0];
+                                uint p01 = (uint)_srcRowA[sx1];
+                                uint p10 = (uint)_srcRowB[sx0];
+                                uint p11 = (uint)_srcRowB[sx1];
+
+                                // Fast 2x2 box-filtered BGRA downsample (keeps text & game HUD sharp with zero GDI overhead)
+                                uint avgRB = (((p00 & 0x00FF00FFu) + (p01 & 0x00FF00FFu) + (p10 & 0x00FF00FFu) + (p11 & 0x00FF00FFu) + 0x00020002u) >> 2) & 0x00FF00FFu;
+                                uint avgG  = (((p00 & 0x0000FF00u) + (p01 & 0x0000FF00u) + (p10 & 0x0000FF00u) + (p11 & 0x0000FF00u) + 0x00000200u) >> 2) & 0x0000FF00u;
+                                int outPx = unchecked((int)(0xFF000000u | avgRB | avgG));
+                                _dstPixels[dstRowBase + x] = outPx;
+
+                                if (inCenterY && x >= cx0 && x <= cx1 && (x & 7) == 0)
+                                {
+                                    centerSamples++;
+                                    int rgb = outPx & 0x00FFFFFF;
+                                    int r = (rgb >> 16) & 0xFF;
+                                    int g = (rgb >> 8) & 0xFF;
+                                    int b = rgb & 0xFF;
+                                    if (refCenterRgb == -1) refCenterRgb = rgb;
+                                    int dr = Math.Abs(r - ((refCenterRgb >> 16) & 0xFF));
+                                    int dg = Math.Abs(g - ((refCenterRgb >> 8) & 0xFF));
+                                    int db = Math.Abs(b - (refCenterRgb & 0xFF));
+                                    if (r > 14 || g > 14 || b > 18 || (dr + dg + db) > 10)
+                                        brightOrVariedSamples++;
+                                }
+                            }
+                        }
+
+                        LastCenterRegionUniformDark = (centerSamples >= 12 && brightOrVariedSamples == 0);
+
+                        BitmapData bd = targetBmp.LockBits(new Rectangle(0, 0, viewW, viewH), ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
+                        try
+                        {
+                            Marshal.Copy(_dstPixels, 0, bd.Scan0, totalDst);
+                        }
+                        finally
+                        {
+                            targetBmp.UnlockBits(bd);
+                        }
+                        return true;
+                    }
+                    finally
+                    {
+                        _fnUnmap(_d3dContext, _stagingTex, 0);
+                    }
+                }
+                finally
+                {
+                    Marshal.Release(srcTex);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (latest != null) latest.Dispose();
+            }
+        }
+
+        public void StopSession()
+        {
+            _targetHwnd = IntPtr.Zero;
+            if (_session != null) { try { _session.Dispose(); } catch { } _session = null; }
+            if (_pool != null) { try { _pool.Dispose(); } catch { } _pool = null; }
+            _item = null;
+            if (_stagingTex != IntPtr.Zero) { try { Marshal.Release(_stagingTex); } catch { } _stagingTex = IntPtr.Zero; }
+            _stagingW = 0; _stagingH = 0; _stagingFmt = 0;
+        }
+
+        private void DisposeD3D()
+        {
+            StopSession();
+            _winrtDevice = null;
+            if (_d3dContext != IntPtr.Zero) { try { Marshal.Release(_d3dContext); } catch { } _d3dContext = IntPtr.Zero; }
+            if (_d3dDevice != IntPtr.Zero) { try { Marshal.Release(_d3dDevice); } catch { } _d3dDevice = IntPtr.Zero; }
+        }
+
+        public void Dispose()
+        {
+            DisposeD3D();
+        }
+    }
+
     public sealed class DwmStreamOverlayForm : Form
     {
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
+
         private IntPtr _thumbId = IntPtr.Zero;
         private IntPtr _boundSourceHwnd = IntPtr.Zero;
         private IntPtr _ownerHwnd = IntPtr.Zero;
@@ -819,6 +1247,16 @@ namespace DynamicIslandWin
         private NativeWin32.RECT _parkedNormalRect;
         private bool _parkedWasZoomed = false;
         private int _parkedTick = 0;
+
+        private readonly WgcWindowCaptureBridge _wgc = new WgcWindowCaptureBridge();
+        private readonly System.Windows.Forms.Timer _wgcTimer;
+        private Bitmap _wgcFrameBmp = null;
+        private bool _usingWgc = false;
+        private bool _hasRenderedWgcFrame = false;
+        private StreamSourceInfo _activeSrcInfo = null;
+        private int _consecutiveUniformDarkFrames = 0;
+        private readonly Font _hintFont = new Font("Segoe UI Semibold", 10.5f, FontStyle.Bold, GraphicsUnit.Pixel);
+        private readonly StringFormat _hintSf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter };
 
         public DwmStreamOverlayForm()
         {
@@ -831,8 +1269,10 @@ namespace DynamicIslandWin
             Size = new Size(10, 10);
             Location = new Point(-4000, -4000);
 
-            // Prevent GDI background erase flicker over DWM hardware thumbnail surface
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.Opaque, true);
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+
+            _wgcTimer = new System.Windows.Forms.Timer { Interval = 33 };
+            _wgcTimer.Tick += OnWgcFrameTick;
         }
 
         protected override bool ShowWithoutActivation { get { return true; } }
@@ -849,13 +1289,255 @@ namespace DynamicIslandWin
 
         protected override void OnPaintBackground(PaintEventArgs e)
         {
-            // Do nothing: prevents WM_ERASEBKGND flicker over live DWM thumbnail
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            Graphics g = e.Graphics;
+            if (_usingWgc && _hasRenderedWgcFrame && _wgcFrameBmp != null)
+            {
+                g.CompositingMode = CompositingMode.SourceCopy;
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.DrawImageUnscaled(_wgcFrameBmp, 0, 0);
+                g.CompositingMode = CompositingMode.SourceOver;
+
+                // Show non-intrusive Chromium occlusion hint ONLY when user minimized Discord and every monitor is 100% covered
+                if (_parkedHwnd != IntPtr.Zero && _consecutiveUniformDarkFrames >= 45 && ClientSize.Width >= 180 && ClientSize.Height >= 70)
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    float bw = Math.Min(ClientSize.Width - 16f, 440f);
+                    var pillRc = new RectangleF((ClientSize.Width - bw) * 0.5f, ClientSize.Height - 28f, bw, 22f);
+                    using (var bg = new SolidBrush(Color.FromArgb(215, 14, 16, 24)))
+                    using (var bd = new Pen(Color.FromArgb(130, 245, 158, 11), 1f))
+                    using (var fg = new SolidBrush(Color.FromArgb(245, 252, 211, 77)))
+                    {
+                        g.FillRectangle(bg, pillRc);
+                        g.DrawRectangle(bd, pillRc.X, pillRc.Y, pillRc.Width, pillRc.Height);
+                        g.DrawString("⚠ Chromium поставил видео на паузу (100% перекрыто) • Откройте Popout в Discord", _hintFont, fg, pillRc, _hintSf);
+                    }
+                }
+                return;
+            }
+
             using (var br = new SolidBrush(Color.FromArgb(6, 7, 11)))
-                e.Graphics.FillRectangle(br, ClientRectangle);
+                g.FillRectangle(br, ClientRectangle);
+        }
+
+        private void OnWgcFrameTick(object sender, EventArgs e)
+        {
+            if (!_usingWgc || !Visible || _activeSrcInfo == null || _lastW < 30 || _lastH < 30) return;
+            IntPtr target = _activeSrcInfo.Hwnd;
+            if (target == IntPtr.Zero || !NativeWin32.IsWindow(target)) return;
+
+            if (NativeWin32.IsIconic(target))
+            {
+                ParkMinimizedWindowForLiveStream(target);
+            }
+
+            if (_wgcFrameBmp == null || _wgcFrameBmp.Width != _lastW || _wgcFrameBmp.Height != _lastH)
+            {
+                if (_wgcFrameBmp != null) { try { _wgcFrameBmp.Dispose(); } catch { } }
+                _wgcFrameBmp = new Bitmap(_lastW, _lastH, PixelFormat.Format32bppPArgb);
+                _hasRenderedWgcFrame = false;
+            }
+
+            if (_wgc.TryRenderLatestFrame(_wgcFrameBmp, _activeSrcInfo, _lastCropMode >= 0 ? _lastCropMode : 0))
+            {
+                _hasRenderedWgcFrame = true;
+                if (_wgc.LastCenterRegionUniformDark && _parkedHwnd != IntPtr.Zero && IsWindowCompletelyOccludedByOthers(target))
+                    _consecutiveUniformDarkFrames = Math.Min(600, _consecutiveUniformDarkFrames + 1);
+                else
+                    _consecutiveUniformDarkFrames = 0;
+                Invalidate();
+            }
+        }
+
+        internal static NativeWin32.RECT ComputeSourceCropRect(int srcW, int srcH, StreamSourceInfo src, int cropModeIndex)
+        {
+            var rcSrc = new NativeWin32.RECT { Left = 0, Top = 0, Right = srcW, Bottom = srcH };
+            if (src == null) return rcSrc;
+
+            if (cropModeIndex == 0) // "Стрим (Авто)"
+            {
+                if (src.IsDiscordPopout && srcW > 240 && srcH > 180)
+                {
+                    int topTrim = Math.Min(36, Math.Max(22, (int)(srcH * 0.045f)));
+                    rcSrc.Left = 2;
+                    rcSrc.Top = topTrim;
+                    rcSrc.Right = Math.Max(120, srcW - 2);
+                    rcSrc.Bottom = Math.Max(topTrim + 80, srcH - 2);
+                }
+                else if (src.CategoryLabel == "Discord" && srcW > 520 && srcH > 360)
+                {
+                    int leftTrim = (int)(srcW * 0.246f);
+                    int rightTrim = (int)(srcW * 0.012f);
+                    int topTrim = (int)(srcH * 0.064f);
+                    int botTrim = (int)(srcH * 0.215f);
+                    rcSrc.Left = leftTrim;
+                    rcSrc.Top = topTrim;
+                    rcSrc.Right = Math.Max(leftTrim + 160, srcW - rightTrim);
+                    rcSrc.Bottom = Math.Max(topTrim + 100, srcH - botTrim);
+                }
+                else if ((src.CategoryLabel == "YouTube" || src.CategoryLabel == "Twitch" ||
+                          src.CategoryLabel == "Браузер" || src.CategoryLabel == "Видеохостинг" ||
+                          src.CategoryLabel == "VK Видео" || src.CategoryLabel == "Кинопоиск" ||
+                          src.CategoryLabel == "Rutube") && srcW > 520 && srcH > 360)
+                {
+                    int topTrim = Math.Min(110, (int)(srcH * 0.115f));
+                    rcSrc.Left = 6;
+                    rcSrc.Top = topTrim;
+                    rcSrc.Right = Math.Max(160, srcW - 6);
+                    rcSrc.Bottom = Math.Max(topTrim + 100, srcH - 6);
+                }
+            }
+            else if (cropModeIndex == 3) // "Крупный план"
+            {
+                int cw = Math.Max(160, (int)(srcW * 0.66f));
+                int ch = Math.Max(100, (int)(srcH * 0.66f));
+                rcSrc.Left = (srcW - cw) / 2;
+                rcSrc.Top = (srcH - ch) / 2;
+                rcSrc.Right = rcSrc.Left + cw;
+                rcSrc.Bottom = rcSrc.Top + ch;
+            }
+            return rcSrc;
+        }
+
+        internal static NativeWin32.RECT ComputeDestViewportRect(int viewW, int viewH, int cropW, int cropH, int cropModeIndex)
+        {
+            var rcDst = new NativeWin32.RECT { Left = 0, Top = 0, Right = viewW, Bottom = viewH };
+            if (cropModeIndex == 0 || cropModeIndex == 2)
+            {
+                float scale = Math.Min(viewW / (float)Math.Max(1, cropW), viewH / (float)Math.Max(1, cropH));
+                int dw = Math.Max(1, (int)Math.Round(cropW * scale));
+                int dh = Math.Max(1, (int)Math.Round(cropH * scale));
+                int dx = (viewW - dw) / 2;
+                int dy = (viewH - dh) / 2;
+                rcDst = new NativeWin32.RECT { Left = dx, Top = dy, Right = dx + dw, Bottom = dy + dh };
+            }
+            return rcDst;
+        }
+
+        private static bool IsCloakedWindow(IntPtr hWnd)
+        {
+            int cloaked = 0;
+            try { if (DwmGetWindowAttribute(hWnd, 14 /* DWMWA_CLOAKED */, out cloaked, 4) == 0) return cloaked != 0; } catch { }
+            return false;
+        }
+
+        private static Screen PickLeastOccludedMonitor(IntPtr targetHwnd)
+        {
+            Screen fallback = Screen.FromHandle(targetHwnd) ?? Screen.PrimaryScreen;
+            Screen[] screens = Screen.AllScreens;
+            if (screens == null || screens.Length <= 1) return fallback;
+
+            uint selfPid = (uint)Process.GetCurrentProcess().Id;
+            var opaqueRects = new List<Rectangle>();
+            try
+            {
+                NativeWin32.EnumWindows((hWnd, lp) =>
+                {
+                    if (hWnd == IntPtr.Zero || hWnd == targetHwnd) return true;
+                    if (!NativeWin32.IsWindowVisible(hWnd) || NativeWin32.IsIconic(hWnd) || IsCloakedWindow(hWnd)) return true;
+                    uint pid;
+                    NativeWin32.GetWindowThreadProcessId(hWnd, out pid);
+                    if (pid == selfPid) return true;
+
+                    var clsSb = new StringBuilder(96);
+                    NativeWin32.GetClassName(hWnd, clsSb, 96);
+                    string cls = clsSb.ToString();
+                    if (cls == "Progman" || cls == "WorkerW") return true;
+
+                    long ex = NativeWin32.GetWindowLongPtr(hWnd, NativeWin32.GWL_EXSTYLE).ToInt64();
+                    if ((ex & NativeWin32.WS_EX_TRANSPARENT) != 0) return true;
+
+                    NativeWin32.RECT r;
+                    if (NativeWin32.GetWindowRect(hWnd, out r) && (r.Right - r.Left) > 80 && (r.Bottom - r.Top) > 40)
+                        opaqueRects.Add(Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom));
+                    return true;
+                }, IntPtr.Zero);
+            }
+            catch { return fallback; }
+
+            Screen bestScr = fallback;
+            int bestUnoccludedSamples = -1;
+            for (int s = 0; s < screens.Length; s++)
+            {
+                Rectangle wa = screens[s].WorkingArea;
+                int freePts = 0;
+                for (int gy = 1; gy <= 5; gy++)
+                {
+                    int py = wa.Top + (wa.Height * gy) / 6;
+                    for (int gx = 1; gx <= 6; gx++)
+                    {
+                        int px = wa.Left + (wa.Width * gx) / 7;
+                        bool covered = false;
+                        for (int k = 0; k < opaqueRects.Count; k++)
+                        {
+                            if (opaqueRects[k].Contains(px, py)) { covered = true; break; }
+                        }
+                        if (!covered) freePts++;
+                    }
+                }
+                if (freePts > bestUnoccludedSamples)
+                {
+                    bestUnoccludedSamples = freePts;
+                    bestScr = screens[s];
+                }
+            }
+            return bestScr;
+        }
+
+        private static bool IsWindowCompletelyOccludedByOthers(IntPtr targetHwnd)
+        {
+            if (targetHwnd == IntPtr.Zero || !NativeWin32.IsWindow(targetHwnd)) return false;
+            NativeWin32.RECT tr;
+            if (!NativeWin32.GetWindowRect(targetHwnd, out tr)) return false;
+            int tw = tr.Right - tr.Left, th = tr.Bottom - tr.Top;
+            if (tw < 80 || th < 80) return false;
+
+            uint selfPid = (uint)Process.GetCurrentProcess().Id;
+            var aboveRects = new List<Rectangle>();
+            try
+            {
+                IntPtr cur = NativeWin32.GetWindow(targetHwnd, NativeWin32.GW_HWNDPREV);
+                int guard = 0;
+                while (cur != IntPtr.Zero && guard++ < 96)
+                {
+                    if (NativeWin32.IsWindowVisible(cur) && !NativeWin32.IsIconic(cur) && !IsCloakedWindow(cur))
+                    {
+                        uint pid;
+                        NativeWin32.GetWindowThreadProcessId(cur, out pid);
+                        if (pid != selfPid)
+                        {
+                            long ex = NativeWin32.GetWindowLongPtr(cur, NativeWin32.GWL_EXSTYLE).ToInt64();
+                            if ((ex & NativeWin32.WS_EX_TRANSPARENT) == 0 && (ex & NativeWin32.WS_EX_LAYERED) == 0)
+                            {
+                                NativeWin32.RECT r;
+                                if (NativeWin32.GetWindowRect(cur, out r) && (r.Right - r.Left) > 40 && (r.Bottom - r.Top) > 24)
+                                    aboveRects.Add(Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom));
+                            }
+                        }
+                    }
+                    cur = NativeWin32.GetWindow(cur, NativeWin32.GW_HWNDPREV);
+                }
+            }
+            catch { return false; }
+
+            for (int gy = 1; gy <= 4; gy++)
+            {
+                int py = tr.Top + (th * gy) / 5;
+                for (int gx = 1; gx <= 4; gx++)
+                {
+                    int px = tr.Left + (tw * gx) / 5;
+                    bool ptCovered = false;
+                    for (int i = 0; i < aboveRects.Count; i++)
+                    {
+                        if (aboveRects[i].Contains(px, py)) { ptCovered = true; break; }
+                    }
+                    if (!ptCovered) return false;
+                }
+            }
+            return true;
         }
 
         public void SyncHardwareStream(IntPtr ownerHwnd, int screenX, int screenY, int viewW, int viewH, StreamSourceInfo src, int cropModeIndex)
@@ -866,18 +1548,15 @@ namespace DynamicIslandWin
                 return;
             }
 
-            if (!IsHandleCreated)
-            {
-                CreateHandle();
-            }
+            if (!IsHandleCreated) CreateHandle();
 
-            // Bind owner relationship once so Windows DWM permanently keeps _dwmOverlay above DynamicIslandOverlayForm without Z-order fighting
             if (_ownerHwnd != ownerHwnd && ownerHwnd != IntPtr.Zero)
             {
                 _ownerHwnd = ownerHwnd;
                 NativeWin32.SetWindowLongPtr(Handle, NativeWin32.GWLP_HWNDPARENT, ownerHwnd);
             }
 
+            _activeSrcInfo = src;
             IntPtr target = src.Hwnd;
             if (_parkedHwnd != IntPtr.Zero && _parkedHwnd != target)
             {
@@ -904,9 +1583,28 @@ namespace DynamicIslandWin
             {
                 _lastX = screenX; _lastY = screenY; _lastW = viewW; _lastH = viewH;
                 NativeWin32.SetWindowPos(Handle, NativeWin32.HWND_TOPMOST, screenX, screenY, viewW, viewH,
-                    NativeWin32.SWP_NOACTIVATE | (uint)0x0040); // SWP_SHOWWINDOW = 0x0040
+                    NativeWin32.SWP_NOACTIVATE | NativeWin32.SWP_SHOWWINDOW);
                 Visible = true;
             }
+
+            // Primary path: Windows.Graphics.Capture (captures DirectComposition WebRTC <video> hardware swapchains!)
+            if (_wgc.StartOrAttach(target))
+            {
+                if (_thumbId != IntPtr.Zero) UnregisterThumb();
+                _usingWgc = true;
+                _boundSourceHwnd = target;
+                if (_lastCropMode != cropModeIndex || sizeChanged)
+                {
+                    _lastCropMode = cropModeIndex;
+                    OnWgcFrameTick(this, EventArgs.Empty);
+                }
+                if (!_wgcTimer.Enabled) _wgcTimer.Start();
+                return;
+            }
+
+            // Fallback path: DwmRegisterThumbnail (e.g., if target is an elevated Administrator window blocking WGC)
+            _usingWgc = false;
+            if (_wgcTimer.Enabled) _wgcTimer.Stop();
 
             bool targetChanged = (_boundSourceHwnd != target || _thumbId == IntPtr.Zero);
             if (targetChanged)
@@ -940,68 +1638,17 @@ namespace DynamicIslandWin
 
             int srcW = srcSize.cx;
             int srcH = srcSize.cy;
-
-            // CRITICAL FLICKER FIX: Only call DwmUpdateThumbnailProperties when target, viewport size, source window size, or crop mode actually changed!
             if (!targetChanged && !geomChanged && cropModeIndex == _lastCropMode && srcW == _lastSrcW && srcH == _lastSrcH)
-            {
                 return;
-            }
 
             _lastCropMode = cropModeIndex;
             _lastSrcW = srcW;
             _lastSrcH = srcH;
 
-            var rcSrc = new NativeWin32.RECT { Left = 0, Top = 0, Right = srcW, Bottom = srcH };
-            if (cropModeIndex == 0) // "Стрим (Авто)"
-            {
-                bool isDiscord = src.CategoryLabel == "Discord";
-                bool isBrowser = src.CategoryLabel == "YouTube" || src.CategoryLabel == "Twitch" ||
-                                 src.CategoryLabel == "Браузер" || src.CategoryLabel == "Видеохостинг" ||
-                                 src.CategoryLabel == "VK Видео" || src.CategoryLabel == "Кинопоиск" ||
-                                 src.CategoryLabel == "Rutube";
-                if (isDiscord && srcW > 520 && srcH > 360)
-                {
-                    int leftTrim = (int)(srcW * 0.246f);
-                    int rightTrim = (int)(srcW * 0.012f);
-                    int topTrim = (int)(srcH * 0.064f);
-                    int botTrim = (int)(srcH * 0.215f);
-                    rcSrc.Left = leftTrim;
-                    rcSrc.Top = topTrim;
-                    rcSrc.Right = Math.Max(leftTrim + 160, srcW - rightTrim);
-                    rcSrc.Bottom = Math.Max(topTrim + 100, srcH - botTrim);
-                }
-                else if (isBrowser && srcW > 520 && srcH > 360)
-                {
-                    int topTrim = Math.Min(110, (int)(srcH * 0.115f));
-                    rcSrc.Left = 6;
-                    rcSrc.Top = topTrim;
-                    rcSrc.Right = Math.Max(160, srcW - 6);
-                    rcSrc.Bottom = Math.Max(topTrim + 100, srcH - 6);
-                }
-            }
-            else if (cropModeIndex == 3) // "Крупный план"
-            {
-                int cw = Math.Max(160, (int)(srcW * 0.66f));
-                int ch = Math.Max(100, (int)(srcH * 0.66f));
-                rcSrc.Left = (srcW - cw) / 2;
-                rcSrc.Top = (srcH - ch) / 2;
-                rcSrc.Right = rcSrc.Left + cw;
-                rcSrc.Bottom = rcSrc.Top + ch;
-            }
-
+            NativeWin32.RECT rcSrc = ComputeSourceCropRect(srcW, srcH, src, cropModeIndex);
             int cropW = Math.Max(1, rcSrc.Right - rcSrc.Left);
             int cropH = Math.Max(1, rcSrc.Bottom - rcSrc.Top);
-            var rcDst = new NativeWin32.RECT { Left = 0, Top = 0, Right = viewW, Bottom = viewH };
-
-            if (cropModeIndex == 0 || cropModeIndex == 2)
-            {
-                float scale = Math.Min(viewW / (float)cropW, viewH / (float)cropH);
-                int dw = Math.Max(1, (int)Math.Round(cropW * scale));
-                int dh = Math.Max(1, (int)Math.Round(cropH * scale));
-                int dx = (viewW - dw) / 2;
-                int dy = (viewH - dh) / 2;
-                rcDst = new NativeWin32.RECT { Left = dx, Top = dy, Right = dx + dw, Bottom = dy + dh };
-            }
+            NativeWin32.RECT rcDst = ComputeDestViewportRect(viewW, viewH, cropW, cropH, cropModeIndex);
 
             var props = new NativeWin32.DWM_THUMBNAIL_PROPERTIES
             {
@@ -1023,9 +1670,8 @@ namespace DynamicIslandWin
             if (target == IntPtr.Zero || !NativeWin32.IsWindow(target)) return;
             try
             {
-                Screen scr = Screen.FromHandle(target) ?? Screen.PrimaryScreen;
-                Rectangle bounds = scr.Bounds;
-                Rectangle work = scr.WorkingArea;
+                Screen origScr = Screen.FromHandle(target) ?? Screen.PrimaryScreen;
+                Rectangle origWork = origScr.WorkingArea;
 
                 if (_parkedHwnd != target)
                 {
@@ -1045,19 +1691,22 @@ namespace DynamicIslandWin
                     {
                         _parkedNormalRect = new NativeWin32.RECT
                         {
-                            Left = work.Left + Math.Max(40, (work.Width - 1180) / 2),
-                            Top = work.Top + Math.Max(30, (work.Height - 720) / 2),
-                            Right = work.Left + Math.Max(40, (work.Width - 1180) / 2) + 1180,
-                            Bottom = work.Top + Math.Max(30, (work.Height - 720) / 2) + 720
+                            Left = origWork.Left + Math.Max(40, (origWork.Width - 1180) / 2),
+                            Top = origWork.Top + Math.Max(30, (origWork.Height - 720) / 2),
+                            Right = origWork.Left + Math.Max(40, (origWork.Width - 1180) / 2) + 1180,
+                            Bottom = origWork.Top + Math.Max(30, (origWork.Height - 720) / 2) + 720
                         };
                     }
                     _parkedHwnd = target;
                 }
 
+                // Choose the monitor with the most unoccluded desktop space so Chromium's NativeWindowOcclusionTrackerWin keeps WebRTC <video> alive!
+                Screen bestScr = PickLeastOccludedMonitor(target);
+                Rectangle work = bestScr.WorkingArea;
+
                 _parkedTick = Environment.TickCount;
                 IntPtr prevFg = NativeWin32.GetForegroundWindow();
 
-                // Exit SW_MINIMIZE without stealing focus so Windows & Chromium resume WebRTC <video> swapchain rendering
                 if (NativeWin32.IsIconic(target))
                     NativeWin32.ShowWindow(target, NativeWin32.SW_SHOWNOACTIVATE);
                 if (NativeWin32.IsIconic(target))
@@ -1065,35 +1714,41 @@ namespace DynamicIslandWin
                 if (NativeWin32.IsZoomed(target))
                     NativeWin32.ShowWindow(target, NativeWin32.SW_SHOWNOACTIVATE);
 
-                int maxParkW = Math.Max(640, bounds.Width - 32);
-                int maxParkH = Math.Max(480, bounds.Height - 32);
+                int maxParkW = Math.Max(640, work.Width - 24);
+                int maxParkH = Math.Max(480, work.Height - 24);
                 int desiredW = _parkedWasZoomed
-                    ? Math.Min(maxParkW, Math.Max(960, work.Width - 40))
+                    ? Math.Min(maxParkW, Math.Max(960, work.Width - 32))
                     : Math.Min(maxParkW, Math.Max(860, _parkedNormalRect.Right - _parkedNormalRect.Left));
                 int desiredH = _parkedWasZoomed
-                    ? Math.Min(maxParkH, Math.Max(600, work.Height - 20))
+                    ? Math.Min(maxParkH, Math.Max(600, work.Height - 28))
                     : Math.Min(maxParkH, Math.Max(560, _parkedNormalRect.Bottom - _parkedNormalRect.Top));
 
-                // CRITICAL DComp + Chromium Occlusion Fix:
-                // 1) Keep 100% of parkW x parkH INSIDE scr.Bounds so DirectComposition NEVER clips the hardware YUV <video> surface to black!
-                // 2) Align bottom edge with bounds.Bottom (extending behind the WS_EX_LAYERED Windows Taskbar) so even when a browser or
-                //    borderless game is maximized over 100% of WorkingArea, Chromium's NativeWindowOcclusionTrackerWin sees the taskbar-underlap
-                //    strip as unoccluded and keeps WebRTC decoding active at 60 FPS!
-                // 3) Place at HWND_BOTTOM with SWP_NOACTIVATE so it stays behind all user windows without stealing focus.
-                int parkX = bounds.Left + Math.Max(16, (bounds.Width - desiredW) / 2);
-                int parkY = Math.Max(bounds.Top + 16, bounds.Bottom - desiredH);
+                int parkX = work.Left + Math.Max(12, (work.Width - desiredW) / 2);
+                int parkY = work.Top + Math.Max(12, (work.Height - desiredH) / 2);
 
-                NativeWin32.SetWindowPos(target, NativeWin32.HWND_BOTTOM, parkX, parkY, desiredW, desiredH,
+                // Briefly wake window visibility in non-minimized state so Chromium restarts DirectComposition <video> swapchain,
+                // then immediately drop to HWND_BOTTOM without ever stealing keyboard focus!
+                NativeWin32.SetWindowPos(target, NativeWin32.HWND_NOTOPMOST, parkX, parkY, desiredW, desiredH,
                     NativeWin32.SWP_NOACTIVATE | NativeWin32.SWP_SHOWWINDOW);
-
                 NativeWin32.PostMessage(target, NativeWin32.WM_NCACTIVATE, new IntPtr(1), IntPtr.Zero);
                 NativeWin32.PostMessage(target, NativeWin32.WM_ACTIVATE, new IntPtr(1), IntPtr.Zero);
 
                 if (prevFg != IntPtr.Zero && prevFg != target && NativeWin32.IsWindow(prevFg))
                     NativeWin32.SetForegroundWindow(prevFg);
 
-                // Force DWM thumbnail re-registration because DWM invalidates/freezes the surface handle across iconic transitions!
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    Thread.Sleep(150);
+                    if (_parkedHwnd == target && NativeWin32.IsWindow(target) && NativeWin32.GetForegroundWindow() != target)
+                    {
+                        NativeWin32.SetWindowPos(target, NativeWin32.HWND_BOTTOM, 0, 0, 0, 0,
+                            NativeWin32.SWP_NOMOVE | NativeWin32.SWP_NOSIZE | NativeWin32.SWP_NOACTIVATE | NativeWin32.SWP_NOOWNERZORDER);
+                    }
+                });
+
+                _wgc.StopSession();
                 UnregisterThumb();
+                _consecutiveUniformDarkFrames = 0;
                 _lastSrcW = -1;
                 _lastSrcH = -1;
                 _lastCropMode = -1;
@@ -1109,6 +1764,7 @@ namespace DynamicIslandWin
             bool wasZoomed = _parkedWasZoomed;
             _parkedHwnd = IntPtr.Zero;
             _parkedWasZoomed = false;
+            _consecutiveUniformDarkFrames = 0;
 
             if (!NativeWin32.IsWindow(h)) return;
             try
@@ -1149,10 +1805,10 @@ namespace DynamicIslandWin
 
             if (_parkedHwnd == target && !NativeWin32.IsIconic(target))
             {
-                // If user clicked Discord on the Taskbar or Alt+Tab to bring it to front, restore its original normal/maximized placement!
                 if (unchecked(Environment.TickCount - _parkedTick) > 650 && NativeWin32.GetForegroundWindow() == target)
                 {
                     RestoreParkedWindow(true);
+                    _wgc.StopSession();
                     UnregisterThumb();
                     if (_lastW > 30 && _lastH > 30)
                         SyncHardwareStream(ownerHwnd, _lastX, _lastY, _lastW, _lastH, src, cropModeIndex);
@@ -1168,7 +1824,12 @@ namespace DynamicIslandWin
             }
             else if (_lastW > 30 && _lastH > 30)
             {
-                if (_thumbId == IntPtr.Zero || _boundSourceHwnd != target)
+                if (_usingWgc)
+                {
+                    if (!_wgc.IsActive || _wgc.TargetHwnd != target)
+                        SyncHardwareStream(ownerHwnd, _lastX, _lastY, _lastW, _lastH, src, cropModeIndex);
+                }
+                else if (_thumbId == IntPtr.Zero || _boundSourceHwnd != target)
                 {
                     SyncHardwareStream(ownerHwnd, _lastX, _lastY, _lastW, _lastH, src, cropModeIndex);
                 }
@@ -1195,6 +1856,11 @@ namespace DynamicIslandWin
 
         public void HideStream()
         {
+            if (_wgcTimer.Enabled) _wgcTimer.Stop();
+            _wgc.StopSession();
+            _usingWgc = false;
+            _hasRenderedWgcFrame = false;
+            _consecutiveUniformDarkFrames = 0;
             RestoreParkedWindow(false);
             UnregisterThumb();
             _lastX = -9999; _lastY = -9999; _lastW = -1; _lastH = -1;
@@ -1217,15 +1883,21 @@ namespace DynamicIslandWin
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            try { _wgcTimer.Stop(); _wgcTimer.Dispose(); } catch { }
+            try { _wgc.Dispose(); } catch { }
+            if (_wgcFrameBmp != null) { try { _wgcFrameBmp.Dispose(); } catch { } _wgcFrameBmp = null; }
+            try { _hintFont.Dispose(); _hintSf.Dispose(); } catch { }
             UnregisterThumb();
             base.OnFormClosing(e);
         }
     }
+
     public sealed class StreamCaptureEngine
     {
         private readonly object _frameLock = new object();
         private IntPtr _selectedHwnd = IntPtr.Zero;
         private List<StreamSourceInfo> _sources = new List<StreamSourceInfo>();
+        private int _lastScanTick = 0;
         private int _cropModeIndex = 0;
         public static readonly string[] CropModeNames = new string[]
         {
@@ -1246,6 +1918,7 @@ namespace DynamicIslandWin
         public List<StreamSourceInfo> GetAvailableSources(IntPtr selfHwnd)
         {
             var list = new List<StreamSourceInfo>();
+            var discordIndices = new List<int>();
             try
             {
                 NativeWin32.EnumWindows((hWnd, lParam) =>
@@ -1262,7 +1935,7 @@ namespace DynamicIslandWin
                     var sbCls = new StringBuilder(128);
                     NativeWin32.GetClassName(hWnd, sbCls, 128);
                     string cls = sbCls.ToString();
-                    if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd") return true;
+                    if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd") return true;
 
                     NativeWin32.RECT rc;
                     if (!NativeWin32.GetWindowRect(hWnd, out rc)) return true;
@@ -1280,11 +1953,14 @@ namespace DynamicIslandWin
 
                     int score = 10;
                     string cat = procName;
+                    bool isPopout = false;
 
                     if (lowerProc.Contains("discord"))
                     {
-                        cat = "Discord";
-                        score = 1100;
+                        isPopout = lowerTitle.Contains("popout") || string.Equals(title, "Discord", StringComparison.OrdinalIgnoreCase);
+                        cat = isPopout && lowerTitle.Contains("popout") ? "Discord Popout" : "Discord";
+                        score = lowerTitle.Contains("popout") ? 1520 : 1100;
+                        discordIndices.Add(list.Count);
                     }
                     else if (lowerTitle.Contains("discord"))
                     {
@@ -1326,10 +2002,28 @@ namespace DynamicIslandWin
                         ProcessName = procName,
                         CategoryLabel = cat,
                         WindowTitle = title,
-                        PriorityScore = score
+                        PriorityScore = score,
+                        IsDiscordPopout = isPopout && lowerTitle.Contains("popout")
                     });
                     return true;
                 }, IntPtr.Zero);
+
+                // If multiple Discord windows exist (main chat + detached Popout stream window), prioritize the Popout window automatically!
+                if (discordIndices.Count >= 2)
+                {
+                    for (int i = 0; i < discordIndices.Count; i++)
+                    {
+                        var ds = list[discordIndices[i]];
+                        string tl = (ds.WindowTitle ?? "").ToLowerInvariant();
+                        bool looksLikeMainChat = tl.StartsWith("#") || tl.StartsWith("@") || tl.Contains(" - discord") || tl.Contains(" | ");
+                        if (!looksLikeMainChat || tl.Contains("popout"))
+                        {
+                            ds.IsDiscordPopout = true;
+                            ds.CategoryLabel = "Discord Popout";
+                            ds.PriorityScore = 1520;
+                        }
+                    }
+                }
             }
             catch { }
 
@@ -1337,6 +2031,7 @@ namespace DynamicIslandWin
             lock (_frameLock)
             {
                 _sources = list;
+                _lastScanTick = Environment.TickCount;
             }
             return list;
         }
@@ -1344,15 +2039,36 @@ namespace DynamicIslandWin
         public StreamSourceInfo GetActiveSource(IntPtr selfHwnd)
         {
             List<StreamSourceInfo> list;
-            lock (_frameLock) { list = _sources; }
-            if (list == null || list.Count == 0)
+            int now = Environment.TickCount;
+            bool needRefresh;
+            lock (_frameLock)
+            {
+                list = _sources;
+                needRefresh = (list == null || list.Count == 0 || unchecked(now - _lastScanTick) >= 850);
+            }
+            if (needRefresh)
                 list = GetAvailableSources(selfHwnd);
-            if (list.Count == 0) return null;
+            if (list == null || list.Count == 0) return null;
 
+            // Auto-upgrade from main Discord chat window ("Stream is popped out") to Discord Popout window as soon as Popout opens
             if (_selectedHwnd != IntPtr.Zero)
             {
-                foreach (var s in list)
-                    if (s.Hwnd == _selectedHwnd) return s;
+                StreamSourceInfo cur = null;
+                StreamSourceInfo popout = null;
+                for (int i = 0; i < list.Count; i++)
+                {
+                    if (list[i].Hwnd == _selectedHwnd) cur = list[i];
+                    if (list[i].IsDiscordPopout && popout == null) popout = list[i];
+                }
+                if (cur != null)
+                {
+                    if (!cur.IsDiscordPopout && cur.CategoryLabel == "Discord" && popout != null)
+                    {
+                        _selectedHwnd = popout.Hwnd;
+                        return popout;
+                    }
+                    return cur;
+                }
             }
             _selectedHwnd = list[0].Hwnd;
             return list[0];
@@ -3164,7 +3880,6 @@ namespace DynamicIslandWin
         [PreserveSig] int QueryService(ref Guid guidService, ref Guid riid, out IntPtr ppvObject);
     }
 
-    [ComImport, Guid("E22AD333-B25F-460C-83D0-0581107395C9")]
     public sealed class DiscoveredMusicPlayer
     {
         public string Id = "";
@@ -3783,7 +4498,28 @@ namespace DynamicIslandWin
         }
     }
 
+    [ComImport, Guid("E22AD333-B25F-460C-83D0-0581107395C9")]
     internal class CUIAutomation8ComObject { }
+
+    [ComImport, Guid("FF48DBA4-60EF-4201-AA87-54103EEF594E")]
+    internal class CUIAutomationLegacyComObject { }
+
+    [ComImport, Guid("B70D9F59-3B5A-4DBA-AB9E-22012F607DF5"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IAccessibleAction
+    {
+        [PreserveSig] int nActions(out int nActions);
+        [PreserveSig] int doAction(int actionIndex);
+        [PreserveSig] int get_description(int actionIndex, [MarshalAs(UnmanagedType.BStr)] out string description);
+        void _Slot6_keyBinding();
+        [PreserveSig] int get_name(int actionIndex, [MarshalAs(UnmanagedType.BStr)] out string name);
+    }
+
+    [ComImport, Guid("E280AC06-EA73-45EB-B8D6-FC51EDEFEEB6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IUIAutomationLegacyIAccessiblePattern
+    {
+        void _Slot3_Select();
+        [PreserveSig] int DoDefaultAction();
+    }
 
     [ComImport, Guid("352FFBA8-0973-437C-A61F-F64CAFD81DF9"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     internal interface IUIAutomationCondition { }
@@ -3914,7 +4650,7 @@ namespace DynamicIslandWin
         void _Slot53_CheckNotSupported();
         void _Slot54_ReservedNotSupported();
         void _Slot55_ReservedMixed();
-        void _Slot56_ElemFromIAcc();
+        [PreserveSig] int ElementFromIAccessible([MarshalAs(UnmanagedType.Interface)] object accessible, int childId, out IUIAutomationElement element);
         void _Slot57_ElemFromIAccCache();
         [PreserveSig] int get_AutoSetFocus(out int autoSetFocus);
         [PreserveSig] int put_AutoSetFocus(int autoSetFocus);
@@ -3922,6 +4658,21 @@ namespace DynamicIslandWin
         [PreserveSig] int put_ConnectionTimeout(uint timeout);
         [PreserveSig] int get_TransactionTimeout(out uint timeout);
         [PreserveSig] int put_TransactionTimeout(uint timeout);
+    }
+
+    [ComImport, Guid("30CBE57D-D9D0-452A-AB13-7AC5AC4825EE"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IUIAutomationLegacy
+    {
+        void _Slot3(); void _Slot4(); void _Slot5();
+        [PreserveSig] int ElementFromHandle(IntPtr hwnd, out IUIAutomationElement element);
+        void _Slot7(); void _Slot8(); void _Slot9(); void _Slot10(); void _Slot11(); void _Slot12(); void _Slot13(); void _Slot14(); void _Slot15(); void _Slot16(); void _Slot17(); void _Slot18(); void _Slot19(); void _Slot20();
+        [PreserveSig] int CreateTrueCondition(out IUIAutomationCondition newCondition);
+        void _Slot22();
+        [PreserveSig] int CreatePropertyCondition(int propertyId, [In, MarshalAs(UnmanagedType.Struct)] object value, out IUIAutomationCondition newCondition);
+        void _Slot24();
+        [PreserveSig] int CreateAndCondition(IUIAutomationCondition condition1, IUIAutomationCondition condition2, out IUIAutomationCondition newCondition);
+        void _Slot26(); void _Slot27();
+        [PreserveSig] int CreateOrCondition(IUIAutomationCondition condition1, IUIAutomationCondition condition2, out IUIAutomationCondition newCondition);
     }
 
     public enum PlayerFavoriteSupport { Unsupported = 0, SupportedUiaAndBgKey = 1, SupportedUiaOnly = 2 }
@@ -3944,10 +4695,14 @@ namespace DynamicIslandWin
         private const int UIA_CheckBoxControlTypeId = 50002;
         private const int UIA_TogglePatternId = 10015;
         private const int UIA_InvokePatternId = 10000;
+        private const int UIA_LegacyIAccessiblePatternId = 10018;
 
         private static readonly object _queueLock = new object();
         private static readonly AutoResetEvent _wakeEvt = new AutoResetEvent(false);
         private static Thread _staThread = null;
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int IA2GetAttributesDelegate(IntPtr thisPtr, [MarshalAs(UnmanagedType.BStr)] out string attributes);
 
         private sealed class FavWorkItem
         {
@@ -3969,6 +4724,8 @@ namespace DynamicIslandWin
             public string ClassLower;
             public string AccelLower;
             public string AriaRoleLower;
+            public string ActNameLower;
+            public string DefaultActionRaw;
             public string AriaProps;
             public int ControlType;
             public bool HasToggle;
@@ -4044,7 +4801,15 @@ namespace DynamicIslandWin
                         combined.Contains("vivaldi") || combined.Contains("browser") || combined.Contains("arc") ||
                         combined.Contains("zen") || combined.Contains("waterfox") || combined.Contains("thorium") ||
                         combined.Contains("librewolf") || combined.Contains("floorp") || combined.Contains("whale");
+
             if (isYandex) return PlayerFavoriteSupport.SupportedUiaAndBgKey;
+            if (isBrowser && snap.IsVideoPlayback)
+            {
+                // Skip generic movie/video browser tabs (Kinopoisk/Rutube/movie sites) unless it's YouTube Music / music platform
+                string ttl = ((snap.Title ?? "") + " " + (snap.Artist ?? "")).ToLowerInvariant();
+                if (!ttl.Contains("youtube music") && !ttl.Contains("яндекс музык") && !ttl.Contains("spotify") && !ttl.Contains("soundcloud") && !ttl.Contains("deezer"))
+                    return PlayerFavoriteSupport.Unsupported;
+            }
             if (isSpotify || isBrowser || combined.Contains("aimp") || combined.Contains("itunes") ||
                 combined.Contains("applemusic") || combined.Contains("zunemusic") || combined.Contains("music.ui") ||
                 combined.Contains("media player") || combined.Contains("deezer") || combined.Contains("tidal") ||
@@ -4057,7 +4822,7 @@ namespace DynamicIslandWin
         public static void RequestSyncStateAsync(MediaSessionSnapshot snap, int generation, Action<PlayerFavoriteSyncResult> onCompleted, bool forceImmediate = false)
         {
             if (snap == null || string.IsNullOrEmpty(BuildTrackKey(snap))) return;
-            if (!forceImmediate && _lastManualToggleTick != 0 && unchecked(Environment.TickCount - _lastManualToggleTick) < 2200) return;
+            if (!forceImmediate && _lastManualToggleTick != 0 && unchecked(Environment.TickCount - _lastManualToggleTick) < 1800) return;
             EnsureStaWorkerStarted();
             lock (_queueLock)
             {
@@ -4089,12 +4854,12 @@ namespace DynamicIslandWin
         {
             if (hwnd == IntPtr.Zero || !NativeWin32.IsWindow(hwnd)) return false;
             IntPtr res;
-            return NativeWin32.SendMessageTimeout(hwnd, 0x0000, IntPtr.Zero, IntPtr.Zero, 0x0002, 160, out res) != IntPtr.Zero;
+            return NativeWin32.SendMessageTimeout(hwnd, 0x0000, IntPtr.Zero, IntPtr.Zero, 0x0002, 180, out res) != IntPtr.Zero;
         }
 
         private static string Norm(string s)
         {
-            return string.IsNullOrEmpty(s) ? "" : s.Trim().ToLowerInvariant().Replace('\u2019', '\'').Replace('ё', 'е');
+            return string.IsNullOrEmpty(s) ? "" : s.Trim().ToLowerInvariant().Replace('’', ''').Replace(' ', ' ').Replace('ё', 'е');
         }
 
         private static bool IsStrongAnchor(string n, string aid = "")
@@ -4103,7 +4868,7 @@ namespace DynamicIslandWin
             {
                 if (aid.Contains("skip-forward") || aid.Contains("skip-back") || aid.Contains("control-button-skip") ||
                     aid.Contains("nextbutton") || aid.Contains("previousbutton") || aid.Contains("transportcontrols_next") ||
-                    aid.Contains("sonata") || aid.Contains("player-bar") || aid.Contains("dislike"))
+                    aid.Contains("vibeplayercontrols_skipbutton") || aid.Contains("sonatacontrols") || aid.Contains("playerbardesktop"))
                     return true;
             }
             if (string.IsNullOrEmpty(n)) return false;
@@ -4112,17 +4877,79 @@ namespace DynamicIslandWin
                    n == "next" || n == "previous" || n.Contains("nächster") || n.Contains("vorheriger") ||
                    n.Contains("suivant") || n.Contains("précédent") || n.Contains("siguiente") || n.Contains("anterior") ||
                    n.Contains("sonraki") || n.Contains("önceki") || n.Contains("następny") || n.Contains("poprzedni") ||
-                   n.Contains("не нравится") || n.Contains("don't like") || n.Contains("dont like") ||
+                   n == "не нравится" || n.Contains("don't like") || n.Contains("dont like") ||
                    n.Contains("ұнамайды") || n.Contains("yoqmaydi") || n.Contains("келесі ән") || n.Contains("алдыңғы ән") ||
                    n.Contains("keyingi tarona") || n.Contains("avvalgi tarona");
         }
 
         private static bool IsPlayAnchor(string n, string aid = "")
         {
-            if (!string.IsNullOrEmpty(aid) && (aid.Contains("play-pause") || aid.Contains("playpause") || aid.Contains("control-button-playpause") || aid.Contains("playbutton")))
+            if (!string.IsNullOrEmpty(aid) && (aid.Contains("play-pause") || aid.Contains("playpause") || aid.Contains("control-button-playpause") || aid.Contains("playbutton") || aid.Contains("vibeplayercontrols_playbutton")))
                 return true;
             return n == "пауза" || n == "воспроизведение" || n == "відтворити" || n == "pause" || n == "play" || n == "playback" ||
                    n == "wiedergabe" || n == "lecture" || n == "reproducir" || n == "oynat" || n == "odtwórz";
+        }
+
+        private static void ParseIA2AttributesFast(object acc, out string ia2ClassLower, out string ia2IdLower, out bool ia2Checkable)
+        {
+            ia2ClassLower = ""; ia2IdLower = ""; ia2Checkable = false;
+            var sp = acc as IComServiceProvider;
+            if (sp == null) return;
+            Guid gAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+            Guid gIA2 = new Guid("E89F726E-C4F4-4C19-BB19-B647D7FA8478");
+            IntPtr pIA2;
+            if (sp.QueryService(ref gAcc, ref gIA2, out pIA2) != 0 || pIA2 == IntPtr.Zero) return;
+            try
+            {
+                // IAccessible2::get_attributes is slot 45 (IUnknown=3, IDispatch=4, IAccessible=21 -> 28..45)
+                IntPtr vtbl = Marshal.ReadIntPtr(pIA2);
+                IntPtr fnPtr = Marshal.ReadIntPtr(vtbl, 45 * IntPtr.Size);
+                var fn = (IA2GetAttributesDelegate)Marshal.GetDelegateForFunctionPointer(fnPtr, typeof(IA2GetAttributesDelegate));
+                string raw;
+                if (fn(pIA2, out raw) == 0 && !string.IsNullOrEmpty(raw))
+                {
+                    string low = raw.ToLowerInvariant();
+                    if (low.Contains("checkable:true")) ia2Checkable = true;
+                    string[] parts = low.Split(';');
+                    for (int i = 0; i < parts.Length; i++)
+                    {
+                        string p = parts[i];
+                        if (p.StartsWith("class:", StringComparison.Ordinal))
+                            ia2ClassLower = p.Substring(6).Trim();
+                        else if (p.StartsWith("id:", StringComparison.Ordinal))
+                            ia2IdLower = p.Substring(3).Trim();
+                    }
+                }
+            }
+            catch { }
+            finally { Marshal.Release(pIA2); }
+        }
+
+        private static string TryReadIA2Action0Name(object acc)
+        {
+            var sp = acc as IComServiceProvider;
+            if (sp == null) return "";
+            Guid gAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+            Guid gAct = new Guid("B70D9F59-3B5A-4DBA-AB9E-22012F607DF5");
+            IntPtr pAct;
+            if (sp.QueryService(ref gAcc, ref gAct, out pAct) != 0 || pAct == IntPtr.Zero) return "";
+            try
+            {
+                var actObj = Marshal.GetObjectForIUnknown(pAct) as IAccessibleAction;
+                if (actObj != null)
+                {
+                    int n;
+                    if (actObj.nActions(out n) == 0 && n > 0)
+                    {
+                        string nm;
+                        if (actObj.get_name(0, out nm) == 0 && !string.IsNullOrEmpty(nm))
+                            return nm.Trim().ToLowerInvariant();
+                    }
+                }
+            }
+            catch { }
+            finally { Marshal.Release(pAct); }
+            return "";
         }
 
         private static bool MatchStableLikeIdentifier(CandidateMeta m, out bool explicitUnlikeId)
@@ -4131,14 +4958,27 @@ namespace DynamicIslandWin
             string aid = m.AutoIdLower ?? "";
             string cls = m.ClassLower ?? "";
             string acc = m.AccelLower ?? "";
+            string act = m.ActNameLower ?? "";
+            string nm = m.NameLower ?? "";
             string idCombo = aid + " | " + cls;
 
-            if (idCombo.Contains("dislike") || idCombo.Contains("thumbs-down") || idCombo.Contains("thumbs_down") || idCombo.Contains("ban-button") || idCombo.Contains("not-interested"))
+            if (idCombo.Contains("dislike") || idCombo.Contains("thumbs-down") || idCombo.Contains("thumbs_down") ||
+                idCombo.Contains("ban-button") || idCombo.Contains("not-interested") || idCombo.Contains("viberesetbutton") ||
+                idCombo.Contains("resetbutton") || idCombo.Contains("pinbutton") || idCombo.Contains("sharebutton"))
                 return false;
 
             if (idCombo.Contains("unlike") || idCombo.Contains("remove-from-liked") || idCombo.Contains("unfavorite"))
             {
                 explicitUnlikeId = true;
+                return true;
+            }
+
+            // Yandex Music v5 Next (Electron 32+): VibePlayerBar_button / PlayerBarDesktop / BaseSonataControls / SonataControls with check/uncheck action
+            bool isYmBarClass = cls.Contains("vibeplayerbar_button") || cls.Contains("playerbardesktop") ||
+                                cls.Contains("basesonatacontrols") || cls.Contains("sonatacontrols");
+            if (isYmBarClass && (act == "check" || act == "uncheck") &&
+                !nm.Contains("не нрав") && !nm.Contains("dislike") && !nm.Contains("don't like") && !nm.Contains("звук") && !nm.Contains("mute"))
+            {
                 return true;
             }
 
@@ -4164,22 +5004,29 @@ namespace DynamicIslandWin
             string nm = m.NameLower ?? "";
             string n = string.IsNullOrEmpty(m.HelpLower) ? nm : (nm + " | " + m.HelpLower);
             string idCombo = (m.AutoIdLower ?? "") + " | " + (m.ClassLower ?? "");
+            string act = m.ActNameLower ?? "";
 
-            // Strict universal exclusion of Dislike / Ban / Share / Repeat / Shuffle / Pin across 12 languages + IDs
-            if (idCombo.Contains("dislike") || idCombo.Contains("thumbs-down") || idCombo.Contains("thumbs_down") || idCombo.Contains("ban") ||
+            // Strict universal exclusion of Dislike / Reset / Promo Banners / Station / Vibe Preset / Share / Repeat / Shuffle / Pin
+            if (idCombo.Contains("dislike") || idCombo.Contains("thumbs-down") || idCombo.Contains("thumbs_down") ||
+                idCombo.Contains("viberesetbutton") || idCombo.Contains("resetbutton") || idCombo.Contains("ban") ||
                 n.Contains("не нравится") || n.Contains("не рекомендовать") || n.Contains("дизлайк") ||
                 n.Contains("не подобається") || n.Contains("dislike") || n.Contains("thumbs down") ||
                 n.Contains("don't like") || n.Contains("dont like") || n.Contains("do not like") ||
                 n.Contains("mag ich nicht") || n.Contains("gefällt mir nicht") || n.Contains("je n'aime pas") ||
                 n.Contains("no me gusta") || n.Contains("non mi piace") || n.Contains("não gostei") ||
                 n.Contains("beğenme") || n.Contains("nie podoba") || n.Contains("ұнамайды") || n.Contains("yoqmaydi") ||
+                n.Contains("сбросить") || n.Contains("включить мою волну") || n.Contains("моя волна") || n.Contains("мою волну") ||
+                n.Contains("станци") || n.Contains("наполните дом") || n.Contains("выбрать ") ||
                 n.Contains("скрыть") || n.Contains("закрепить") || n.Contains("открепить") || n.Contains("pin") ||
                 n.Contains("повтор") || n.Contains("случайн") || n.Contains("перемеш") || n.Contains("очеред") ||
-                n.Contains("контекстное меню") || n.Contains("поделиться") || n.Contains("share"))
+                n.Contains("контекстное меню") || n.Contains("поделиться") || n.Contains("share") || n.Contains("звук"))
                 return false;
 
             bool explicitUnlikeId;
             bool byStableId = MatchStableLikeIdentifier(m, out explicitUnlikeId);
+
+            // Reject long promotional sentences (e.g. banners > 44 chars) unless matched by a stable player ID
+            if (!byStableId && nm.Length > 44) return false;
 
             bool explicitRemove = explicitUnlikeId ||
                 n.Contains("удалить из") || n.Contains("убрать из") || n.Contains("убрать отметку") ||
@@ -4198,12 +5045,9 @@ namespace DynamicIslandWin
 
             bool isLikeText =
                 explicitRemove || spotifyCheckedBox ||
-                nm == "нравится" || nm == "like" || nm == "подобається" || nm == "ұнайды" || nm == "yoqadi" ||
+                nm == "нравится" || nm == "мне нравится" || nm == "like" || nm == "подобається" || nm == "ұнайды" || nm == "yoqadi" ||
                 nm == "gefällt mir" || nm == "j'aime" || nm == "me gusta" || nm == "mi piace" || nm == "gostei" || nm == "beğen" || nm == "lubię to" ||
-                n.Contains("нравится") || n.Contains("лайк") || n.Contains("любить") || n.Contains("любимое") || n.Contains("любимые") ||
-                n.Contains("подобається") || n.Contains("улюблені") || n.Contains("в обране") ||
-                n.Contains("в коллекцию") || n.Contains("в мою коллекцию") || n.Contains("добавить в коллекцию") ||
-                n.Contains("в медиатеку") || n.Contains("добавить в медиатеку") || n.Contains("в избранное") ||
+                n.Contains("добавить в коллекцию") || n.Contains("в мою коллекцию") || n.Contains("добавить в медиатеку") || n.Contains("в избранное") ||
                 n == "like" || n.StartsWith("like |") || n.EndsWith("| like") ||
                 n.Contains("save to your library") || n.Contains("add to liked") || n.Contains("add to favorites") || n.Contains("favourite") || n.Contains("favorite") ||
                 n.Contains("gefällt mir") || n.Contains("lieblingssongs") || n.Contains("j'aime") || n.Contains("titres likés") ||
@@ -4211,6 +5055,9 @@ namespace DynamicIslandWin
 
             if (!byStableId && !isLikeText) return false;
             m.MatchedByStableId = byStableId;
+
+            if (act == "uncheck") { resolvedLiked = true; return true; }
+            if (act == "check" && !explicitRemove) { resolvedLiked = (m.HasToggle && m.ToggleVal == 1); return true; }
 
             if (m.HasToggle && (m.ToggleVal == 0 || m.ToggleVal == 1))
             {
@@ -4223,7 +5070,8 @@ namespace DynamicIslandWin
                 if (ap.Contains("pressed=true") || ap.Contains("checked=true") || ap.Contains("selected=true")) { resolvedLiked = true; return true; }
                 if (ap.Contains("pressed=false") || ap.Contains("checked=false")) { resolvedLiked = explicitRemove; return true; }
             }
-            if ((m.ClassLower ?? "").Contains("active") || (m.ClassLower ?? "").Contains("is-liked") || (m.ClassLower ?? "").Contains("liked") && !(m.ClassLower ?? "").Contains("unliked"))
+            string clsLow = m.ClassLower ?? "";
+            if ((clsLow.Contains("active") || clsLow.Contains("is-liked") || clsLow.Contains("_liked")) && !clsLow.Contains("unliked"))
             {
                 resolvedLiked = true;
                 return true;
@@ -4255,7 +5103,7 @@ namespace DynamicIslandWin
             bool validWin = !topIconic && winW >= 200 && winH >= 120;
             int maxBtnW = (int)Math.Ceiling(260f * dpiScale);
             int maxBtnH = (int)Math.Ceiling(150f * dpiScale);
-            int bottomBandPx = Math.Max((int)Math.Ceiling(165f * dpiScale), (int)(winH * 0.26f));
+            int bottomBandPx = Math.Max((int)Math.Ceiling(170f * dpiScale), (int)(winH * 0.28f));
             int topBandPx = Math.Max((int)Math.Ceiling(140f * dpiScale), (int)(winH * 0.22f));
 
             int bestIdx = -1, bestScore = int.MinValue;
@@ -4277,7 +5125,8 @@ namespace DynamicIslandWin
                 if (!EvaluateSemantics(m, nearStrong, out candLiked)) continue;
 
                 int score = 0;
-                if (m.MatchedByStableId) score += 2600;
+                if (m.MatchedByStableId) score += 3200;
+                if (m.ActNameLower == "check" || m.ActNameLower == "uncheck") score += 950;
                 if (nearStrong) score += 3600 - minStrong * 55;
                 else if (nearPlay) score += 1400 - minPlay * 40;
 
@@ -4291,18 +5140,20 @@ namespace DynamicIslandWin
                     float relX = (cx - topWinRc.Left) / Math.Max(1f, (float)winW);
                     float relY = (cy - topWinRc.Top) / Math.Max(1f, (float)winH);
 
-                    if (cy >= topWinRc.Bottom - bottomBandPx && cy <= topWinRc.Bottom + 24 * dpiScale)
+                    if (cy >= topWinRc.Bottom - bottomBandPx && cy <= topWinRc.Bottom + 32 * dpiScale)
                         score += 1500 + (int)(relY * 220f);
-                    else if (relY >= 0.68f)
-                        score += 850 + (int)(relY * 120f);
+                    else if (relY >= 0.65f)
+                        score += 900 + (int)(relY * 120f);
                     else if (cy <= topWinRc.Top + topBandPx || relY <= 0.22f)
                         score += 720; // Top transport bar (Apple Music / iTunes / VK / WMP)
-                    else if (relX >= 0.66f && relY >= 0.22f && relY <= 0.96f)
+                    else if (relX >= 0.64f && relY >= 0.22f && relY <= 0.96f)
                         score += 680; // Right Now-Playing sidebar (Spotify Desktop / Store)
-                    else if (!nearStrong && !m.MatchedByStableId)
+                    else if (nearStrong || m.MatchedByStableId)
+                        score += 620; // Central Vibe / Fullscreen player orb bar (Yandex Music v5 VibePlayerBar_button)
+                    else
                     {
                         if (string.IsNullOrEmpty(nearMiss))
-                            nearMiss = string.Format("midScreenReject(name='{0}',aid='{1}',rel={2:0.00},{3:0.00})", m.NameLower, m.AutoIdLower, relX, relY);
+                            nearMiss = string.Format("midScreenReject(name='{0}',cls='{1}',rel={2:0.00},{3:0.00})", m.NameLower, m.ClassLower, relX, relY);
                         continue;
                     }
                 }
@@ -4311,14 +5162,14 @@ namespace DynamicIslandWin
                     if (!nearStrong && !nearPlay && !m.MatchedByStableId && k < items.Count - 32 && k > 28)
                     {
                         if (string.IsNullOrEmpty(nearMiss))
-                            nearMiss = string.Format("noBoundsReject(name='{0}',aid='{1}',idx={2}/{3})", m.NameLower, m.AutoIdLower, k, items.Count);
+                            nearMiss = string.Format("noBoundsReject(name='{0}',cls='{1}',idx={2}/{3})", m.NameLower, m.ClassLower, k, items.Count);
                         continue;
                     }
                     if (k >= items.Count - 32) score += 450 + (k - (items.Count - 32)) * 10;
                     else if (k <= 28) score += 320;
                 }
 
-                if (m.HasToggle) score += 160;
+                if (m.HasToggle) score += 260;
                 if (!string.IsNullOrEmpty(m.AriaProps)) score += 90;
                 if (score >= bestScore) { bestScore = score; bestIdx = k; bestLiked = candLiked; }
             }
@@ -4329,8 +5180,9 @@ namespace DynamicIslandWin
                 if (k == bestIdx)
                 {
                     winner = items[k];
-                    dbg = string.Format("mode={0}, name='{1}', aid='{2}', cls='{3}', tog={4}:{5}, dpi={6:0.00}x, score={7}, btns={8}",
-                        winner.IsAccNode ? "IA2" : "UIA", winner.NameLower, winner.AutoIdLower, winner.ClassLower,
+                    dbg = string.Format("mode={0}, name='{1}', act='{2}', aid='{3}', cls='{4}', tog={5}:{6}, dpi={7:0.00}x, score={8}, btns={9}",
+                        winner.IsAccNode ? "IA2" : "UIA", winner.NameLower, winner.ActNameLower, winner.AutoIdLower,
+                        (winner.ClassLower ?? "").Length > 36 ? winner.ClassLower.Substring(winner.ClassLower.Length - 36) : winner.ClassLower,
                         winner.HasToggle ? 1 : 0, winner.ToggleVal, dpiScale, bestScore, items.Count);
                 }
                 else { ReleaseCom(items[k].ComNode); items[k].ComNode = null; }
@@ -4348,7 +5200,7 @@ namespace DynamicIslandWin
             object acc, int depth, ref int visitedNodes,
             List<CandidateMeta> items, List<int> strongAnchors, List<int> playAnchors)
         {
-            if (acc == null || depth > 26 || visitedNodes > 2200) return;
+            if (acc == null || depth > 26 || visitedNodes > 2400) return;
             visitedNodes++;
 
             object vSelf = 0;
@@ -4356,51 +5208,77 @@ namespace DynamicIslandWin
             bool addedSelf = false;
             try
             {
-                if (depth <= 8)
-                {
-                    var sp = acc as IComServiceProvider;
-                    if (sp != null)
-                    {
-                        Guid gAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
-                        Guid gIA2 = new Guid("E89F726E-C4F4-4C19-BB19-B647D7FA8478");
-                        IntPtr p2;
-                        if (sp.QueryService(ref gAcc, ref gIA2, out p2) == 0 && p2 != IntPtr.Zero)
-                            Marshal.Release(p2);
-                    }
-                }
-
                 Type t = acc.GetType();
-                object rObj = t.InvokeMember("accRole", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
+                object rObj = t.InvokeMember("accRole", BindingFlags.GetProperty, null, acc, new object[] { vSelf });
                 if (rObj is int) role = (int)rObj;
-                object sObj = t.InvokeMember("accState", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf });
+                object sObj = t.InvokeMember("accState", BindingFlags.GetProperty, null, acc, new object[] { vSelf });
                 if (sObj is int) state = (int)sObj;
-                object cObj = t.InvokeMember("accChildCount", System.Reflection.BindingFlags.GetProperty, null, acc, null);
+                object cObj = t.InvokeMember("accChildCount", BindingFlags.GetProperty, null, acc, null);
                 if (cObj is int) childCount = (int)cObj;
 
                 if (role == 43 || role == 44 || role == 62)
                 {
-                    string rawNm = null, rawDesc = null, rawKey = null;
-                    try { rawNm = t.InvokeMember("accName", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string; } catch { }
-                    try { rawDesc = t.InvokeMember("accDescription", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string; } catch { }
-                    try { rawKey = t.InvokeMember("accKeyboardShortcut", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string; } catch { }
-
-                    string nmNorm = Norm(rawNm);
-                    string descNorm = Norm(rawDesc);
-                    string keyNorm = Norm(rawKey);
-                    if (IsStrongAnchor(nmNorm) || IsStrongAnchor(descNorm)) strongAnchors.Add(items.Count);
-                    else if (IsPlayAnchor(nmNorm) || IsPlayAnchor(descNorm)) playAnchors.Add(items.Count);
-
-                    int enabled = ((state & 0x01) == 0) ? 1 : 0;
-                    int pressed = (((state & 0x08) != 0) || ((state & 0x10) != 0)) ? 1 : 0;
-
-                    items.Add(new CandidateMeta
+                    // Skip invisible or zero-sized offscreen ghost buttons (0x8000 = INVISIBLE, 0x01 = UNAVAILABLE)
+                    if ((state & 0x8000) == 0)
                     {
-                        ComNode = acc, IsAccNode = true, NameLower = nmNorm, HelpLower = descNorm,
-                        AutoIdLower = "", ClassLower = "", AccelLower = keyNorm, AriaRoleLower = "", AriaProps = null,
-                        ControlType = (role == 44) ? UIA_CheckBoxControlTypeId : UIA_ButtonControlTypeId,
-                        HasToggle = true, ToggleVal = pressed, Enabled = enabled, HasBounds = false
-                    });
-                    addedSelf = true;
+                        string rawNm = null, rawDesc = null, rawKey = null, rawDef = null;
+                        try { rawNm = t.InvokeMember("accName", BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string; } catch { }
+                        try { rawDesc = t.InvokeMember("accDescription", BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string; } catch { }
+                        try { rawKey = t.InvokeMember("accKeyboardShortcut", BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string; } catch { }
+                        try { rawDef = t.InvokeMember("accDefaultAction", BindingFlags.GetProperty, null, acc, new object[] { vSelf }) as string; } catch { }
+
+                        string ia2Cls, ia2Id;
+                        bool ia2Checkable;
+                        ParseIA2AttributesFast(acc, out ia2Cls, out ia2Id, out ia2Checkable);
+                        string act0 = TryReadIA2Action0Name(acc);
+
+                        int lx = 0, ly = 0, lw = 0, lh = 0;
+                        bool hasLoc = false;
+                        try
+                        {
+                            object[] locArgs = new object[] { 0, 0, 0, 0, vSelf };
+                            ParameterModifier pm = new ParameterModifier(5);
+                            pm[0] = true; pm[1] = true; pm[2] = true; pm[3] = true; pm[4] = false;
+                            t.InvokeMember("accLocation", BindingFlags.InvokeMethod, null, acc, locArgs, new ParameterModifier[] { pm }, null, null);
+                            lx = (int)locArgs[0]; ly = (int)locArgs[1]; lw = (int)locArgs[2]; lh = (int)locArgs[3];
+                            hasLoc = (lw > 0 && lh > 0);
+                        }
+                        catch { }
+
+                        string nmNorm = Norm(rawNm);
+                        string descNorm = Norm(rawDesc);
+                        string keyNorm = Norm(rawKey);
+                        if (IsStrongAnchor(nmNorm, ia2Cls) || IsStrongAnchor(descNorm, ia2Id)) strongAnchors.Add(items.Count);
+                        else if (IsPlayAnchor(nmNorm, ia2Cls) || IsPlayAnchor(descNorm, ia2Id)) playAnchors.Add(items.Count);
+
+                        int enabled = ((state & 0x01) == 0) ? 1 : 0;
+                        bool isCheckedOrPressed = (((state & 0x08) != 0) || ((state & 0x10) != 0));
+                        bool isCheckableAct = (act0 == "check" || act0 == "uncheck" || act0 == "toggle");
+                        bool hasToggle = isCheckedOrPressed || isCheckableAct || ia2Checkable || (role == 44);
+                        int toggleVal = (isCheckedOrPressed || act0 == "uncheck") ? 1 : 0;
+
+                        items.Add(new CandidateMeta
+                        {
+                            ComNode = acc,
+                            IsAccNode = true,
+                            NameLower = nmNorm,
+                            HelpLower = descNorm,
+                            AutoIdLower = ia2Id,
+                            ClassLower = ia2Cls,
+                            AccelLower = keyNorm,
+                            AriaRoleLower = "",
+                            ActNameLower = act0,
+                            DefaultActionRaw = rawDef ?? "",
+                            AriaProps = null,
+                            ControlType = (role == 44) ? UIA_CheckBoxControlTypeId : UIA_ButtonControlTypeId,
+                            HasToggle = hasToggle,
+                            ToggleVal = toggleVal,
+                            Enabled = enabled,
+                            Bounds = new NativeWin32.RECT { Left = lx, Top = ly, Right = lx + lw, Bottom = ly + lh },
+                            HasBounds = hasLoc
+                        });
+                        addedSelf = true;
+                    }
                     if (childCount <= 0) return;
                 }
             }
@@ -4500,17 +5378,18 @@ namespace DynamicIslandWin
             {
                 ComNode = el, IsAccNode = false, NameLower = nmNorm, HelpLower = helpNorm,
                 AutoIdLower = aidNorm, ClassLower = clsNorm, AccelLower = accNorm, AriaRoleLower = roleNorm,
+                ActNameLower = "", DefaultActionRaw = "",
                 AriaProps = rawAria, ControlType = ct, HasToggle = hasTog, ToggleVal = togVal,
                 Enabled = en, Bounds = brc, HasBounds = hasBounds
             });
         }
 
         private static CandidateMeta ScanUiaWindow(
-            IUIAutomation2 uia, IntPtr topHwnd, IntPtr scanHwnd, NativeWin32.RECT topWinRc, bool topIconic,
+            object uiaAny, IntPtr topHwnd, IntPtr scanHwnd, NativeWin32.RECT topWinRc, bool topIconic,
             IUIAutomationCondition condInteractive, out bool resolvedLiked, out int totalBtns, out string dbg)
         {
             resolvedLiked = false; totalBtns = 0; dbg = "";
-            if (uia == null || scanHwnd == IntPtr.Zero || !IsWindowResponsive(scanHwnd)) return null;
+            if (uiaAny == null || scanHwnd == IntPtr.Zero || !IsWindowResponsive(scanHwnd)) return null;
 
             IUIAutomationElement root = null;
             IUIAutomationElementArray arr = null;
@@ -4519,13 +5398,16 @@ namespace DynamicIslandWin
             var playAnchors = new List<int>();
             try
             {
-                if (uia.ElementFromHandle(scanHwnd, out root) != 0 || root == null) return null;
+                int hrElem = -1;
+                if (uiaAny is IUIAutomation2) hrElem = ((IUIAutomation2)uiaAny).ElementFromHandle(scanHwnd, out root);
+                else if (uiaAny is IUIAutomationLegacy) hrElem = ((IUIAutomationLegacy)uiaAny).ElementFromHandle(scanHwnd, out root);
+                if (hrElem != 0 || root == null) return null;
+
                 if (root.FindAll(UIA_TreeScope_Descendants, condInteractive, out arr) != 0 || arr == null) return null;
                 int len;
                 if (arr.get_Length(out len) != 0 || len <= 0) return null;
                 totalBtns = len;
 
-                // Scan BOTH head (top player bars like Apple Music / iTunes / VK) AND tail (bottom/sidebar bars like Spotify / Yandex / YouTube Music)
                 if (len <= 640)
                 {
                     for (int i = 0; i < len; i++)
@@ -4553,13 +5435,12 @@ namespace DynamicIslandWin
         }
 
         private static CandidateMeta FindPlayerBarLikeControl(
-            IUIAutomation2 uia, IntPtr topHwnd, IntPtr renderHwnd, bool isBrowser, string windowTitle,
+            object uiaAny, IntPtr topHwnd, IntPtr renderHwnd, bool isBrowser, string windowTitle,
             bool allowColdWakeRetry, out bool isCurrentlyLiked, out string debugSummary)
         {
             isCurrentlyLiked = false; debugSummary = "";
             if (topHwnd == IntPtr.Zero) { debugSummary = "topHwnd=0"; return null; }
 
-            // Note: do NOT filter browsers by RU/EN window title words — SMTC already confirmed this process owns the active media session!
             NativeWin32.RECT winRc;
             if (!NativeWin32.GetWindowRect(topHwnd, out winRc)) winRc = new NativeWin32.RECT();
             bool isIconic = NativeWin32.IsIconic(topHwnd);
@@ -4568,7 +5449,6 @@ namespace DynamicIslandWin
             NativeWin32.GetClassName(topHwnd, clsSb, 128);
             string winClass = clsSb.ToString();
 
-            // Locate UWP CoreWindow child when player runs inside ApplicationFrameHost (Microsoft Store Spotify / Apple Music / Media Player)
             IntPtr uwpCoreHwnd = IntPtr.Zero;
             if (winClass == "ApplicationFrameWindow")
             {
@@ -4598,29 +5478,40 @@ namespace DynamicIslandWin
                 if (!string.IsNullOrEmpty(subDbg)) lastAttemptDbg = "IA2Top:" + subDbg;
 
                 int uiaBtns = 0;
-                if (uia != null)
+                if (uiaAny != null)
                 {
                     IUIAutomationCondition cBtn = null, cChk = null, cInter = null;
                     try
                     {
-                        uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out cBtn);
-                        uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_CheckBoxControlTypeId, out cChk);
-                        uia.CreateOrCondition(cBtn, cChk, out cInter);
+                        if (uiaAny is IUIAutomation2)
+                        {
+                            var u2 = (IUIAutomation2)uiaAny;
+                            u2.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out cBtn);
+                            u2.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_CheckBoxControlTypeId, out cChk);
+                            u2.CreateOrCondition(cBtn, cChk, out cInter);
+                        }
+                        else if (uiaAny is IUIAutomationLegacy)
+                        {
+                            var u1 = (IUIAutomationLegacy)uiaAny;
+                            u1.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, out cBtn);
+                            u1.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_CheckBoxControlTypeId, out cChk);
+                            u1.CreateOrCondition(cBtn, cChk, out cInter);
+                        }
                         if (cInter != null)
                         {
                             if (uwpCoreHwnd != IntPtr.Zero)
                             {
-                                var hitCore = ScanUiaWindow(uia, topHwnd, uwpCoreHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out subDbg);
+                                var hitCore = ScanUiaWindow(uiaAny, topHwnd, uwpCoreHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out subDbg);
                                 if (hitCore != null) { debugSummary = "UWPCore+" + subDbg; return hitCore; }
                                 if (!string.IsNullOrEmpty(subDbg)) lastAttemptDbg = "UWPCore:" + subDbg;
                             }
                             if (renderHwnd != IntPtr.Zero)
                             {
-                                var hitRenderUia = ScanUiaWindow(uia, topHwnd, renderHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out subDbg);
+                                var hitRenderUia = ScanUiaWindow(uiaAny, topHwnd, renderHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out subDbg);
                                 if (hitRenderUia != null) { debugSummary = "UIARender+" + subDbg; return hitRenderUia; }
                                 if (!string.IsNullOrEmpty(subDbg)) lastAttemptDbg = "UIARender:" + subDbg;
                             }
-                            var hitUia = ScanUiaWindow(uia, topHwnd, topHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out subDbg);
+                            var hitUia = ScanUiaWindow(uiaAny, topHwnd, topHwnd, winRc, isIconic, cInter, out isCurrentlyLiked, out uiaBtns, out subDbg);
                             if (hitUia != null) { debugSummary = subDbg; return hitUia; }
                             if (!string.IsNullOrEmpty(subDbg)) lastAttemptDbg = "UIATop:" + subDbg;
                         }
@@ -4640,26 +5531,86 @@ namespace DynamicIslandWin
                 winClass, isIconic ? 1 : 0, winRc.Right - winRc.Left, winRc.Bottom - winRc.Top, lastAttemptDbg);
             return null;
         }
-        private static bool InvokeLikeControlSafe(CandidateMeta ctrl)
+
+        private static bool InvokeLikeControlSafe(object uiaAny, CandidateMeta ctrl, out string usedMethod)
         {
+            usedMethod = "none";
             if (ctrl == null || ctrl.ComNode == null) return false;
             if (ctrl.IsAccNode)
             {
+                // Tier 1: IAccessibleAction::doAction(0) — works silently in background on Electron 32+ / Chromium 130+ (Yandex Music v5, Spotify, Browsers)!
                 try
                 {
-                    ctrl.ComNode.GetType().InvokeMember(
-                        "accDoDefaultAction",
-                        System.Reflection.BindingFlags.InvokeMethod,
-                        null,
-                        ctrl.ComNode,
-                        new object[] { 0 });
-                    return true;
+                    var sp = ctrl.ComNode as IComServiceProvider;
+                    if (sp != null)
+                    {
+                        Guid gAcc = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+                        Guid gAct = new Guid("B70D9F59-3B5A-4DBA-AB9E-22012F607DF5");
+                        IntPtr pAct;
+                        if (sp.QueryService(ref gAcc, ref gAct, out pAct) == 0 && pAct != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                var actObj = Marshal.GetObjectForIUnknown(pAct) as IAccessibleAction;
+                                if (actObj != null)
+                                {
+                                    int nAct;
+                                    if (actObj.nActions(out nAct) == 0 && nAct > 0 && actObj.doAction(0) == 0)
+                                    {
+                                        usedMethod = "IAccessibleAction.doAction(0:" + (ctrl.ActNameLower ?? "") + ")";
+                                        return true;
+                                    }
+                                }
+                            }
+                            finally { Marshal.Release(pAct); }
+                        }
+                    }
                 }
-                catch (Exception ex)
+                catch (Exception ex) { LogDiagnostic("WARN", "IAccessibleAction.doAction failed: " + ex.Message); }
+
+                // Tier 2: MSAA accDoDefaultAction (only when non-empty default action is declared)
+                if (!string.IsNullOrEmpty(ctrl.DefaultActionRaw))
                 {
-                    LogDiagnostic("WARN", "IA2 accDoDefaultAction failed safely: " + ex.Message);
-                    return false;
+                    try
+                    {
+                        ctrl.ComNode.GetType().InvokeMember("accDoDefaultAction", BindingFlags.InvokeMethod, null, ctrl.ComNode, new object[] { 0 });
+                        usedMethod = "MSAA.accDoDefaultAction(" + ctrl.DefaultActionRaw + ")";
+                        return true;
+                    }
+                    catch (Exception ex) { LogDiagnostic("WARN", "MSAA accDoDefaultAction failed: " + ex.Message); }
                 }
+
+                // Tier 3: Bridge IA2 node into UIA ElementFromIAccessible -> Toggle / Invoke
+                if (uiaAny is IUIAutomation2)
+                {
+                    IUIAutomationElement bridged = null;
+                    try
+                    {
+                        if (((IUIAutomation2)uiaAny).ElementFromIAccessible(ctrl.ComNode, 0, out bridged) == 0 && bridged != null)
+                        {
+                            object pObj = null;
+                            if (bridged.GetCurrentPattern(UIA_TogglePatternId, out pObj) == 0 && pObj is IUIAutomationTogglePattern)
+                            {
+                                int hr = ((IUIAutomationTogglePattern)pObj).Toggle();
+                                ReleaseCom(pObj);
+                                if (hr == 0) { usedMethod = "BridgedUIA.Toggle"; return true; }
+                            }
+                            else ReleaseCom(pObj);
+
+                            pObj = null;
+                            if (bridged.GetCurrentPattern(UIA_InvokePatternId, out pObj) == 0 && pObj is IUIAutomationInvokePattern)
+                            {
+                                int hr = ((IUIAutomationInvokePattern)pObj).Invoke();
+                                ReleaseCom(pObj);
+                                if (hr == 0) { usedMethod = "BridgedUIA.Invoke"; return true; }
+                            }
+                            else ReleaseCom(pObj);
+                        }
+                    }
+                    catch { }
+                    finally { ReleaseCom(bridged); }
+                }
+                return false;
             }
 
             var btn = ctrl.ComNode as IUIAutomationElement;
@@ -4671,14 +5622,21 @@ namespace DynamicIslandWin
                 {
                     int hr = ((IUIAutomationTogglePattern)patObj).Toggle();
                     ReleaseCom(patObj); patObj = null;
-                    if (hr == 0) return true;
+                    if (hr == 0) { usedMethod = "UIA.TogglePattern"; return true; }
                 }
                 ReleaseCom(patObj); patObj = null;
                 if (btn.GetCurrentPattern(UIA_InvokePatternId, out patObj) == 0 && patObj is IUIAutomationInvokePattern)
                 {
                     int hr = ((IUIAutomationInvokePattern)patObj).Invoke();
                     ReleaseCom(patObj); patObj = null;
-                    if (hr == 0) return true;
+                    if (hr == 0) { usedMethod = "UIA.InvokePattern"; return true; }
+                }
+                ReleaseCom(patObj); patObj = null;
+                if (btn.GetCurrentPattern(UIA_LegacyIAccessiblePatternId, out patObj) == 0 && patObj is IUIAutomationLegacyIAccessiblePattern)
+                {
+                    int hr = ((IUIAutomationLegacyIAccessiblePattern)patObj).DoDefaultAction();
+                    ReleaseCom(patObj); patObj = null;
+                    if (hr == 0) { usedMethod = "UIA.LegacyIAccessible"; return true; }
                 }
             }
             catch (Exception ex) { LogDiagnostic("WARN", "UIA invoke failed safely: " + ex.Message); }
@@ -4688,66 +5646,88 @@ namespace DynamicIslandWin
 
         private static bool SendSilentBackgroundKeyYandex(IntPtr topHwnd, IntPtr renderHwnd)
         {
-            IntPtr target = (renderHwnd != IntPtr.Zero && NativeWin32.IsWindow(renderHwnd)) ? renderHwnd : topHwnd;
-            if (target == IntPtr.Zero || !NativeWin32.IsWindow(target)) return false;
+            if (topHwnd == IntPtr.Zero || !NativeWin32.IsWindow(topHwnd)) return false;
             try
             {
                 uint scanF = 0x21;
                 IntPtr lDown = new IntPtr((int)((scanF << 16) | 1));
                 IntPtr lUp = new IntPtr(unchecked((int)(0xC0000001u | (scanF << 16))));
-                if (topHwnd != IntPtr.Zero && NativeWin32.GetForegroundWindow() != topHwnd)
+
+                // Never call ShowWindow or SetForegroundWindow — send background key message directly!
+                NativeWin32.PostMessage(topHwnd, NativeWin32.WM_KEYDOWN, new IntPtr(0x46), lDown);
+                Thread.Sleep(18);
+                NativeWin32.PostMessage(topHwnd, NativeWin32.WM_KEYUP, new IntPtr(0x46), lUp);
+
+                if (renderHwnd != IntPtr.Zero && renderHwnd != topHwnd && NativeWin32.IsWindow(renderHwnd))
                 {
-                    NativeWin32.PostMessage(topHwnd, NativeWin32.WM_ACTIVATE, new IntPtr(1), IntPtr.Zero);
-                    Thread.Sleep(12);
+                    NativeWin32.PostMessage(renderHwnd, NativeWin32.WM_KEYDOWN, new IntPtr(0x46), lDown);
+                    Thread.Sleep(18);
+                    NativeWin32.PostMessage(renderHwnd, NativeWin32.WM_KEYUP, new IntPtr(0x46), lUp);
                 }
-                NativeWin32.PostMessage(target, NativeWin32.WM_KEYDOWN, new IntPtr(0x46), lDown);
-                Thread.Sleep(20);
-                NativeWin32.PostMessage(target, NativeWin32.WM_KEYUP, new IntPtr(0x46), lUp);
                 return true;
             }
             catch (Exception ex) { LogDiagnostic("WARN", "Silent background key failed: " + ex.Message); return false; }
         }
 
+        private static object CreateUiaInstanceSafe()
+        {
+            try
+            {
+                var uia8 = (IUIAutomation2)(new CUIAutomation8ComObject());
+                uia8.put_AutoSetFocus(0);
+                uia8.put_ConnectionTimeout(750);
+                uia8.put_TransactionTimeout(1100);
+                return uia8;
+            }
+            catch (Exception ex8)
+            {
+                try
+                {
+                    var uiaLegacy = (IUIAutomationLegacy)(new CUIAutomationLegacyComObject());
+                    LogDiagnostic("INFO", "Initialized legacy CUIAutomation fallback (" + ex8.Message + ")");
+                    return uiaLegacy;
+                }
+                catch (Exception ex1)
+                {
+                    LogDiagnostic("ERROR", "Both CUIAutomation8 and CUIAutomation init failed: " + ex1.Message);
+                    return null;
+                }
+            }
+        }
+
         public static string RunDiagnosticProbe()
         {
             var sb = new StringBuilder();
+            object uia = null;
             try
             {
                 IntPtr fg0 = NativeWin32.GetForegroundWindow();
-                var uia = (IUIAutomation2)(new CUIAutomation8ComObject());
-                uia.put_AutoSetFocus(0);
-                var dummyYm = new MediaSessionSnapshot { AppId = "YandexMusic", DisplayAppName = "Яндекс Музыка", Title = "Probe", Artist = "Probe" };
+                uia = CreateUiaInstanceSafe();
+                sb.AppendLine("UIA_READY=" + (uia != null));
+                var dummyYm = new MediaSessionSnapshot { AppId = "Яндекс Музыка.exe", DisplayAppName = "Яндекс Музыка", Title = "Probe", Artist = "Probe" };
                 string wt; IntPtr rw;
                 IntPtr top = MultiPlayerMediaController.FindPlayerWindowSafe(dummyYm, false, true, out wt, out rw);
                 if (top != IntPtr.Zero)
                 {
                     bool liked; string dbg;
                     var ctrl = FindPlayerBarLikeControl(uia, top, rw, false, wt, true, out liked, out dbg);
-                    sb.AppendLine(string.Format("Before: found={0} isLiked={1} [{2}]", ctrl != null, liked, dbg));
+                    sb.AppendLine(string.Format("YM_PROBE: found={0} isLiked={1} [{2}]", ctrl != null, liked, dbg));
                     if (ctrl != null) ReleaseCom(ctrl.ComNode);
                 }
+                else sb.AppendLine("YM_PROBE: window_not_found");
                 sb.AppendLine("FG_UNCHANGED=" + (fg0 == NativeWin32.GetForegroundWindow()));
-                ReleaseCom(uia);
             }
             catch (Exception ex) { sb.AppendLine("ERR: " + ex.Message); }
+            finally { ReleaseCom(uia); }
             return sb.ToString();
         }
 
         private static void StaWorkerLoop()
         {
-            IUIAutomation2 uia = null;
-            try
-            {
-                uia = (IUIAutomation2)(new CUIAutomation8ComObject());
-                uia.put_AutoSetFocus(0);
-                uia.put_ConnectionTimeout(750);
-                uia.put_TransactionTimeout(1100);
-            }
-            catch (Exception ex) { LogDiagnostic("ERROR", "CUIAutomation8 init failed: " + ex.Message); uia = null; }
-
+            object uia = CreateUiaInstanceSafe();
             while (true)
             {
-                _wakeEvt.WaitOne(2500);
+                _wakeEvt.WaitOne(2200);
                 FavWorkItem job = null;
                 lock (_queueLock)
                 {
@@ -4755,12 +5735,13 @@ namespace DynamicIslandWin
                     else if (_pendingSync != null) { job = _pendingSync; _pendingSync = null; }
                 }
                 if (job == null) continue;
+                if (uia == null) uia = CreateUiaInstanceSafe();
                 try { ExecuteJobOnSta(uia, job); }
                 catch (Exception ex) { LogDiagnostic("ERROR", "Unhandled STA job error: " + ex.Message); }
             }
         }
 
-        private static void ExecuteJobOnSta(IUIAutomation2 uia, FavWorkItem job)
+        private static void ExecuteJobOnSta(object uia, FavWorkItem job)
         {
             var res = new PlayerFavoriteSyncResult { TrackKey = job.TrackKey, Generation = job.Generation };
             bool isSpotify, isYandex, isBrowser;
@@ -4769,7 +5750,8 @@ namespace DynamicIslandWin
             if (sup == PlayerFavoriteSupport.Unsupported)
             {
                 res.PlayerSupported = false; res.SyncedFromPlayer = false; res.IsLiked = job.ExpectedTargetLiked;
-                if (job.IsToggleAction) LogDiagnostic("INFO", "Unsupported player '" + (job.Snapshot.DisplayAppName ?? job.Snapshot.AppId) + "' — stored locally.");
+                if (job.IsToggleAction)
+                    LogDiagnostic("STAGE:DETECT", "Player '" + (job.Snapshot.DisplayAppName ?? job.Snapshot.AppId) + "' unsupported for UIA/IA2 sync — stored locally.");
                 if (job.Callback != null) job.Callback(res);
                 return;
             }
@@ -4785,7 +5767,7 @@ namespace DynamicIslandWin
                     if (!string.Equals(_lastLoggedPassiveSync, missWinSig, StringComparison.Ordinal))
                     {
                         _lastLoggedPassiveSync = missWinSig;
-                        LogDiagnostic("DIAG", "Passive sync: window not found for AppId='" + (job.Snapshot.AppId ?? "") + "' Display='" + (job.Snapshot.DisplayAppName ?? "") + "'");
+                        LogDiagnostic("STAGE:DETECT", "Passive sync: window not found (closed to tray or starting) for AppId='" + (job.Snapshot.AppId ?? "") + "'");
                     }
                     return;
                 }
@@ -4800,7 +5782,7 @@ namespace DynamicIslandWin
                     if (!string.Equals(_lastLoggedPassiveSync, sigLog, StringComparison.Ordinal))
                     {
                         _lastLoggedPassiveSync = sigLog;
-                        LogDiagnostic("SYNC", "Synced player favorite state for '" + job.TrackKey + "' (AppId='" + job.Snapshot.AppId + "') -> IsLiked=" + playerLiked + " [" + dbg + "]");
+                        LogDiagnostic("STAGE:READ", "Player -> Island synced '" + job.TrackKey + "' (AppId='" + job.Snapshot.AppId + "') => IsLiked=" + playerLiked + " [" + dbg + "]");
                     }
                     if (job.Callback != null) job.Callback(res);
                 }
@@ -4810,16 +5792,19 @@ namespace DynamicIslandWin
                     if (!string.Equals(_lastLoggedPassiveSync, missCtrlSig, StringComparison.Ordinal))
                     {
                         _lastLoggedPassiveSync = missCtrlSig;
-                        LogDiagnostic("DIAG", "Passive sync: Like control not matched for AppId='" + (job.Snapshot.AppId ?? "") + "' Title='" + winTitle + "' [" + dbg + "]");
+                        LogDiagnostic("STAGE:SCAN", "Passive sync: Like control not matched for AppId='" + (job.Snapshot.AppId ?? "") + "' Title='" + winTitle + "' [" + dbg + "]");
                     }
                 }
                 return;
             }
 
+            LogDiagnostic("STAGE:TOGGLE_START", string.Format("Island -> Player toggle requested: track='{0}', targetLiked={1}, AppId='{2}', hwnd=0x{3:X}",
+                job.TrackKey, job.ExpectedTargetLiked, job.Snapshot.AppId, topHwnd.ToInt64()));
+
             if (topHwnd == IntPtr.Zero)
             {
                 res.PlayerSupported = false; res.SyncedFromPlayer = false; res.IsLiked = job.ExpectedTargetLiked;
-                LogDiagnostic("INFO", "Player window unavailable for '" + job.Snapshot.DisplayAppName + "' — kept local state.");
+                LogDiagnostic("STAGE:DETECT", "Player window unavailable (closed to tray) for '" + job.Snapshot.DisplayAppName + "' — kept local state without opening window.");
                 if (job.Callback != null) job.Callback(res);
                 return;
             }
@@ -4829,24 +5814,26 @@ namespace DynamicIslandWin
             if (likeCtrl != null)
             {
                 bool alreadyMatched = (curLikedBefore == job.ExpectedTargetLiked);
+                if (alreadyMatched)
+                {
+                    ReleaseCom(likeCtrl.ComNode);
+                    res.SyncedFromPlayer = true;
+                    res.IsLiked = curLikedBefore;
+                    LogDiagnostic("STAGE:ALIGNED", "Player already in target state IsLiked=" + res.IsLiked + " for '" + job.TrackKey + "' [" + beforeDbg + "]");
+                    if (job.Callback != null) job.Callback(res);
+                    return;
+                }
+
+                string usedMethod;
                 bool invoked = false;
-                try { invoked = alreadyMatched ? true : InvokeLikeControlSafe(likeCtrl); }
+                try { invoked = InvokeLikeControlSafe(uia, likeCtrl, out usedMethod); }
                 finally { ReleaseCom(likeCtrl.ComNode); }
 
                 if (invoked)
                 {
-                    if (alreadyMatched)
-                    {
-                        res.SyncedFromPlayer = true;
-                        res.IsLiked = curLikedBefore;
-                        LogDiagnostic("INFO", "Aligned phase without redundant toggle for '" + job.TrackKey + "' -> IsLiked=" + res.IsLiked + " [" + beforeDbg + "]");
-                        if (job.Callback != null) job.Callback(res);
-                        return;
-                    }
-
-                    bool verifiedLiked = job.ExpectedTargetLiked;
+                    bool verifiedLiked = curLikedBefore;
                     bool settled = false;
-                    int[] waits = new int[] { 180, 260, 360, 450 };
+                    int[] waits = new int[] { 150, 240, 350, 420 };
                     for (int w = 0; w < waits.Length; w++)
                     {
                         Thread.Sleep(waits[w]);
@@ -4860,29 +5847,48 @@ namespace DynamicIslandWin
                         }
                     }
 
-                    res.SyncedFromPlayer = true;
-                    res.IsLiked = settled ? verifiedLiked : job.ExpectedTargetLiked;
-                    _lastManualToggleTick = Environment.TickCount;
-                    LogDiagnostic("INFO", "Toggled favorite silently in background for '" + job.TrackKey + "' (" + curLikedBefore + " -> " + res.IsLiked + ", settled=" + settled + ") [" + beforeDbg + "]");
-                    if (job.Callback != null) job.Callback(res);
-                    return;
+                    if (settled)
+                    {
+                        res.SyncedFromPlayer = true;
+                        res.IsLiked = verifiedLiked;
+                        _lastManualToggleTick = Environment.TickCount;
+                        _lastLoggedPassiveSync = job.TrackKey + "|" + verifiedLiked;
+                        LogDiagnostic("STAGE:SETTLED", string.Format("Toggled silently via {0} for '{1}': {2} -> {3} [{4}]",
+                            usedMethod, job.TrackKey, curLikedBefore, verifiedLiked, beforeDbg));
+                        if (job.Callback != null) job.Callback(res);
+                        return;
+                    }
+
+                    LogDiagnostic("WARN", string.Format("Method {0} did not flip state within timeout for '{1}' (stayed {2}) — trying fallback.",
+                        usedMethod, job.TrackKey, verifiedLiked));
                 }
             }
 
             if (sup == PlayerFavoriteSupport.SupportedUiaAndBgKey && SendSilentBackgroundKeyYandex(topHwnd, renderHwnd))
             {
-                Thread.Sleep(450);
+                Thread.Sleep(380);
                 bool afterLiked; string afterDbg;
                 var verifyCtrl = FindPlayerBarLikeControl(uia, topHwnd, renderHwnd, isBrowser, winTitle, false, out afterLiked, out afterDbg);
-                if (verifyCtrl != null) { ReleaseCom(verifyCtrl.ComNode); res.SyncedFromPlayer = true; res.IsLiked = afterLiked; }
-                else { res.SyncedFromPlayer = false; res.IsLiked = job.ExpectedTargetLiked; }
-                LogDiagnostic("INFO", "Sent silent background KeyF for hidden '" + job.Snapshot.DisplayAppName + "' -> IsLiked=" + res.IsLiked);
+                if (verifyCtrl != null)
+                {
+                    ReleaseCom(verifyCtrl.ComNode);
+                    res.SyncedFromPlayer = true;
+                    res.IsLiked = afterLiked;
+                    _lastLoggedPassiveSync = job.TrackKey + "|" + afterLiked;
+                }
+                else
+                {
+                    res.SyncedFromPlayer = false;
+                    res.IsLiked = job.ExpectedTargetLiked;
+                }
+                _lastManualToggleTick = Environment.TickCount;
+                LogDiagnostic("STAGE:KEY_FALLBACK", "Sent silent background KeyF for '" + job.Snapshot.DisplayAppName + "' -> IsLiked=" + res.IsLiked);
                 if (job.Callback != null) job.Callback(res);
                 return;
             }
 
             res.PlayerSupported = false; res.SyncedFromPlayer = false; res.IsLiked = job.ExpectedTargetLiked;
-            LogDiagnostic("DIAG", "Toggle fallback: Like control unreachable for AppId='" + (job.Snapshot.AppId ?? "") + "' Display='" + (job.Snapshot.DisplayAppName ?? "") + "' WinTitle='" + winTitle + "' [" + beforeDbg + "] — kept local state.");
+            LogDiagnostic("STAGE:UNREACHABLE", "Like control unreachable in background for AppId='" + (job.Snapshot.AppId ?? "") + "' WinTitle='" + winTitle + "' [" + beforeDbg + "] — kept local state without window activation.");
             if (job.Callback != null) job.Callback(res);
         }
     }
@@ -6121,7 +7127,7 @@ namespace DynamicIslandWin
 
     public sealed class UpdateManager
     {
-        public const string CurrentVersionStr = "3.4.0";
+        public const string CurrentVersionStr = "3.4.1";
         public const string DefaultRepo = "Miltanchik/DynamicIsland";
 
         public string LatestVersionStr { get; private set; }
@@ -11359,15 +12365,14 @@ namespace DynamicIslandWin
                         }
                         InstalledMusicPlayerDiscovery.RememberFromActiveSession(_config, activeSnap);
 
-                        // 2-Way Favorite Sync (Single Source of Truth: immediate on startup/track change + up to 2 cold retries + every 2.0s while Expanded)
+                        // Continuous 2-Way Favorite Sync (Single Source of Truth: instant on track change, 1.8s in Expanded, 3.4s in Compact/Idle)
                         int nowSync = Environment.TickCount;
                         string activeTrackKey = PlayerFavoriteEngine.BuildTrackKey(activeSnap);
                         bool trackChangedForLike = !string.Equals(sig, _lastLikeSyncSig, StringComparison.Ordinal);
                         if (trackChangedForLike) _initialLikeSyncAttempts = 0;
-                        bool needsInitialSync = (!_livePlayerLikedKnown || !string.Equals(_livePlayerLikedTrackKey, activeTrackKey, StringComparison.OrdinalIgnoreCase)) && _initialLikeSyncAttempts < 2;
-                        bool periodicSync = !_isFullscreenAppActive && (
-                            (_mode == IslandMode.Expanded && _expandedPage == 0 && unchecked(nowSync - _lastLikeSyncTick) >= 2000) ||
-                            (needsInitialSync && unchecked(nowSync - _lastLikeSyncTick) >= 2200));
+                        bool needsInitialSync = (!_livePlayerLikedKnown || !string.Equals(_livePlayerLikedTrackKey, activeTrackKey, StringComparison.OrdinalIgnoreCase)) && _initialLikeSyncAttempts < 12;
+                        int syncIntervalMs = (_mode == IslandMode.Expanded && _expandedPage == 0) ? 1800 : (needsInitialSync ? 2000 : 3400);
+                        bool periodicSync = !_isFullscreenAppActive && unchecked(nowSync - _lastLikeSyncTick) >= syncIntervalMs;
                         if ((trackChangedForLike || periodicSync) && !string.IsNullOrEmpty(activeTrackKey))
                         {
                             _lastLikeSyncSig = sig;
