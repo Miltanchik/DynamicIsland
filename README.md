@@ -11,14 +11,14 @@
 
 <br />
 
-<a href="https://github.com/YOUR_USERNAME/DynamicIsland/releases/latest/download/DynamicIslandWin_Setup.exe">
+<a href="https://github.com/Miltanchik/DynamicIsland/releases/latest/download/DynamicIslandWin_Setup.exe">
   <img src="assets/download-button.svg" alt="Скачать Dynamic Island" width="340" />
 </a>
 
 <br /><br />
 
 <p>
-  <a href="https://github.com/YOUR_USERNAME/DynamicIsland/releases/latest/download/DynamicIslandWin.exe">Скачать только приложение для Windows x64</a>
+  <a href="https://github.com/Miltanchik/DynamicIsland/releases/latest/download/DynamicIslandWin.exe">Скачать только приложение для Windows x64</a>
   &nbsp;·&nbsp;
   <a href="https://github.com/YOUR_USERNAME/DynamicIsland/releases/latest">Что нового</a>
   &nbsp;·&nbsp;
